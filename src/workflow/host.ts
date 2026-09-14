@@ -306,6 +306,10 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
+            // Kept as the caller's SPELLING, not the resolved model: shared
+            // routing refuses a script-named model it cannot serve rather than
+            // silently running a different one.
+            ...(request.model !== undefined ? { modelOverride: request.model } : {}),
             // Validated worker-side against the same list pi accepts, so the
             // cast asserts what the boundary has already checked. Left unset,
             // the agent definition's `thinking` (then the parent's) still wins —

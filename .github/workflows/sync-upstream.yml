@@ -1,0 +1,93 @@
+name: Sync upstream
+
+# Keeps this fork's `master` an exact mirror of tintinweb/pi-subagents and carries
+# that history into `shared-routing`, which is where this fork's own work lives.
+#
+# Nothing here is allowed to force anything: `master` moves by fast-forward only,
+# and `shared-routing` is pushed ONLY after the merge and the full check suite
+# pass. A conflict or a red check leaves the branch exactly as it was and fails
+# the run, so the failure lands where a person looks for it — GitHub's Actions
+# tab — instead of in a silently half-merged branch.
+#
+# `shared-routing` must be the fork's default branch for `pi update --extensions`
+# to follow successful syncs from the unpinned git package source.
+
+on:
+  schedule:
+    # 03:17 UTC daily. Off the hour on purpose: GitHub's scheduler is busiest at
+    # the top of the hour, and a delayed run is one that lands after yours.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One sync at a time. A run racing another would push over a merge it never saw.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out shared-routing with full history
+        # zizmor: ignore[unpinned-uses] — matches ci.yml's convention for this repo
+        uses: actions/checkout@v4
+        with:
+          ref: shared-routing
+          # The merge needs real ancestry; a shallow clone has no merge base.
+          fetch-depth: 0
+
+      # zizmor: ignore[unpinned-uses] — matches ci.yml's convention for this repo
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Mark upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/tintinweb/pi-subagents.git
+          git fetch upstream master --no-tags
+
+      - name: Mirror upstream/master into master (fast-forward only)
+        run: git push --ff-only origin upstream/master:refs/heads/master
+
+      - name: Stop when shared-routing already contains upstream/master
+        id: current
+        run: |
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "shared-routing already contains $(git rev-parse --short upstream/master)"
+            echo "up-to-date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up-to-date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream/master into shared-routing
+        if: steps.current.outputs.up-to-date == 'false'
+        run: git merge --no-edit upstream/master
+
+      - name: Install dependencies
+        if: steps.current.outputs.up-to-date == 'false'
+        run: npm ci
+
+      # The same gates a release runs. A merge that resolves cleanly but breaks
+      # the build must not reach the branch users install from.
+      - name: Lint, typecheck and test
+        if: steps.current.outputs.up-to-date == 'false'
+        run: npm run check
+
+      - name: End-to-end suite
+        if: steps.current.outputs.up-to-date == 'false'
+        run: npm run test:e2e
+
+      - name: Build
+        if: steps.current.outputs.up-to-date == 'false'
+        run: npm run build
+
+      # Last, so every earlier failure leaves the remote branch untouched.
+      - name: Push shared-routing
+        if: steps.current.outputs.up-to-date == 'false'
+        run: git push origin shared-routing

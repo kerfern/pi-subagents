@@ -253,6 +253,9 @@ export class SubagentScheduler {
         isBackground: true,
         bypassQueue: true,
         model: resolvedModel,
+        // A job's model is an orchestrator-level choice, kept as a spelling so
+        // shared routing can refuse it rather than silently ignore it.
+        ...(job.model !== undefined ? { modelOverride: job.model } : {}),
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: job.thinking,

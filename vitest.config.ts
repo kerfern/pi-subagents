@@ -13,6 +13,12 @@ export default defineConfig({
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
+    // The harnesses drive ONE-model faux catalogs, so the session-wide subagent
+    // route (see src/model-routing.ts) would latch as "target unavailable" in
+    // every wiring and e2e suite. Off here; test/model-routing.test.ts and
+    // test/subagent-model-routing.test.ts exercise the route against their own
+    // catalogs, and the one e2e that must route enables it per-test.
+    env: { PI_SUBAGENTS_MODEL_ROUTING: "off" },
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with
     // almost no logic and is not worth a fake-TUI harness; any global floor

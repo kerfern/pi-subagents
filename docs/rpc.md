@@ -13,10 +13,10 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 **Honoured** — set these and they take effect:
 
 | Field | Type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
-| `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
+| `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override — and with the session's [subagent model route](../README.md#subagent-model-routing) active, any override that names a *different* model is refused, not ignored. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
@@ -33,7 +33,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 **Silently stripped** — set these and nothing happens, with no error and no note. Each deletion is a deliberate guard, and the reasons are worth knowing because they say what the surface refuses to let a caller forge:
 
 | Field | Why it is taken away |
-|---|---|
+| --- | --- |
 | `parentAgentId` | Ownership. A forged parent hides your agent under someone else's nested tools |
 | `workflowId` | A forged value would hide an RPC-spawned agent inside someone else's workflow — and take it out of the concurrency pool with it |
 | `depth`, `maxSubagentDepth` | The nesting cap is inherited, not declared |
@@ -57,7 +57,7 @@ Four things that are not obvious from the tables:
 One of these already shipped as a bug in this project's own README example, so it is worth reading the table even if you are sure.
 
 | You might write | What it does | What you meant |
-|---|---|---|
+| --- | --- | --- |
 | `run_in_background` | Forwarded verbatim and ignored — it is the [`Agent`](../README.md#agent) *tool's* parameter name | `isBackground` |
 | `isolated: true` | Disables extensions, skills and nested tools | `isolation: "worktree"` for a git worktree |
 | `isolation: "worktree"` | Creates a git worktree | `isolated: true` to strip capabilities |
@@ -72,10 +72,11 @@ One of these already shipped as a bug in this project's own README example, so i
 Every failure reaches the caller as `{ success: false, error }`, where `error` is `err?.message ?? String(err)` (`src/cross-extension-rpc.ts:87`) — so these strings are what you will actually see.
 
 | Error | Source |
-|---|---|
+| --- | --- |
 | `No active session` | `src/cross-extension-rpc.ts:107` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
 | `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
+| `Model override "<input>" is refused: this session routes every subagent to <model>. Change it with /subagent-model.` | `src/agent-manager.ts` — the session's [subagent model route](../README.md#subagent-model-routing); the override never reaches a model |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
 | `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
 | `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |
@@ -118,7 +119,7 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
 
 | When you consume | What happens |
-|---|---|
+| --- | --- |
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
 | After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
 | After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
@@ -134,7 +135,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 `globalThis[Symbol.for("pi-subagents:manager")]` (`src/index.ts:649-659`) is a second integration surface — the standard Node cross-package singleton pattern, no bus involved:
 
 | Member | Signature | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
 | `hasRunning()` | `() => boolean` | |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
@@ -167,7 +168,7 @@ One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`
 This document has no test of its own, so it is worth knowing which claims are actually held in place:
 
 | Test | Level | Pins |
-|---|---|---|
+| --- | --- | --- |
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel error strings, model resolution and scope enforcement |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |

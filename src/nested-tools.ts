@@ -52,6 +52,8 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
+  /** Caller-supplied spelling, so shared routing can refuse rather than ignore it. */
+  modelOverride?: string;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -258,6 +260,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const options: NestedSpawnOptions = {
         description: params.description,
         model,
+        // Only when the CALLER named one: a model inherited from the agent file
+        // or the parent session is not a choice this layer has to defend.
+        ...(invocation.modelFromParams ? { modelOverride: invocation.modelInput } : {}),
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,

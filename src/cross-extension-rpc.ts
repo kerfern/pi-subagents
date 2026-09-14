@@ -135,7 +135,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
             throw new Error(resolved);
           }
           model = resolved;
-          normalizedOptions = { ...normalizedOptions, model: resolved };
+          normalizedOptions = { ...normalizedOptions, model: resolved, modelOverride: label };
         }
 
         // A model on the RPC payload is an orchestrator-level choice, exactly

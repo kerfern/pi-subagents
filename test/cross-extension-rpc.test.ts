@@ -385,7 +385,9 @@ describe("cross-extension RPC", () => {
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
+        // The spelling travels with the resolved model: shared routing refuses a
+        // per-call override it cannot honour rather than silently ignoring it.
+        { model: fakeModel, modelOverride: "openai-codex/gpt-5.5" },
       );
     });
 
@@ -538,7 +540,8 @@ describe("cross-extension RPC", () => {
       const call = await spawn("req-sc3", "openai-codex/gpt-5.5");
       expect(call).toEqual({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x", { model: ALLOWED },
+        deps.pi, ctx, "general-purpose", "x",
+        { model: ALLOWED, modelOverride: "openai-codex/gpt-5.5" },
       );
     });
 
@@ -547,7 +550,8 @@ describe("cross-extension RPC", () => {
       const call = await spawn("req-sc4", "sonnet");
       expect(call).toEqual({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x", { model: BLOCKED },
+        deps.pi, ctx, "general-purpose", "x",
+        { model: BLOCKED, modelOverride: "sonnet" },
       );
     });
   });

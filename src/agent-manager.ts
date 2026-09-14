@@ -19,9 +19,20 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { type RunResult, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
+import {
+  classifyProviderFailure,
+  FALLBACK_SUBAGENT_MODEL,
+  isRoutingEnabled,
+  type ModelRef,
+  modelKey,
+  recordFallbackFailure,
+  recordUnavailableModel,
+  routingBlockReason,
+  type SubagentRoutingState,
+} from "./model-routing.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -41,6 +52,31 @@ export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void
  */
 export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
+
+/**
+ * The session-wide model route, handed to the manager once per session.
+ *
+ * The state object is shared by reference and mutated in place: a fallback
+ * failure during one spawn has to stop the NEXT dispatch too, which only works
+ * if every reader sees the same latch.
+ */
+export interface SubagentRouting {
+  state: SubagentRoutingState;
+  /** The catalog for a spawn's context, read when that spawn actually starts. */
+  catalogFor(ctx: ExtensionContext): readonly ModelRef[];
+  /**
+   * Fired once when the route latches, with the same reason every later
+   * dispatch will get. The manager owns no UI: without this the status line
+   * would keep advertising a model that can no longer run.
+   */
+  onLatch?(reason: string): void;
+}
+
+/** The two models one logical task may run on: the route, and its one retry. */
+interface RoutedModels {
+  model: Model<any>;
+  fallback: Model<any>;
+}
 
 /**
  * Default max concurrent background agents.
@@ -194,6 +230,16 @@ interface SpawnOptions {
    */
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
+  /**
+   * The model spelling a CALLER explicitly asked for (`Agent({ model })`,
+   * `agent({ model })`, a scheduled job's model, an RPC `options.model`).
+   *
+   * Recorded separately from the resolved `model` because a resolved model
+   * cannot say who chose it: shared routing overrides a parent-inherited or
+   * agent-frontmatter model silently, but refuses to silently discard a model a
+   * caller named. Only callers set this.
+   */
+  modelOverride?: string;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -418,6 +464,12 @@ export class AgentManager {
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
+    /**
+     * Session-wide model route (see `src/model-routing.ts`). Optional so every
+     * existing `new AgentManager()` — tests, and any host that wants raw
+     * pass-through — keeps today's behavior exactly.
+     */
+    private routing?: SubagentRouting,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
@@ -662,6 +714,138 @@ export class AgentManager {
     return this.startups.get(id) ?? Promise.resolve();
   }
 
+  /**
+   * Both models a fresh dispatch may use, or the reason it cannot run.
+   *
+   * Resolved here and not by the callers because every fresh dispatch surface —
+   * the Agent tool, workflows, nested delegation, the scheduler and cross-
+   * extension RPC — converges on `startAgent`, and only here is the catalog read
+   * at the moment the work actually starts (a queued spawn can be minutes old).
+   */
+  private resolveRoute(ctx: ExtensionContext, options: SpawnOptions): RoutedModels | string {
+    const routing = this.routing;
+    if (routing === undefined) return "";
+    const blocked = routingBlockReason(routing.state);
+    if (blocked !== undefined) return blocked;
+
+    const catalog = routing.catalogFor(ctx);
+    const wanted = routing.state.effective;
+    // Both legs are validated up front: a fallback that cannot be resolved is a
+    // latched route, and discovering that mid-task would waste the primary run.
+    const model = this.exactCatalogModel(ctx, catalog, wanted);
+    if (typeof model === "string") {
+      recordUnavailableModel(routing.state, wanted);
+      return this.latched(routing);
+    }
+
+    // A caller that named a model is answered, not ignored — but only after the
+    // route is known to be runnable, so "change it with /subagent-model" is a
+    // fix the user can actually apply.
+    if (options.modelOverride !== undefined && options.model !== undefined) {
+      const same = options.model.provider === model.provider && options.model.id === model.id;
+      if (!same) {
+        return `Model override "${options.modelOverride}" is refused: this session routes every subagent to ` +
+          `${wanted}. Change it with /subagent-model.`;
+      }
+    }
+
+    const fallback = this.exactCatalogModel(ctx, catalog, FALLBACK_SUBAGENT_MODEL);
+    if (typeof fallback === "string") {
+      recordUnavailableModel(routing.state, FALLBACK_SUBAGENT_MODEL);
+      return this.latched(routing);
+    }
+    return { model, fallback };
+  }
+
+  /** The latched reason, announced to the UI exactly where the latch was set. */
+  private latched(routing: SubagentRouting): string {
+    const reason = routingBlockReason(routing.state) as string;
+    routing.onLatch?.(reason);
+    return reason;
+  }
+
+  /**
+   * Resolves an exact `provider/model` key against the live catalog and returns
+   * the Model instance, or the key itself when it cannot be served. Exact on
+   * purpose: the route is a configured identity, and `resolveModel`'s fuzzy
+   * matching would happily serve a different date-stamped sibling of it.
+   */
+  private exactCatalogModel(
+    ctx: ExtensionContext,
+    catalog: readonly ModelRef[],
+    key: string,
+  ): Model<any> | string {
+    if (!catalog.some((candidate) => modelKey(candidate) === key)) return key;
+    const slash = key.indexOf("/");
+    const found = ctx.modelRegistry.find(key.slice(0, slash), key.slice(slash + 1)) as Model<any> | undefined;
+    return found ?? key;
+  }
+
+  /**
+   * One logical task, at most two model attempts.
+   *
+   * Only the model differs between attempts: same prompt, type, tools, options
+   * and worktree, because a provider failure says nothing about the work. Any
+   * non-provider failure — including an abort — returns immediately, so a task
+   * failure can never consume the fallback.
+   */
+  private runRouted(
+    startRun: (model?: Model<any>) => Promise<RunResult>,
+    route?: RoutedModels,
+  ): Promise<RunResult> {
+    // NOT an `async` method: every unrouted path must call the runner directly,
+    // so a SYNCHRONOUS throw out of `runAgent` stays a startup failure the
+    // spawn's caller can see. An async body would fold it into a rejected
+    // promise that the completion tail swallows, and the spawn would look like
+    // it started.
+    if (this.routing === undefined || route === undefined) return startRun(route?.model);
+    return this.runAttempts(startRun, route);
+  }
+
+  private async runAttempts(
+    startRun: (model?: Model<any>) => Promise<RunResult>,
+    route: RoutedModels,
+  ): Promise<RunResult> {
+    try {
+      const first = await startRun(route.model);
+      if (first.aborted || first.failure === undefined) return first;
+      if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
+      return await this.retryOnFallback(startRun, route);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
+      return await this.retryOnFallback(startRun, route);
+    }
+  }
+
+  /**
+   * The single fallback leg. A fallback that fails again latches the route for
+   * every LATER dispatch, while this task still reports what actually happened:
+   * the fallback's own error, not the primary's.
+   */
+  private async retryOnFallback(
+    startRun: (model?: Model<any>) => Promise<RunResult>,
+    route: RoutedModels,
+  ): Promise<RunResult> {
+    const routing = this.routing as SubagentRouting;
+    try {
+      const second = await startRun(route.fallback);
+      if (!second.aborted && second.failure !== undefined
+        && classifyProviderFailure({ isError: true, text: second.failure })) {
+        recordFallbackFailure(routing.state, second.failure);
+        this.latched(routing);
+      }
+      return second;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (classifyProviderFailure({ isError: true, text: detail })) {
+        recordFallbackFailure(routing.state, detail);
+        this.latched(routing);
+      }
+      throw error;
+    }
+  }
+
   /** Actually start an agent (called immediately or from queue drain). */
   private async startAgent(
     id: string,
@@ -676,6 +860,15 @@ export class AgentManager {
     // repo and both cleanup calls below MUST agree on this value forever.
     const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
     const baseCwd = customCwd ?? ctx.cwd;
+
+    // The route is resolved BEFORE the pool slot and the worktree: a config that
+    // cannot run must fail without claiming either. `resumeSessionFile` is
+    // deliberately exempt — a resumed conversation keeps the model its stored
+    // session already has, and must still open while the route is latched.
+    const routed = this.routing !== undefined && isRoutingEnabled() && options.resumeSessionFile === undefined
+      ? this.resolveRoute(ctx, options)
+      : undefined;
+    if (typeof routed === "string") throw new Error(routed);
 
     // Take the running state — and with it the concurrency slot — BEFORE the
     // first await. Creating a worktree is an awaited git call, and drainQueue
@@ -758,10 +951,13 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
-    const promise = runAgent(ctx, type, prompt, {
+    // `model ?? options.model`: the unrouted paths (no router, routing disabled,
+    // or a resume) must reproduce the old call exactly, including the caller's
+    // own resolution.
+    const startRun = (model: Model<any> | undefined) => runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
-      model: options.model,
+      model: model ?? options.model,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
@@ -845,7 +1041,9 @@ export class AgentManager {
         }
         options.onSessionCreated?.(session);
       },
-    })
+    });
+
+    const promise = this.runRouted(startRun, routed as RoutedModels | undefined)
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {

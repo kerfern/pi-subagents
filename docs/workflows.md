@@ -21,7 +21,7 @@ Use the `Agent` tool for one delegated task, or a handful you can name up front.
 There is no `/workflows` command. The tool is model-invoked, so you get a workflow by asking for one in the prompt — the same way you ask for anything else. What you say shapes what you get:
 
 | What you say | What you get |
-|---|---|
+| --- | --- |
 | "audit every route file for missing auth checks" | A discovery agent, then a fan-out over what it found |
 | "review the changed files for bugs, and verify each finding before reporting it" | Two stages, the second trying to refute the first |
 | "fix the failing test, and don't tell me it's done until `npm test` passes" | A `gate` on the fix agent, and a retry loop around it |
@@ -75,7 +75,7 @@ Each row names the model the child *actually* ran on — read back from its sess
 The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
-|---|---|
+| --- | --- |
 | `x` | Stop the run |
 | `p` | Pause — running agents finish, no new ones start, and held time comes off the clock |
 | `s` | **Skip** the selected agent: its `agent()` call returns `null` in the script |
@@ -117,7 +117,7 @@ Replayed rows are annotated `from resume journal` on the card and in the inspect
 A script you will run more than once belongs somewhere durable. Copy it out of the temp directory into one of these, named `<name>.js`:
 
 | Location | Scope |
-|---|---|
+| --- | --- |
 | `<project>/.pi/workflows/<name>.js` | This project. Checked in, if you want it shared |
 | `<project>/.agents/workflows/<name>.js` | This project, in the tool-agnostic directory |
 | `<agent dir>/workflows/<name>.js` | You, everywhere — follows you across projects |
@@ -218,7 +218,7 @@ export const meta = {
 ### Tool parameters
 
 | Parameter | Type | Description |
-|---|---|---|
+| --- | --- | --- |
 | `script` | string | Inline source. Must begin with `export const meta = { name, description }` |
 | `scriptPath` | string | A script file, absolute or project-relative. **Takes precedence over `script`** — this is how an edited workflow is re-run |
 | `name` | string | A saved workflow — `<name>.js` in one of the three directories above. Lowest precedence |
@@ -235,11 +235,11 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 **Returns `null` if the agent failed terminally *or* if you skipped it from the inspector**, indistinguishably. Filter with `.filter(Boolean)` when a `null` would break a later stage, and be careful with in-script retry loops: retrying on `null` will re-run something you deliberately skipped.
 
 | Option | Type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
+| `model` | string | `provider/modelId`, or fuzzy like `haiku`. **Refused while the session's [subagent model route](../README.md#subagent-model-routing) is active** unless it names the routed model — the route decides what every child runs, so a script cannot pick one. Change the route with `/subagent-model` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
@@ -249,6 +249,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+Every child of a run is a fresh subagent, so every one of them runs the session's routed model (see [Subagent Model Routing](../README.md#subagent-model-routing)): the row's model column reports what it actually ran on, and an `agent({ model })` that names something else is refused rather than ignored — typically surfacing to the script as a `null` agent and a run-level error, the same shape a bad agent type takes.
 
 ### `pipeline()` and `parallel()`
 
@@ -281,7 +283,7 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 ### Where files live
 
 | What | Where |
-|---|---|
+| --- | --- |
 | An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
 | Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
@@ -291,7 +293,7 @@ The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only
 ### Limits and caps
 
 | Limit | Value |
-|---|---|
+| --- | --- |
 | Agents running at once | `max(1, min(16, cpus - 2))` — 6 on an 8-core machine |
 | Agents per run, total | 1000 |
 | Items per `parallel`/`pipeline` **call** | 4096 |
@@ -427,7 +429,7 @@ Additions on this side: `gate`, `resume`, `effort`, journal-backed `resumeFromRu
 Every file below is executed by `test/workflow-examples.test.ts` against a stub host on each CI run, so none of them can silently rot.
 
 | File | Demonstrates | Runs as-is? |
-|---|---|---|
+| --- | --- | --- |
 | [`fan-out-audit.js`](../examples/workflows/fan-out-audit.js) | Runtime fan-out, `pipeline`, `label`, per-stage `phase` | Yes — takes `args.root` |
 | [`structured-findings.js`](../examples/workflows/structured-findings.js) | `schema` on both stages, objects instead of prose | Yes |
 | [`gated-fix.js`](../examples/workflows/gated-fix.js) | `gate`, `isolation: "worktree"`, `resume` retry loop | Needs a real test command |

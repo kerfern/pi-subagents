@@ -4,11 +4,9 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 
 <img width="600" alt="pi-subagents screenshot" src="https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png" />
 
-
-https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
+<https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543>
 
 <img width="600" alt="pi-color-badges-white" src="https://github.com/user-attachments/assets/555dcae4-333e-4ff0-b420-7b3369c018a4" />
-
 
 ## Features
 
@@ -26,6 +24,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
+- **Session-wide subagent route** — every fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC) runs the one model you pick with `/subagent-model`, independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
@@ -101,6 +100,7 @@ Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`.
 **Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
 
 Restrictions:
+
 - `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
 - `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
@@ -122,6 +122,7 @@ The extension renders a persistent widget above the editor showing active agents
 ```
 
 The token field is annotated with two optional signals inside parens:
+
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
 - **`⇊N`** — number of times the session has compacted, when > 0. Stays dim; the percent's color carries urgency.
 
@@ -158,7 +159,7 @@ Subagents are addressable. Every agent has a typeable handle — the agent type,
 The handle names the **agent**, not one process, so a single syntax covers its whole lifecycle:
 
 | State | `@explore fix the flaky test` does |
-|-------|-----------------------------------|
+| ------- | ----------------------------------- |
 | running or queued | sends the message into its conversation, exactly as `steer_subagent` would |
 | finished | **resumes** it in the background from its existing session, continuing where it left off |
 | finished long ago, record gone | **reopens** its session from disk and continues there |
@@ -182,7 +183,7 @@ The cost is a visible turn — the model's reasoning and its tool block, narrati
 It is a literal clone — the session's own entries and the same system prompt, not [`inherit_context`](#agent-frontmatter)'s text rendering of them — taken from memory and compaction-aware, so what the copy reads is what the main model is working from. The clone gets one tool and one job; it cannot read, write or run anything, because an invisible turn with the full toolset could do invisible work. The agent it starts is attributed to the *real* session, so its transcript and `rootSessionId` land where they would have anyway, and it carries no `tool-use-id` — the main conversation never issued one.
 
 | Mode | `@plan sketch the migration`, with no Plan agent running |
-|------|----------------------------------------------------------|
+| ------ | ---------------------------------------------------------- |
 | `model` (default) | a clone of this conversation takes the turn off-screen and calls `Agent`, so the agent starts with a prompt **written from the conversation**. Nothing reaches the chat but a `Prompting @plan…` toast — the wording marks the wait for that turn, where `direct`'s `Started @plan` means it is already running |
 | `direct` | the agent starts here, immediately, with your message verbatim as its prompt. No model call at all, so no latency before it begins |
 | `off` | `@` means only "attach a file" again |
@@ -200,10 +201,10 @@ Two things to weigh against `direct`: the clone re-sends the whole conversation,
 The grammar mirrors Claude Code's, and is deliberately narrow so nothing gets swallowed by accident:
 
 | Input | Goes to |
-|-------|---------|
+| ------- | --------- |
 | `@explore fix the flaky test` | the `explore` agent |
 | `@agent-explore fix the flaky test` | the same agent — Claude Code's manual spelling, accepted as a synonym |
-| `@main @explore is not a mention` | the main model, with `@main ` stripped — the escape hatch |
+| `@main @explore is not a mention` | the main model, with `@main` stripped — the escape hatch |
 | `@explore` (no message) | the main model — a bare handle is never a send |
 | `hey @explore look at this` | the main model — only a **leading** mention is routed |
 | `@src/index.ts summarize this` | the main model, with pi's normal file attachment |
@@ -216,7 +217,7 @@ A `direct`-mode start takes the non-tool spawn path shared with the scheduler an
 Individual agent results render Claude Code-style in the conversation:
 
 | State | Example |
-|-------|---------|
+| ------- | --------- |
 | **Running** | `⠹ ↻3≤30 · 3 tool uses · 12.4k token (8%)` / `⎿ searching, reading 3 files…` |
 | **Completed** | `✓ ↻8 · 5 tool uses · 33.8k token (62%) · 12.3s` / `⎿ Done` |
 | **Wrapped up** | `✓ ↻50≤50 · 50 tool uses · 89.1k token (84% · ⇊2) · 45.2s` / `⎿ Wrapped up (turn limit)` |
@@ -240,7 +241,7 @@ Group completions render each agent as a separate block. The LLM receives struct
 ## Default Agent Types
 
 | Type | Tools | Model | Prompt Mode | Description |
-|------|-------|-------|-------------|-------------|
+| ------ | ------- | ------- | ------------- | ------------- |
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
 | `Explore` | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace` (standalone) | Fast codebase exploration (read-only) |
 | `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
@@ -256,7 +257,7 @@ Define custom agent types by creating `.md` files. The frontmatter `name:` is th
 Agents are discovered from three locations (higher priority wins):
 
 | Priority | Location | Scope |
-|----------|----------|-------|
+| ---------- | ---------- | ------- |
 | 1 (highest) | `.pi/agents/<name>.md` | Project — pi's config dir; authoritative, and where `/agents` writes |
 | 2 | `.agents/agents/<name>.md` | Project — the shared cross-tool `.agents` workspace (same convention as `.agents/skills/`) |
 | 3 | `$PI_CODING_AGENT_DIR/agents/<name>.md` (default `~/.pi/agent/agents/<name>.md`) | Global — available everywhere |
@@ -297,7 +298,7 @@ Agent({ subagent_type: "auditor", prompt: "Review the auth module", description:
 All fields are optional — sensible defaults for everything.
 
 | Field | Default | Description |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `description` | filename | Agent description shown in tool listings |
 | `name` | filename | **The agent's type** — what `subagent_type` and `@handle` address. Claude Code's rule: the filename doesn't have to match, so `blubb.md` with `name: code-review` dispatches as `code-review`. Omit it and the filename is used. Any value works except one containing `:`, which Claude Code reserves for plugin-scoped identifiers — such a file is skipped with a warning. Two files may declare the same name; the later load wins, as a filename clash always did |
 | `display_name` | the type | Label shown in the UI (widget, agent list, badges) — cosmetic only, and independent of `name`. Claude Code has no equivalent; a file that sets only `name` badges as its type, unchanged |
@@ -389,7 +390,7 @@ A few rules the examples don't make obvious:
 **How an agent's scope is advertised.** The Agent tool description lists every available agent with a `(Tools: …)` suffix, and that suffix is what the orchestrator reads when deciding where to route work. It describes **built-in scope only** — extension tools are resolved when the agent runs (extensions may register lazily, see above), so they can't be enumerated when the description is built:
 
 | `tools:` | suffix |
-|---|---|
+| --- | --- |
 | omitted, `*`, or `all` | `*` |
 | a list of built-ins | that list, e.g. `read, grep` |
 | `none` with `isolated: true` or `extensions: false` | `none` |
@@ -404,7 +405,7 @@ The last two rows are separate because zero built-ins is not zero tools: `tools:
 Launch a sub-agent.
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| ----------- | ------ | ---------- | ------------- |
 | `prompt` | string | yes | The task for the agent |
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
 | `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
@@ -423,7 +424,7 @@ Launch a sub-agent.
 Run a deterministic script that orchestrates many subagents. Returns a task id immediately; the run continues in the background and notifies on completion.
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| ----------- | ------ | ---------- | ------------- |
 | `script` | string | no | The workflow source. Must begin with `export const meta = { name, description }` |
 | `scriptPath` | string | no | Path to a script file. Takes precedence over `script` and `name` |
 | `name` | string | no | A saved workflow — `<name>.js` in `.pi/workflows/`, `.agents/workflows/` or `<agent dir>/workflows/`, carrying an `export const meta` declaration |
@@ -462,7 +463,7 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 Check status and retrieve results from a background agent.
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| ----------- | ------ | ---------- | ------------- |
 | `agent_id` | string | yes | Agent ID to check |
 | `wait` | boolean | no | Wait for completion |
 | `verbose` | boolean | no | Include full conversation log |
@@ -481,8 +482,10 @@ Send a steering message to a running agent. The message interrupts after the cur
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/subagent-model [provider/model]` | Set (or report) the session-wide model every fresh subagent runs. No argument opens a picker; an argument must be an exact `provider/model`. See [Subagent Model Routing](#subagent-model-routing) |
+| `/implementer-model` | Alias for `/subagent-model` |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
 
@@ -504,7 +507,7 @@ The overview puts the phases on the left (a phase shows its number until it fini
 The run itself takes five keys, and the footer offers each only while it can actually do something:
 
 | Key | What it does |
-|-----|--------------|
+| ----- | -------------- |
 | `x` | Stop the run. Live runs only — a settled one has nothing left to stop |
 | `p` | Pause / resume. Pausing stops *starting* agents; ones already running are left to finish, because killing model work mid-turn throws away everything it has spent. Held time is subtracted from the run's elapsed clock |
 | `s` | Skip the selected agent: its `agent()` call returns `null`, exactly as a terminal failure does, and the row renders skipped. Offered while the agent is queued or running |
@@ -550,7 +553,7 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 3. Hard abort only after the grace period
 
 | Status | Meaning | Icon |
-|--------|---------|------|
+| -------- | --------- | ------ |
 | `completed` | Finished naturally | `✓` green |
 | `steered` | Hit limit, wrapped up in time | `✓` yellow |
 | `aborted` | Grace period exceeded | `✗` red |
@@ -575,7 +578,7 @@ Nested children and a [workflow](#subagentworkflow)'s agents are outside the poo
 When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
 
 | Mode | Behavior |
-|------|----------|
+| ------ | ---------- |
 | `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
 | `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
 | `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
@@ -583,6 +586,7 @@ When background agents complete, they notify the main agent. The **join mode** c
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 
 **Configuration:**
+
 - Configure join mode in `/agents` → Settings → Join mode
 
 ## Model Scope
@@ -594,7 +598,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 **Out-of-scope handling depends on source:**
 
 | Model source | Out-of-scope behavior |
-|---|---|
+| --- | --- |
 | Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
 | Caller-supplied via cross-extension RPC (`subagents:rpc:spawn`, e.g. pi-tasks `TaskExecute`) | Hard error returned to the calling extension, listing allowed models |
 | Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
@@ -607,6 +611,28 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 **Pattern format:** only exact `provider/modelId` entries are honored (e.g. `anthropic/claude-haiku-4-5-20251001`). Glob patterns (`*sonnet*`), bare model IDs, and `:thinking` suffixes — which pi itself supports — are silently dropped here. pi's `/scoped-models` picker writes exact entries, so the limitation is invisible if you configure scope through the UI. Hand-edited globs produce an empty allowed set (scope check becomes a no-op).
 
 **No-op safety:** if `enabledModels` is missing or empty in pi's settings, scope check skips entirely — no false positives, no spurious errors.
+
+## Subagent Model Routing
+
+One session-wide route decides the model for **every fresh subagent** — `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns all converge on it. Pi's main-session model is deliberately untouched: switching the subagent route never changes what you are talking to.
+
+| | |
+| --------- | ------------- |
+| Default | `commandcode/deepseek/deepseek-v4.1-flash` |
+| Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
+| Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
+| Stored | Session entry `subagent-model-state` — per session, never per project |
+| Status line | `routing:<provider>/<model>`, or `routing:blocked` |
+
+**Precedence.** The session selection wins, then the default. Nothing else: an agent file's `model:` frontmatter and the parent session's model are overridden silently, because neither is a choice the caller made for this spawn. A model a **caller** named — `Agent({ model })`, `agent({ model })` in a workflow, a scheduled job's `model`, an RPC `options.model` — is answered rather than ignored: if it conflicts with the route the spawn is refused with an error naming the routed model and `/subagent-model`, before any worktree or session exists. An override that names the routed model is accepted.
+
+**One retry, same task.** A recognized provider failure (auth, quota, rate limit, 404/408/429/5xx, connection/transport errors) retries *the identical task* — same prompt, type, tools, options and worktree — once on the fallback provider. A failure on that leg sets the terminal latch. Task, gate, test, cancellation, schema and scope failures never retry: the classifier is deliberately narrow, because a retry that re-runs finished work costs real tokens.
+
+**Fail closed.** A latched route refuses every later fresh or queued dispatch with the recorded reason, and never offers a replacement model — already-running agents are left to settle. Re-selecting with `/subagent-model` is the deliberate, only way out. An unavailable target (the selected or default model missing from this session's catalog) is terminal *before* execution: it does not fall back, so a provider outage or a revoked login surfaces as an error naming the model instead of a silent substitution.
+
+**Resumes are exempt** in both directions: a resumed conversation keeps the model its stored session already has, consumes no fallback attempt, and still opens while the route is latched.
+
+`PI_SUBAGENTS_MODEL_ROUTING=off` disables the route for the process — the escape hatch the test harnesses use, and available when debugging.
 
 ## Persistent Settings
 
@@ -699,7 +725,7 @@ Launch an autonomous agent. Available types:
 Custom agents live in .pi/agents/ or {{agentDir}}/agents/.
 ```
 
-Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `- ` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
+Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{isolationGuideline}}` and `{{scheduleGuideline}}` (each expands with its own leading newline + `-` bullet when the matching feature is on — place them directly after your last rule line; empty when [worktree isolation](#turning-worktrees-off) / scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
 
 **Starting point:** copy [`examples/agent-tool-description.md`](examples/agent-tool-description.md) — it reproduces the default full description exactly (a CI test keeps it in sync), so you can trim from a known-good baseline instead of writing from scratch.
 
@@ -724,7 +750,7 @@ Every project now starts with concurrency 16 and grace 10, without ever touching
 Agent lifecycle events are emitted via `pi.events.emit()` so other extensions can react:
 
 | Event | When | Key fields |
-|-------|------|------------|
+| ------- | ------ | ------------ |
 | `subagents:created` | `Agent`-tool background spawn, or a detached resume — **not** cross-extension RPC, scheduler, or `@handle` spawns, which are first seen at `subagents:started` | `id`, `type`, `description`, `isBackground` (always `true`) |
 | `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description` |
 | `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `description`, `status`, `durationMs`, `tokens` (display total, `{ input, output, total }` — see the note below), `usage` (the run's spend as a pi `Usage`: token components including `cacheRead`, plus `cost.total` in USD; absent when nothing was spent), `toolUses`, `result` |
@@ -840,7 +866,7 @@ memory: project   # project | local | user
 ```
 
 | Scope | Location | Use case |
-|-------|----------|----------|
+| ------- | ---------- | ---------- |
 | `project` | `.pi/agent-memory/<name>/` | Shared across the team (committed) |
 | `local` | `.pi/agent-memory-local/<name>/` | Machine-specific (gitignored) |
 | `user` | `<agentDir>/agent-memory/<name>/` (default `~/.pi/agent/agent-memory/`, honors `PI_CODING_AGENT_DIR`) | Global personal memory |
@@ -860,6 +886,7 @@ Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
 ```
 
 The agent gets a full, isolated copy of the repository. The worktree directory is removed on completion either way — what differs is whether a branch is left behind:
+
 - **No changes:** worktree is cleaned up automatically, no branch
 - **Changes made:** changes are committed to a new branch (`pi-agent-<id>`), and the result names the branch and the `git merge` command for it. The branch is the only artifact — the worktree path is gone, so nothing points into it
 - **Agent committed its own work:** the branch is created at the agent's HEAD, preserving its commits (uncommitted leftovers are committed on top first)
@@ -895,7 +922,7 @@ skills: api-conventions, error-handling
 **Discovery roots** (checked in this order, first match wins):
 
 | Scope | Path | Source |
-|---|---|---|
+| --- | --- | --- |
 | Project | `<cwd>/.pi/skills/` | Pi-standard |
 | Project | `<cwd>/.agents/skills/` | [Agent Skills spec](https://agentskills.io/integrate-skills) |
 | User | `$PI_CODING_AGENT_DIR/skills/` (default `~/.pi/agent/skills/`) | Pi-standard |
@@ -974,6 +1001,7 @@ src/
   skill-loader.ts     # Preload skills (Pi-standard + Agent Skills spec layouts)
   output-file.ts      # Streaming output file transcripts for agent sessions
   worktree.ts         # Git worktree isolation (create, cleanup, prune)
+  model-routing.ts    # Session-wide subagent model route: defaults, catalog checks, latch
   prompts.ts          # Config-driven system prompt builder
   context.ts          # Parent conversation context for inherit_context
   settings.ts         # Persistent settings (~/.pi/agent/subagents.json + .pi/subagents.json)

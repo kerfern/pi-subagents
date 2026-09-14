@@ -13,12 +13,12 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, Input, Key, matchesKey, type SelectItem, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
-import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
+import { AgentManager, isTopLevelAgent, type SubagentRouting } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -29,6 +29,17 @@ import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from ".
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
+import {
+  DEFAULT_SUBAGENT_MODEL,
+  type ModelRef,
+  modelKey,
+  ROUTING_STATE_TYPE,
+  resolveExactSelection,
+  restoreRoutingState,
+  routingCatalog,
+  type SubagentRoutingState,
+  selectModel,
+} from "./model-routing.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
@@ -564,6 +575,31 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  /**
+   * One model route per session, mutated in place: `startAgent` reads the live
+   * latch, so a fallback failure stops the NEXT dispatch too. `catalogFor`
+   * re-reads the catalog on every spawn because auth and the model scope can
+   * change mid-session, and a queued spawn starts minutes after it was queued.
+   */
+  const routingState: SubagentRoutingState = {
+    effective: DEFAULT_SUBAGENT_MODEL,
+    stale: false,
+    routingFailed: false,
+  };
+  const routing: SubagentRouting = {
+    state: routingState,
+    // The latch is set inside the manager, so the surfaces a person watches are
+    // refreshed from here rather than from a polling read of the state.
+    onLatch: (reason) => {
+      if (currentCtx) updateRoutingStatus(currentCtx);
+      currentCtx?.ui.notify(reason, "error");
+    },
+    catalogFor: (spawnCtx) => routingCatalog({
+      scoped: (spawnCtx.scopedModels ?? []).map(entry => entry.model as ModelRef),
+      available: (spawnCtx.modelRegistry.getAvailable?.() ?? spawnCtx.modelRegistry.getAll()) as ModelRef[],
+    }),
+  };
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
@@ -644,7 +680,7 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
-  });
+  }, routing);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -793,6 +829,7 @@ export default function (pi: ExtensionAPI) {
       fleet.setUICtx(ctx.ui as any);
     }
     manager.clearCompleted(true);
+    restoreSubagentRouting(ctx);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -1135,6 +1172,7 @@ export default function (pi: ExtensionAPI) {
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
   // The last two arguments keep a conversation overlay opened here identical to
   // one opened from `/agents`: same setting on the way in, same persist out.
+  // SAFETY: `currentCtx` is the live extension context; `chooseViewerMarkdown` reads only sessionManager/ui, which the richer command context also carries.
   const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
     (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
   let fleetViewEnabled = true;
@@ -1360,6 +1398,8 @@ export default function (pi: ExtensionAPI) {
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
     widget.setUICtx(ctx.ui as UICtx);
+    // SAFETY: the fleet and the widget render through the same Pi UI context;
+    // FleetUICtx is this repo's structural view of it, narrowed at one call site.
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     widget.onTurnStart();
   });
@@ -1482,6 +1522,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
+- Every subagent runs the session's routed model; the model parameter is refused unless it names that model (change it with /subagent-model).
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -1510,13 +1551,14 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
+- Every subagent runs this session's routed model. The model parameter is refused unless it names that model, and the main session's own model is unaffected — change the route with /subagent-model rather than per call.
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
 ## Writing the prompt
 
 Brief the agent like a smart colleague who just walked into the room — it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.
+
 - Explain what you're trying to accomplish and why.
 - Describe what you've already learned or ruled out.
 - Give enough context about the surrounding problem that the agent can make judgment calls rather than just following a narrow instruction.
@@ -2056,6 +2098,9 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          // The caller's spelling when there is one: shared routing refuses a
+          // conflicting override instead of silently ignoring it.
+          ...(resolvedConfig.modelFromParams ? { modelOverride: params.model as string } : {}),
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -2210,6 +2255,7 @@ Terse command-style prompts produce shallow, generic work.
           description: params.description,
           name: params.name as string | undefined,
           model,
+          ...(resolvedConfig.modelFromParams ? { modelOverride: params.model as string } : {}),
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
@@ -3965,6 +4011,208 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ctx.ui.notify(message, level);
   }
 
+  /** One status key, so the blocked state and the chosen model can't draw twice. */
+  function updateRoutingStatus(sessionCtx: ExtensionContext): void {
+    if (!sessionCtx.hasUI) return;
+    sessionCtx.ui.setStatus(
+      "subagent",
+      routingState.routingFailed ? "routing:blocked" : `routing:${routingState.effective}`,
+    );
+  }
+
+  /**
+   * Restores the branch's newest selection and migrates a legacy
+   * implementer-model entry once, so a session that predates this command keeps
+   * the model its owner already chose.
+   */
+  function restoreSubagentRouting(sessionCtx: ExtensionContext): void {
+    Object.assign(
+      routingState,
+      restoreRoutingState(sessionCtx.sessionManager.getBranch(), routing.catalogFor(sessionCtx)),
+    );
+    if (routingState.migratedFrom !== undefined && routingState.selected !== undefined) {
+      const slash = routingState.selected.indexOf("/");
+      pi.appendEntry(ROUTING_STATE_TYPE, {
+        provider: routingState.selected.slice(0, slash),
+        model: routingState.selected.slice(slash + 1),
+      });
+    }
+    updateRoutingStatus(sessionCtx);
+    if (routingState.stale) {
+      sessionCtx.ui.notify(
+        `Subagent model ${routingState.selected} is unavailable; using ${routingState.effective}.`,
+        "warning",
+      );
+    }
+  }
+
+  type RoutingModel = ModelRef & { contextWindow?: number; maxTokens?: number; reasoning?: boolean };
+
+  function routingModels(sessionCtx: ExtensionContext): RoutingModel[] {
+    return [...routing.catalogFor(sessionCtx)] as RoutingModel[];
+  }
+
+  function describeRoutingModel(model: RoutingModel): string {
+    const parts: string[] = [];
+    if (typeof model.contextWindow === "number") parts.push(`ctx ${model.contextWindow}`);
+    if (typeof model.maxTokens === "number") parts.push(`max ${model.maxTokens}`);
+    if (typeof model.reasoning === "boolean") parts.push(model.reasoning ? "reasoning" : "no reasoning");
+    return parts.join(" • ");
+  }
+
+  /**
+   * The model picker, mirroring Pi's own: fuzzy over the full `provider/model`
+   * key (a leading-prefix filter could never find "luna"-style names), and the
+   * same wider primary column, because the default truncates model ids that
+   * carry slashes.
+   */
+  async function pickSubagentModel(commandCtx: ExtensionCommandContext): Promise<string | null> {
+    const catalog = routingModels(commandCtx);
+    if (catalog.length === 0) {
+      commandCtx.ui.notify("No models available to pick from.", "warning");
+      return null;
+    }
+    return commandCtx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+      const container = new Container();
+      container.addChild(new Text(theme.fg("accent", theme.bold("Subagent model"))));
+      const searchInput = new Input();
+      searchInput.focused = true;
+      container.addChild(searchInput);
+      container.addChild(new Spacer(1));
+
+      const listTheme = {
+        selectedPrefix: (text: string) => theme.fg("accent", text),
+        selectedText: (text: string) => theme.fg("accent", text),
+        description: (text: string) => theme.fg("muted", text),
+        scrollInfo: (text: string) => theme.fg("dim", text),
+        noMatch: (text: string) => theme.fg("warning", text),
+      };
+
+      const matches = (query: string): readonly RoutingModel[] => {
+        const text = query.trim();
+        return text.length === 0 ? catalog : fuzzyFilter([...catalog], text, modelKey);
+      };
+
+      let list: SelectList;
+      let highlighted: RoutingModel | undefined;
+      function buildList(query: string): SelectList {
+        const found = matches(query);
+        const items: SelectItem[] = found.map(model => ({
+          value: modelKey(model),
+          label: modelKey(model),
+          description: describeRoutingModel(model),
+        }));
+        highlighted = found[0];
+        const next = new SelectList(items, Math.min(items.length, 15), listTheme, {
+          minPrimaryColumnWidth: 12,
+          maxPrimaryColumnWidth: 46,
+        });
+        next.onSelect = item => done(item.value);
+        next.onCancel = () => done(null);
+        return next;
+      }
+
+      const listContainer = new Container();
+      list = buildList("");
+      listContainer.addChild(list);
+      container.addChild(listContainer);
+
+      // Enter takes the best match: rebuilding on every keystroke resets the
+      // cursor to the top row, exactly like Pi's own model selector.
+      searchInput.onSubmit = () => {
+        if (highlighted !== undefined) done(modelKey(highlighted));
+      };
+
+      container.addChild(new Text(theme.fg("dim", "type to filter • ↑↓ navigate • enter select • esc cancel")));
+
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          if (keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "tui.select.down")) {
+            list.handleInput(data);
+          } else if (keybindings.matches(data, "tui.select.cancel")) {
+            done(null);
+            return;
+          } else {
+            searchInput.handleInput(data);
+            listContainer.clear();
+            list = buildList(searchInput.getValue());
+            listContainer.addChild(list);
+          }
+          tui.requestRender();
+        },
+      };
+    });
+  }
+
+  /**
+   * Persists the choice; a failed write changes neither state nor status, so a
+   * session that cannot record the model keeps routing the one it had.
+   */
+  function applyRoutingSelection(selection: string, sessionCtx: ExtensionContext): void {
+    const slash = selection.indexOf("/");
+    try {
+      pi.appendEntry(ROUTING_STATE_TYPE, {
+        provider: selection.slice(0, slash),
+        model: selection.slice(slash + 1),
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      sessionCtx.ui.notify(
+        `Could not save subagent model ${selection}: ${reason}. Keeping ${routingState.effective}.`,
+        "error",
+      );
+      return;
+    }
+    // Re-selecting is the deliberate way out of a latched route.
+    selectModel(routingState, selection);
+    updateRoutingStatus(sessionCtx);
+    sessionCtx.ui.notify(`Subagent model set to ${selection}.`, "info");
+  }
+
+  async function subagentModelCommand(args: string, commandCtx: ExtensionCommandContext): Promise<void> {
+    // `ExtensionCommandContext extends ExtensionContext`: every routing read the
+    // command needs (catalog, session branch, UI) is already on it.
+    const sessionCtx: ExtensionContext = commandCtx;
+    // Catalogs change mid-session (login, new provider, model scope), so the
+    // session_start snapshot must not decide what this command accepts.
+    const catalog = routingModels(sessionCtx);
+    const text = (args ?? "").trim();
+    if (text.length > 0) {
+      const selection = resolveExactSelection(text, catalog);
+      if (selection === undefined) {
+        sessionCtx.ui.notify(
+          `Unknown or unavailable model "${text}". Pass an exact provider/model, or run /subagent-model with no argument to pick one.`,
+          "warning",
+        );
+        return;
+      }
+      applyRoutingSelection(selection, sessionCtx);
+      return;
+    }
+
+    if (!sessionCtx.hasUI) {
+      sessionCtx.ui.notify(
+        "An exact provider/model argument is required without a picker UI, e.g. /subagent-model commandcode/deepseek/deepseek-v4.1-flash.",
+        "warning",
+      );
+      return;
+    }
+
+    const picked = await pickSubagentModel(commandCtx);
+    if (picked !== null) applyRoutingSelection(picked, sessionCtx);
+  }
+
+  pi.registerCommand("subagent-model", {
+    description: "Set the session-wide model used by every subagent (the main session's model is unaffected)",
+    handler: subagentModelCommand,
+  });
+  pi.registerCommand("implementer-model", {
+    description: "Alias for /subagent-model (session-wide subagent model)",
+    handler: subagentModelCommand,
+  });
+
   pi.registerCommand("agents", {
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
@@ -3981,6 +4229,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
     viewAgentConversation,
     // Read lazily: `currentCtx` is rebound on every session_start, and the
     // fleet list may act between sessions, when there is none.
+    // SAFETY: the value IS the live extension context; the consumer only needs
+    // the command-context surface for a modal, and `undefined` covers no session.
     getCtx: () => currentCtx as unknown as ExtensionCommandContext | undefined,
   };
 
