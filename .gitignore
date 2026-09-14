@@ -40,3 +40,6 @@ test/perf/.results/
 # Pi internal files
 progress.md
 CLAUDE.md
+
+# Serena MCP project state (indexes, memories, caches)
+.serena/
