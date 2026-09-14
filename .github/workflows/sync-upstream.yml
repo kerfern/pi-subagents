@@ -53,7 +53,10 @@ jobs:
           git fetch upstream master --no-tags
 
       - name: Mirror upstream/master into master (fast-forward only)
-        run: git push --ff-only origin upstream/master:refs/heads/master
+        # No `--ff-only` here: that is a fetch/pull option, and `git push` rejects
+        # a non-fast-forward update on its own. Named plainly, a rewritten
+        # upstream/master fails this step instead of being forced through.
+        run: git push origin upstream/master:refs/heads/master
 
       - name: Stop when shared-routing already contains upstream/master
         id: current
