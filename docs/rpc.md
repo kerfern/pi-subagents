@@ -76,7 +76,7 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `No active session` | `src/cross-extension-rpc.ts:107` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
 | `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
-| `Model override "<input>" is refused: this session routes every subagent to <model>. Change it with /subagent-model.` | `src/agent-manager.ts` — the session's [subagent model route](../README.md#subagent-model-routing); the override never reaches a model |
+| `Model override "<input>" is refused: this session routes <type> to <model>. Change it with /subagent-model.` | `src/agent-manager.ts` — the session's [reviewer/shared model routes](../README.md#subagent-model-routing); the override never reaches a model |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
 | `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
 | `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |

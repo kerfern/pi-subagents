@@ -12,9 +12,10 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    setupFiles: ["test/setup.ts"],
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
-    // The harnesses drive ONE-model faux catalogs, so the session-wide subagent
-    // route (see src/model-routing.ts) would latch as "target unavailable" in
+    // The harnesses drive narrow faux catalogs, so the reviewer/shared subagent
+    // routes (see src/model-routing.ts) would latch as "target unavailable" in
     // every wiring and e2e suite. Off here; test/model-routing.test.ts and
     // test/subagent-model-routing.test.ts exercise the route against their own
     // catalogs, and the one e2e that must route enables it per-test.

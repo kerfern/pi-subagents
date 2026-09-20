@@ -4,6 +4,7 @@ import {
   DEFAULT_SUBAGENT_MODEL,
   FALLBACK_SUBAGENT_MODEL,
   LEGACY_ROUTING_STATE_TYPE,
+  modelForSubagent,
   modelKey,
   ROUTING_STATE_TYPE,
   recordFallbackFailure,
@@ -12,7 +13,7 @@ import {
   restoreRoutingState,
   routingBlockReason,
   routingCatalog,
-  selectModel,
+  selectModels,
 } from "../src/model-routing.js";
 
 const FAUX = { provider: "faux", id: "faux-1" };
@@ -40,13 +41,26 @@ describe("restore + migration", () => {
     const state = restoreRoutingState(
       [
         { type: "custom", customType: ROUTING_STATE_TYPE, data: { provider: "other", model: "model/x" } },
-        { type: "custom", customType: ROUTING_STATE_TYPE, data: { provider: "faux", model: "faux-1" } },
+        {
+          type: "custom",
+          customType: ROUTING_STATE_TYPE,
+          data: {
+            provider: "faux",
+            model: "faux-1",
+            reviewerProvider: "other",
+            reviewerModel: "model/x",
+          },
+        },
       ],
       catalog,
     );
     expect(state.selected).toBe("faux/faux-1");
     expect(state.effective).toBe("faux/faux-1");
+    expect(state.reviewerEffective).toBe("other/model/x");
+    expect(state.reviewerEffective).toBe("other/model/x");
     expect(state.routingFailed).toBe(false);
+    expect(modelForSubagent(state, "reviewer")).toBe("other/model/x");
+    expect(modelForSubagent(state, "worker")).toBe("faux/faux-1");
   });
 
   it("migrates the legacy implementer-model entry once", () => {
@@ -55,6 +69,7 @@ describe("restore + migration", () => {
       catalog,
     );
     expect(state.selected).toBe("faux/faux-1");
+    expect(state.reviewerSelected).toBe("faux/faux-1");
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
@@ -65,6 +80,7 @@ describe("restore + migration", () => {
     );
     expect(state.selected).toBe("gone/x");
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
+    expect(state.reviewerEffective).toBe(DEFAULT_SUBAGENT_MODEL);
     expect(state.stale).toBe(true);
   });
 
@@ -74,6 +90,7 @@ describe("restore + migration", () => {
       catalog,
     );
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
+    expect(state.reviewerEffective).toBe(DEFAULT_SUBAGENT_MODEL);
     expect(state.stale).toBe(false);
   });
 });
@@ -120,7 +137,7 @@ describe("terminal latch", () => {
   it("clears the latch on a deliberate re-selection", () => {
     const state = restoreRoutingState([], catalog);
     recordFallbackFailure(state, "quota");
-    selectModel(state, modelKey(FAUX));
+    selectModels(state, modelKey(FAUX), modelKey(OTHER));
     expect(state.routingFailed).toBe(false);
     expect(routingBlockReason(state)).toBeUndefined();
     expect(state.effective).toBe("faux/faux-1");

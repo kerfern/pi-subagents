@@ -21,7 +21,7 @@ function router(state: SubagentRoutingState, models = [PRIMARY, FALLBACK]): Suba
   return { state, catalogFor: () => models };
 }
 
-function mockCtx(models = [PRIMARY, FALLBACK]) {
+function mockCtx(models = [PRIMARY, { provider: "faux", id: "reviewer-1" }, FALLBACK]) {
   return {
     cwd: "/tmp",
     scopedModels: [],
@@ -36,6 +36,7 @@ function mockCtx(models = [PRIMARY, FALLBACK]) {
 
 const state = (over: Partial<SubagentRoutingState> = {}): SubagentRoutingState => ({
   effective: "faux/primary-1",
+  reviewerEffective: "faux/primary-1",
   stale: false,
   routingFailed: false,
   ...over,
@@ -47,7 +48,8 @@ const fresh = (over: Record<string, unknown> = {}) => ({ description: "d", isBac
 
 /** Runs a fresh dispatch to completion (or startup failure). */
 async function spawnAndSettle(manager: AgentManager, over: Record<string, unknown> = {}) {
-  const id = manager.spawn({} as any, mockCtx(), "general-purpose", "p", fresh(over) as any);
+  const { type = "general-purpose", ...options } = over;
+  const id = manager.spawn({} as any, mockCtx(), type as string, "p", fresh(options) as any);
   const record = manager.getRecord(id);
   await (record?.promise ?? manager.awaitStartup(id)).catch(() => {});
   return record;
@@ -62,7 +64,7 @@ async function spawnRefused(manager: AgentManager, over: Record<string, unknown>
 let manager: AgentManager | undefined;
 
 beforeEach(() => {
-  // vitest.config disables routing process-wide for the one-model faux harnesses;
+  // vitest.config disables routing process-wide for narrow faux harnesses;
   // these tests supply their own catalog and need the route live.
   delete process.env.PI_SUBAGENTS_MODEL_ROUTING;
 });
@@ -74,6 +76,32 @@ afterEach(() => {
 });
 
 describe("shared routing at startAgent", () => {
+  it("uses reviewer model only for reviewer agents", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state({ reviewerEffective: "faux/reviewer-1" });
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+      PRIMARY,
+      { provider: "faux", id: "reviewer-1" },
+      FALLBACK,
+    ]));
+
+    await spawnAndSettle(manager, { type: "reviewer" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual({ provider: "faux", id: "reviewer-1" });
+  });
+
+  it("uses shared model for every non-reviewer agent", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state({ reviewerEffective: "faux/reviewer-1" });
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+      PRIMARY,
+      { provider: "faux", id: "reviewer-1" },
+      FALLBACK,
+    ]));
+
+    await spawnAndSettle(manager, { type: "worker" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
+  });
+
   it("runs the routed model instead of the caller's inherited model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));

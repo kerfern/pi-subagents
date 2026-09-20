@@ -24,7 +24,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
-- **Session-wide subagent route** — every fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC) runs the one model you pick with `/subagent-model`, independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
+- **Session-scoped subagent routes** — `/subagent-model` picks reviewer model first, then one shared model for every other fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC), independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
@@ -484,7 +484,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 | --------- | ------------- |
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
-| `/subagent-model [provider/model]` | Set (or report) the session-wide model every fresh subagent runs. No argument opens a picker; an argument must be an exact `provider/model`. See [Subagent Model Routing](#subagent-model-routing) |
+| `/subagent-model [provider/model]` | Set (or report) reviewer model, then one shared model for every other fresh subagent. No argument opens two pickers in series — type to filter, `↑↓` to move, `⏎` takes the highlighted row; an argument must be an exact `provider/model` and applies to both routes. See [Subagent Model Routing](#subagent-model-routing) |
 | `/implementer-model` | Alias for `/subagent-model` |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
@@ -614,14 +614,14 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Subagent Model Routing
 
-One session-wide route decides the model for **every fresh subagent** — `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns all converge on it. Pi's main-session model is deliberately untouched: switching the subagent route never changes what you are talking to.
+Two session-scoped routes decide fresh subagent models — reviewer calls use the reviewer route; `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns for every other role use the shared route. Pi's main-session model is deliberately untouched: switching either route never changes what you are talking to.
 
 | | |
 | --------- | ------------- |
 | Default | `commandcode/deepseek/deepseek-v4.1-flash` |
 | Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
-| Stored | Session entry `subagent-model-state` — per session, never per project |
+| Stored | Session entry `subagent-model-state` — shared `provider/model` plus `reviewerProvider/reviewerModel`, per session, never per project |
 | Status line | `routing:<provider>/<model>`, or `routing:blocked` |
 
 **Precedence.** The session selection wins, then the default. Nothing else: an agent file's `model:` frontmatter and the parent session's model are overridden silently, because neither is a choice the caller made for this spawn. A model a **caller** named — `Agent({ model })`, `agent({ model })` in a workflow, a scheduled job's `model`, an RPC `options.model` — is answered rather than ignored: if it conflicts with the route the spawn is refused with an error naming the routed model and `/subagent-model`, before any worktree or session exists. An override that names the routed model is accepted.

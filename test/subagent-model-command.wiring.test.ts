@@ -9,6 +9,7 @@
  * reports what the route will actually use.
  */
 
+import { KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import subagentsExtension from "../src/index.js";
@@ -16,6 +17,15 @@ import { ctx, type Hermetic, hermeticDir, makePi } from "./helpers/boot-extensio
 
 const FAUX = { provider: "faux", id: "faux-1" };
 const ROUTING_KEY = "subagent";
+/**
+ * Two providers serving the SAME model id — the case that makes a bare "luna"
+ * query ambiguous, and the one a person hits by typing `codex/...` for
+ * `openai-codex/...`.
+ */
+const LUNA = [
+  { provider: "commandcode", id: "gpt-5.6-luna" },
+  { provider: "openai-codex", id: "gpt-5.6-luna" },
+];
 
 function boot() {
   const booted = makePi();
@@ -81,8 +91,19 @@ describe("/subagent-model", () => {
     const { context, notes } = commandCtx();
     await booted.commands.get("subagent-model").handler("faux/faux-1", context);
 
-    expect(entryWrites(booted.pi)).toEqual([["subagent-model-state", { provider: "faux", model: "faux-1" }]]);
-    expect(notes.at(-1)).toEqual({ text: "Subagent model set to faux/faux-1.", level: "info" });
+    expect(entryWrites(booted.pi)).toEqual([[
+      "subagent-model-state",
+      {
+        provider: "faux",
+        model: "faux-1",
+        reviewerProvider: "faux",
+        reviewerModel: "faux-1",
+      },
+    ]]);
+    expect(notes.at(-1)).toEqual({
+      text: "Subagent models set: reviewer=faux/faux-1, others=faux/faux-1.",
+      level: "info",
+    });
   });
 
   it("refuses an unknown or unavailable model without writing state", async () => {
@@ -93,6 +114,23 @@ describe("/subagent-model", () => {
     expect(entryWrites(booted.pi)).toEqual([]);
     expect(notes.at(-1)?.level).toBe("warning");
     expect(notes.at(-1)?.text).toContain('Unknown or unavailable model "faux/nope"');
+  });
+
+  it("names the near misses when the argument is not a catalog key", async () => {
+    const booted = boot();
+    // The provider is `openai-codex`; `codex/...` is what a person types.
+    const { context, notes } = commandCtx({
+      modelRegistry: {
+        find: vi.fn(),
+        getAll: vi.fn(() => LUNA),
+        getAvailable: vi.fn(() => LUNA),
+      },
+    });
+    await booted.commands.get("subagent-model").handler("codex/gpt-5.6-luna", context);
+
+    expect(entryWrites(booted.pi)).toEqual([]);
+    expect(notes.at(-1)?.text).toContain("openai-codex/gpt-5.6-luna");
+    expect(notes.at(-1)?.text).not.toContain("commandcode/gpt-5.6-luna");
   });
 
   it("refuses a fuzzy name, because the route is an exact identity", async () => {
@@ -117,7 +155,101 @@ describe("/subagent-model", () => {
     const { context, statuses } = commandCtx();
     await booted.commands.get("subagent-model").handler("faux/faux-1", context);
 
-    expect(statuses.at(-1)).toEqual({ key: ROUTING_KEY, text: "routing:faux/faux-1" });
+    expect(statuses.at(-1)).toEqual({
+      key: ROUTING_KEY,
+      text: "routing:faux/faux-1 | others:faux/faux-1",
+    });
+  });
+});
+
+describe("the /subagent-model picker", () => {
+  const DOWN = "\x1b[B";
+  const ENTER = "\r";
+
+  /** Holds the picker component open and hands out its input stream. */
+  function picker(models: { provider: string; id: string }[] = LUNA) {
+    let instance: { handleInput: (data: string) => void } | undefined;
+    const build = (factory: unknown, done: (value: string | null) => void) => {
+      instance = (
+        factory as (
+          tui: unknown,
+          theme: unknown,
+          keybindings: unknown,
+          finish: (value: string | null) => void,
+        ) => { handleInput: (data: string) => void }
+      )(
+        { requestRender: vi.fn() },
+        { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+        new KeybindingsManager(TUI_KEYBINDINGS, {}),
+        done,
+      );
+    };
+    const context = ctx({
+      hasUI: true,
+      ui: {
+        notify: vi.fn(),
+        setStatus: vi.fn(),
+        custom: vi.fn((factory: unknown) =>
+          new Promise((resolve) => { build(factory, resolve as (value: string | null) => void); })),
+      },
+      scopedModels: [],
+      modelRegistry: {
+        find: vi.fn((provider: string, id: string) =>
+          models.find(model => model.provider === provider && model.id === id)),
+        getAll: vi.fn(() => models),
+        getAvailable: vi.fn(() => models),
+      },
+    });
+    return { context, send: (data: string) => instance?.handleInput(data) };
+  }
+
+  it("takes the row the arrow keys moved to, not the top fuzzy match", async () => {
+    const booted = boot();
+    const { context, send } = picker();
+
+    const pending = booted.commands.get("subagent-model").handler("", context);
+    // "luna" matches both rows; the shorter key (commandcode) sorts first, so
+    // only honouring ↓ can reach the codex entry the user moved down to.
+    for (const char of "luna") send(char);
+    send(DOWN);
+    send(ENTER);
+    // First prompt is reviewer; second prompt is shared model for all others.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    send(ENTER);
+    await pending;
+
+    expect(entryWrites(booted.pi)).toEqual([[
+      "subagent-model-state",
+      {
+        provider: "commandcode",
+        model: "gpt-5.6-luna",
+        reviewerProvider: "openai-codex",
+        reviewerModel: "gpt-5.6-luna",
+      },
+    ]]);
+  });
+
+  it("still picks the top match when no arrow key is pressed", async () => {
+    const booted = boot();
+    const { context, send } = picker();
+
+    const pending = booted.commands.get("subagent-model").handler("", context);
+    for (const char of "luna") send(char);
+    send(ENTER);
+    // Reviewer first; choose same top match for shared agents in second prompt.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    send(ENTER);
+    await pending;
+
+    expect(entryWrites(booted.pi)).toEqual([[
+      "subagent-model-state",
+      {
+        provider: "commandcode",
+        model: "gpt-5.6-luna",
+        reviewerProvider: "commandcode",
+        reviewerModel: "gpt-5.6-luna",
+      },
+    ]]);
   });
 });
 
@@ -182,7 +314,10 @@ describe("routing restore on session start", () => {
     });
     await booted.lifecycle.get("session_start")({}, context);
 
-    expect(statuses.at(-1)).toEqual({ key: ROUTING_KEY, text: "routing:faux/faux-1" });
+    expect(statuses.at(-1)).toEqual({
+      key: ROUTING_KEY,
+      text: "routing:faux/faux-1 | others:faux/faux-1",
+    });
   });
 
   it("falls back to the default and warns when the stored selection is gone", async () => {
@@ -214,6 +349,14 @@ describe("routing restore on session start", () => {
     });
     await booted.lifecycle.get("session_start")({}, context);
 
-    expect(entryWrites(booted.pi)).toEqual([["subagent-model-state", { provider: "faux", model: "faux-1" }]]);
+    expect(entryWrites(booted.pi)).toEqual([[
+      "subagent-model-state",
+      {
+        provider: "faux",
+        model: "faux-1",
+        reviewerProvider: "faux",
+        reviewerModel: "faux-1",
+      },
+    ]]);
   });
 });

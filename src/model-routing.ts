@@ -1,5 +1,5 @@
 /**
- * model-routing.ts — the session-wide subagent model route.
+ * model-routing.ts — the session-scoped reviewer/shared subagent model route.
  *
  * Pi-free on purpose: every function takes and returns plain objects so the
  * policy can be unit tested without a session, and so `AgentManager` can apply
@@ -26,10 +26,14 @@ export interface ModelRef {
 }
 
 export interface SubagentRoutingState {
-  /** Last selection recorded in the session, when one existed. */
-  selected?: string;
-  /** Model a fresh dispatch uses when the route is healthy. */
+  /** Model used by fresh non-reviewer dispatches. */
   effective: string;
+  /** Model used by fresh reviewer dispatches. */
+  reviewerEffective: string;
+  /** Shared-model selection recorded for every non-reviewer agent. */
+  selected?: string;
+  /** Reviewer selection recorded separately. */
+  reviewerSelected?: string;
   /** A stored selection points at a model the catalog has lost. */
   stale: boolean;
   /** Terminal: every later fresh dispatch is refused with `terminalReason`. */
@@ -72,7 +76,16 @@ export function resolveExactSelection(text: string, catalog: readonly ModelRef[]
 }
 
 function emptyState(): SubagentRoutingState {
-  return { effective: DEFAULT_SUBAGENT_MODEL, stale: false, routingFailed: false };
+  return {
+    effective: DEFAULT_SUBAGENT_MODEL,
+    reviewerEffective: DEFAULT_SUBAGENT_MODEL,
+    stale: false,
+    routingFailed: false,
+  };
+}
+
+export function modelForSubagent(state: SubagentRoutingState, type: string): string {
+  return type === "reviewer" ? state.reviewerEffective : state.effective;
 }
 
 /**
@@ -90,30 +103,54 @@ export function restoreRoutingState(
     if (entry?.type !== "custom") continue;
     const legacy = entry.customType === LEGACY_ROUTING_STATE_TYPE;
     if (!legacy && entry.customType !== ROUTING_STATE_TYPE) continue;
-    const { provider, model } = (entry.data ?? {}) as { provider?: unknown; model?: unknown };
-    if (typeof provider !== "string" || typeof model !== "string") continue;
-    if (provider.length === 0 || model.length === 0) continue;
-    const selected = `${provider}/${model}`;
+    const data = (entry.data ?? {}) as {
+      provider?: unknown;
+      model?: unknown;
+      reviewerProvider?: unknown;
+      reviewerModel?: unknown;
+    };
+    if (typeof data.provider !== "string" || typeof data.model !== "string") continue;
+    if (data.provider.length === 0 || data.model.length === 0) continue;
+
+    const selected = `${data.provider}/${data.model}`;
+    const reviewer = typeof data.reviewerProvider === "string" && typeof data.reviewerModel === "string"
+      && data.reviewerProvider.length > 0 && data.reviewerModel.length > 0
+      ? `${data.reviewerProvider}/${data.reviewerModel}`
+      : selected;
     const migrated = legacy ? { migratedFrom: LEGACY_ROUTING_STATE_TYPE } : {};
-    if (!known.includes(selected)) {
-      return { ...emptyState(), selected, stale: true, ...migrated };
-    }
-    return { effective: selected, selected, stale: false, routingFailed: false, ...migrated };
+    const stale = !known.includes(selected) || !known.includes(reviewer);
+    return {
+      ...emptyState(),
+      selected,
+      reviewerSelected: reviewer,
+      effective: known.includes(selected) ? selected : DEFAULT_SUBAGENT_MODEL,
+      reviewerEffective: known.includes(reviewer) ? reviewer : DEFAULT_SUBAGENT_MODEL,
+      stale,
+      ...migrated,
+    };
   }
   return emptyState();
 }
+
 
 /**
  * Applies a deliberate session selection. Re-selecting is the only way out of a
  * latched route, and it is deliberate: the user typed a model.
  */
-export function selectModel(state: SubagentRoutingState, key: string): void {
-  state.selected = key;
-  state.effective = key;
+export function selectModels(state: SubagentRoutingState, shared: string, reviewer: string): void {
+  state.selected = shared;
+  state.reviewerSelected = reviewer;
+  state.effective = shared;
+  state.reviewerEffective = reviewer;
   state.stale = false;
   state.routingFailed = false;
   state.terminalReason = undefined;
   state.migratedFrom = undefined;
+}
+
+/** Backward-compatible helper: one explicit choice applies to both roles. */
+export function selectModel(state: SubagentRoutingState, key: string): void {
+  selectModels(state, key, key);
 }
 
 export function clearRoutingState(state: SubagentRoutingState): void {

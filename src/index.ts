@@ -38,7 +38,7 @@ import {
   restoreRoutingState,
   routingCatalog,
   type SubagentRoutingState,
-  selectModel,
+  selectModels,
 } from "./model-routing.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -583,6 +583,7 @@ export default function (pi: ExtensionAPI) {
    */
   const routingState: SubagentRoutingState = {
     effective: DEFAULT_SUBAGENT_MODEL,
+    reviewerEffective: DEFAULT_SUBAGENT_MODEL,
     stale: false,
     routingFailed: false,
   };
@@ -1522,7 +1523,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- Every subagent runs the session's routed model; the model parameter is refused unless it names that model (change it with /subagent-model).
+- Reviewer uses its route; all others use shared. Model params must name route; change with /subagent-model.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -1551,7 +1552,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Every subagent runs this session's routed model. The model parameter is refused unless it names that model, and the main session's own model is unaffected — change the route with /subagent-model rather than per call.
+- Reviewer agents use the reviewer route; every other agent uses the shared route. A model parameter is refused unless it names that agent's routed model, and the main session's own model is unaffected — change routes with /subagent-model rather than per call.
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
@@ -4016,7 +4017,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
     if (!sessionCtx.hasUI) return;
     sessionCtx.ui.setStatus(
       "subagent",
-      routingState.routingFailed ? "routing:blocked" : `routing:${routingState.effective}`,
+      routingState.routingFailed
+        ? "routing:blocked"
+        : `routing:${routingState.reviewerEffective} | others:${routingState.effective}`,
     );
   }
 
@@ -4032,15 +4035,25 @@ Write the file using the write tool. Only write the file, nothing else.`;
     );
     if (routingState.migratedFrom !== undefined && routingState.selected !== undefined) {
       const slash = routingState.selected.indexOf("/");
+      const reviewer = routingState.reviewerSelected ?? routingState.selected;
+      const reviewerSlash = reviewer?.indexOf("/") ?? -1;
       pi.appendEntry(ROUTING_STATE_TYPE, {
         provider: routingState.selected.slice(0, slash),
         model: routingState.selected.slice(slash + 1),
+        ...(reviewer !== undefined && reviewerSlash > 0
+          ? {
+              reviewerProvider: reviewer.slice(0, reviewerSlash),
+              reviewerModel: reviewer.slice(reviewerSlash + 1),
+            }
+          : {}),
       });
     }
     updateRoutingStatus(sessionCtx);
     if (routingState.stale) {
       sessionCtx.ui.notify(
-        `Subagent model ${routingState.selected} is unavailable; using ${routingState.effective}.`,
+        `Subagent model unavailable (reviewer=${routingState.reviewerSelected}, ` +
+          `others=${routingState.selected}); using reviewer=${routingState.reviewerEffective}, ` +
+          `others=${routingState.effective}.`,
         "warning",
       );
     }
@@ -4066,7 +4079,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
    * same wider primary column, because the default truncates model ids that
    * carry slashes.
    */
-  async function pickSubagentModel(commandCtx: ExtensionCommandContext): Promise<string | null> {
+  async function pickSubagentModel(
+    commandCtx: ExtensionCommandContext,
+    label: string,
+  ): Promise<string | null> {
     const catalog = routingModels(commandCtx);
     if (catalog.length === 0) {
       commandCtx.ui.notify("No models available to pick from.", "warning");
@@ -4074,7 +4090,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     }
     return commandCtx.ui.custom<string | null>((tui, theme, keybindings, done) => {
       const container = new Container();
-      container.addChild(new Text(theme.fg("accent", theme.bold("Subagent model"))));
+      container.addChild(new Text(theme.fg("accent", theme.bold(label))));
       const searchInput = new Input();
       searchInput.focused = true;
       container.addChild(searchInput);
@@ -4094,7 +4110,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
       };
 
       let list: SelectList;
-      let highlighted: RoutingModel | undefined;
       function buildList(query: string): SelectList {
         const found = matches(query);
         const items: SelectItem[] = found.map(model => ({
@@ -4102,7 +4117,6 @@ Write the file using the write tool. Only write the file, nothing else.`;
           label: modelKey(model),
           description: describeRoutingModel(model),
         }));
-        highlighted = found[0];
         const next = new SelectList(items, Math.min(items.length, 15), listTheme, {
           minPrimaryColumnWidth: 12,
           maxPrimaryColumnWidth: 46,
@@ -4117,10 +4131,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
       listContainer.addChild(list);
       container.addChild(listContainer);
 
-      // Enter takes the best match: rebuilding on every keystroke resets the
-      // cursor to the top row, exactly like Pi's own model selector.
+      // Enter takes the row the cursor is on — the best match until an arrow key
+      // moves it, exactly like Pi's own model selector. The list's own cursor is
+      // what makes ↑↓ mean anything: several providers serve the same model id,
+      // so the top hit for "luna" is whichever key is shortest, not the row the
+      // user moved down to.
       searchInput.onSubmit = () => {
-        if (highlighted !== undefined) done(modelKey(highlighted));
+        const item = list.getSelectedItem();
+        if (item !== null) done(item.value);
       };
 
       container.addChild(new Text(theme.fg("dim", "type to filter • ↑↓ navigate • enter select • esc cancel")));
@@ -4150,25 +4168,33 @@ Write the file using the write tool. Only write the file, nothing else.`;
    * Persists the choice; a failed write changes neither state nor status, so a
    * session that cannot record the model keeps routing the one it had.
    */
-  function applyRoutingSelection(selection: string, sessionCtx: ExtensionContext): void {
-    const slash = selection.indexOf("/");
+  function applyRoutingSelection(
+    shared: string,
+    reviewer: string,
+    sessionCtx: ExtensionContext,
+  ): void {
+    const slash = shared.indexOf("/");
+    const reviewerSlash = reviewer.indexOf("/");
     try {
       pi.appendEntry(ROUTING_STATE_TYPE, {
-        provider: selection.slice(0, slash),
-        model: selection.slice(slash + 1),
+        provider: shared.slice(0, slash),
+        model: shared.slice(slash + 1),
+        reviewerProvider: reviewer.slice(0, reviewerSlash),
+        reviewerModel: reviewer.slice(reviewerSlash + 1),
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       sessionCtx.ui.notify(
-        `Could not save subagent model ${selection}: ${reason}. Keeping ${routingState.effective}.`,
+        `Could not save subagent models reviewer=${reviewer}, others=${shared}: ${reason}. ` +
+          `Keeping reviewer=${routingState.reviewerEffective}, others=${routingState.effective}.`,
         "error",
       );
       return;
     }
     // Re-selecting is the deliberate way out of a latched route.
-    selectModel(routingState, selection);
+    selectModels(routingState, shared, reviewer);
     updateRoutingStatus(sessionCtx);
-    sessionCtx.ui.notify(`Subagent model set to ${selection}.`, "info");
+    sessionCtx.ui.notify(`Subagent models set: reviewer=${reviewer}, others=${shared}.`, "info");
   }
 
   async function subagentModelCommand(args: string, commandCtx: ExtensionCommandContext): Promise<void> {
@@ -4182,13 +4208,18 @@ Write the file using the write tool. Only write the file, nothing else.`;
     if (text.length > 0) {
       const selection = resolveExactSelection(text, catalog);
       if (selection === undefined) {
+        // Refusing stays exact — but say what was probably meant. The likeliest
+        // mistake is a provider the catalog spells differently (`codex` for
+        // `openai-codex`), which no amount of re-reading the argument reveals.
+        const near = fuzzyFilter(catalog.map(modelKey), text, key => key).slice(0, 3);
+        const hint = near.length > 0 ? `\n\nDid you mean:\n${near.map(key => `  ${key}`).join("\n")}` : "";
         sessionCtx.ui.notify(
-          `Unknown or unavailable model "${text}". Pass an exact provider/model, or run /subagent-model with no argument to pick one.`,
+          `Unknown or unavailable model "${text}". Pass an exact provider/model, or run /subagent-model with no argument to pick one.${hint}`,
           "warning",
         );
         return;
       }
-      applyRoutingSelection(selection, sessionCtx);
+      applyRoutingSelection(selection, selection, sessionCtx);
       return;
     }
 
@@ -4200,16 +4231,18 @@ Write the file using the write tool. Only write the file, nothing else.`;
       return;
     }
 
-    const picked = await pickSubagentModel(commandCtx);
-    if (picked !== null) applyRoutingSelection(picked, sessionCtx);
+    const reviewer = await pickSubagentModel(commandCtx, "Reviewer model");
+    if (reviewer === null) return;
+    const shared = await pickSubagentModel(commandCtx, "Other agents model");
+    if (shared !== null) applyRoutingSelection(shared, reviewer, sessionCtx);
   }
 
   pi.registerCommand("subagent-model", {
-    description: "Set the session-wide model used by every subagent (the main session's model is unaffected)",
+    description: "Set reviewer model, then one shared model for all other subagents",
     handler: subagentModelCommand,
   });
   pi.registerCommand("implementer-model", {
-    description: "Alias for /subagent-model (session-wide subagent model)",
+    description: "Alias for /subagent-model (reviewer + shared subagent models)",
     handler: subagentModelCommand,
   });
 

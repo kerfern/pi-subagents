@@ -27,6 +27,7 @@ import {
   FALLBACK_SUBAGENT_MODEL,
   isRoutingEnabled,
   type ModelRef,
+  modelForSubagent,
   modelKey,
   recordFallbackFailure,
   recordUnavailableModel,
@@ -54,7 +55,7 @@ export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
 /**
- * The session-wide model route, handed to the manager once per session.
+ * The session-scoped reviewer/shared model route, handed to the manager once per session.
  *
  * The state object is shared by reference and mutated in place: a fallback
  * failure during one spawn has to stop the NEXT dispatch too, which only works
@@ -465,7 +466,7 @@ export class AgentManager {
     onCompact?: OnAgentCompact,
     onUsage?: OnAgentUsage,
     /**
-     * Session-wide model route (see `src/model-routing.ts`). Optional so every
+     * Session-scoped reviewer/shared model route (see `src/model-routing.ts`). Optional so every
      * existing `new AgentManager()` — tests, and any host that wants raw
      * pass-through — keeps today's behavior exactly.
      */
@@ -722,14 +723,14 @@ export class AgentManager {
    * extension RPC — converges on `startAgent`, and only here is the catalog read
    * at the moment the work actually starts (a queued spawn can be minutes old).
    */
-  private resolveRoute(ctx: ExtensionContext, options: SpawnOptions): RoutedModels | string {
+  private resolveRoute(ctx: ExtensionContext, options: SpawnOptions, type: string): RoutedModels | string {
     const routing = this.routing;
     if (routing === undefined) return "";
     const blocked = routingBlockReason(routing.state);
     if (blocked !== undefined) return blocked;
 
     const catalog = routing.catalogFor(ctx);
-    const wanted = routing.state.effective;
+    const wanted = modelForSubagent(routing.state, type);
     // Both legs are validated up front: a fallback that cannot be resolved is a
     // latched route, and discovering that mid-task would waste the primary run.
     const model = this.exactCatalogModel(ctx, catalog, wanted);
@@ -744,7 +745,7 @@ export class AgentManager {
     if (options.modelOverride !== undefined && options.model !== undefined) {
       const same = options.model.provider === model.provider && options.model.id === model.id;
       if (!same) {
-        return `Model override "${options.modelOverride}" is refused: this session routes every subagent to ` +
+        return `Model override "${options.modelOverride}" is refused: this session routes ${type} to ` +
           `${wanted}. Change it with /subagent-model.`;
       }
     }
@@ -866,7 +867,7 @@ export class AgentManager {
     // deliberately exempt — a resumed conversation keeps the model its stored
     // session already has, and must still open while the route is latched.
     const routed = this.routing !== undefined && isRoutingEnabled() && options.resumeSessionFile === undefined
-      ? this.resolveRoute(ctx, options)
+      ? this.resolveRoute(ctx, options, type)
       : undefined;
     if (typeof routed === "string") throw new Error(routed);
 

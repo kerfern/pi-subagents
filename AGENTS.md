@@ -56,6 +56,24 @@ Read the file that covers a surface before changing its behavior; update it in t
 - `npm run bench` runs the benchmarks in `test/perf/*.bench.ts` (absolute timings, ~1 min). Opt-in: it is not part of the check suite, and `npm run test` never picks bench files up. `npm run bench:ab -- <ref>` benchmarks the working tree against another commit and prints the delta — use it for a PR's `## Performance` section. The `*.perf.test.ts` guards beside them assert operation counts, not time, and DO run in the normal suite.
 - For ad-hoc scripts, write them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 
+## Runtime Source (why an edit can appear to do nothing)
+
+Pi loads this repo **from this working tree** — `~/.pi/agent/settings.json` lists `/Users/kerf/Projects/pi-subagents` as a local package. Local paths are loaded in place, so `src/` edits take effect after `/reload`, with no build and no publish.
+
+Two ways that silently breaks, both seen in practice:
+
+- **A second copy exists.** A `git:`/`npm:` entry for pi-subagents loads a clone (`~/.pi/agent/git/<host>/<path>`) or a published tarball (`~/.pi/agent/npm/node_modules/@tintinweb/pi-subagents`) — a *different identity* to the local path, so Pi loads both and the stale one's tools win. Fixes committed but not installed appear to do nothing.
+- **`settings.json.bak-*`.** The backups name `npm:@tintinweb/pi-subagents`; restoring one silently swaps the source back to a published build.
+
+Before concluding a change had no effect, check which copy is live:
+
+```bash
+pi list | grep -A1 -B1 subagents   # must resolve to /Users/kerf/Projects/pi-subagents
+grep -rn "pi-subagents" ~/.pi/agent/settings.json
+```
+
+Keep exactly one entry — the local path. If a clone or npm copy reappears, remove that entry rather than editing the stale tree. `pi install git:…` re-creates `~/.pi/agent/git/<host>/<path>`; never point the dev loop back at it.
+
 ## Git
 
 - **Never commit.** The user commits manually. At most, suggest a concise commit message as text.
