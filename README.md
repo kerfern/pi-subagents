@@ -24,7 +24,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
-- **Session-scoped subagent routes** — `/subagent-model` picks reviewer model first, then one shared model for every other fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC), independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
+- **Session-scoped subagent routes** — `/subagent-model` picks reviewer model → reviewer thinking → shared model → shared thinking for every other fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC), independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
@@ -484,7 +484,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 | --------- | ------------- |
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
-| `/subagent-model [provider/model]` | Set (or report) reviewer model, then one shared model for every other fresh subagent. No argument opens two pickers in series — type to filter, `↑↓` to move, `⏎` takes the highlighted row; an argument must be an exact `provider/model` and applies to both routes. See [Subagent Model Routing](#subagent-model-routing) |
+| `/subagent-model [provider/model]` | Set reviewer model → reviewer thinking → other-subagent model → other-subagent thinking. No argument opens four pickers in series; model pickers support filtering and `↑↓`, thinking pickers offer `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. An exact `provider/model` argument applies models only, preserving current thinking routes. See [Subagent Model Routing](#subagent-model-routing) |
 | `/implementer-model` | Alias for `/subagent-model` |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
@@ -614,17 +614,18 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Subagent Model Routing
 
-Two session-scoped routes decide fresh subagent models — reviewer calls use the reviewer route; `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns for every other role use the shared route. Pi's main-session model is deliberately untouched: switching either route never changes what you are talking to.
+Two session-scoped routes decide fresh subagent models — reviewer calls use the reviewer route; `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns for every other role use the shared route. The same command stores one thinking level per route. Pi's main-session model is deliberately untouched: switching either route never changes what you are talking to.
 
 | | |
 | --------- | ------------- |
-| Default | `commandcode/deepseek/deepseek-v4.1-flash` |
+| Defaults | Reviewer `openai-codex/gpt-5.6-sol`; others `openai-codex/gpt-5.6-luna` |
 | Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
-| Stored | Session entry `subagent-model-state` — shared `provider/model` plus `reviewerProvider/reviewerModel`, per session, never per project |
-| Status line | `routing:<provider>/<model>`, or `routing:blocked` |
+| Picker order | Reviewer model → reviewer thinking → other-subagent model → other-subagent thinking |
+| Stored | Session entry `subagent-model-state` — shared `provider/model` + `thinking`, reviewer `reviewerProvider/reviewerModel` + `reviewerThinking`, per session, never per project |
+| Status line | `🧿: <reviewer model> (<thinking>) | 👷🏻‍♂️: <other model> (<thinking>)`, or blocked |
 
-**Precedence.** The session selection wins, then the default. Nothing else: an agent file's `model:` frontmatter and the parent session's model are overridden silently, because neither is a choice the caller made for this spawn. A model a **caller** named — `Agent({ model })`, `agent({ model })` in a workflow, a scheduled job's `model`, an RPC `options.model` — is answered rather than ignored: if it conflicts with the route the spawn is refused with an error naming the routed model and `/subagent-model`, before any worktree or session exists. An override that names the routed model is accepted.
+**Precedence.** For models, the session selection wins, then the default. An agent file's `model:` frontmatter and the parent session's model are overridden silently, because neither is a choice the caller made for this spawn. A model a **caller** named — `Agent({ model })`, `agent({ model })` in a workflow, a scheduled job's `model`, an RPC `options.model` — is answered rather than ignored: if it conflicts with the route the spawn is refused with an error naming the routed model and `/subagent-model`, before any worktree or session exists. An override that names the routed model is accepted. Thinking routes are fallback defaults: explicit agent `thinking:` frontmatter or a caller/workflow `thinking`/`effort` value wins; otherwise the selected route level is passed to Pi, which clamps unsupported levels for the selected model.
 
 **One retry, same task.** A recognized provider failure (auth, quota, rate limit, 404/408/429/5xx, connection/transport errors) retries *the identical task* — same prompt, type, tools, options and worktree — once on the fallback provider. A failure on that leg sets the terminal latch. Task, gate, test, cancellation, schema and scope failures never retry: the classifier is deliberately narrow, because a retry that re-runs finished work costs real tokens.
 

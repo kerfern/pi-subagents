@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyProviderFailure,
+  DEFAULT_REVIEWER_MODEL,
   DEFAULT_SUBAGENT_MODEL,
   FALLBACK_SUBAGENT_MODEL,
   LEGACY_ROUTING_STATE_TYPE,
@@ -14,6 +15,7 @@ import {
   routingBlockReason,
   routingCatalog,
   selectModels,
+  thinkingForSubagent,
 } from "../src/model-routing.js";
 
 const FAUX = { provider: "faux", id: "faux-1" };
@@ -37,6 +39,28 @@ describe("routing catalog", () => {
 });
 
 describe("restore + migration", () => {
+  it("restores reviewer and shared thinking selections on the branch", () => {
+    const state = restoreRoutingState(
+      [{
+        type: "custom",
+        customType: ROUTING_STATE_TYPE,
+        data: {
+          provider: "faux",
+          model: "faux-1",
+          reviewerProvider: "other",
+          reviewerModel: "model/x",
+          thinking: "high",
+          reviewerThinking: "low",
+        },
+      }],
+      catalog,
+    );
+    expect(state.effectiveThinking).toBe("high");
+    expect(state.reviewerEffectiveThinking).toBe("low");
+    expect(thinkingForSubagent(state, "reviewer")).toBe("low");
+    expect(thinkingForSubagent(state, "worker")).toBe("high");
+  });
+
   it("restores the newest selection on the branch", () => {
     const state = restoreRoutingState(
       [
@@ -73,6 +97,15 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
+  it("defaults reviewer to Sol and other agents to Luna", () => {
+    const state = restoreRoutingState([], [
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      { provider: "openai-codex", id: "gpt-5.6-luna" },
+    ]);
+    expect(state.reviewerEffective).toBe("openai-codex/gpt-5.6-sol");
+    expect(state.effective).toBe("openai-codex/gpt-5.6-luna");
+  });
+
   it("keeps the default when a stored selection is gone, and reports it stale", () => {
     const state = restoreRoutingState(
       [{ type: "custom", customType: ROUTING_STATE_TYPE, data: { provider: "gone", model: "x" } }],
@@ -80,7 +113,7 @@ describe("restore + migration", () => {
     );
     expect(state.selected).toBe("gone/x");
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
-    expect(state.reviewerEffective).toBe(DEFAULT_SUBAGENT_MODEL);
+    expect(state.reviewerEffective).toBe(DEFAULT_REVIEWER_MODEL);
     expect(state.stale).toBe(true);
   });
 
@@ -90,7 +123,7 @@ describe("restore + migration", () => {
       catalog,
     );
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
-    expect(state.reviewerEffective).toBe(DEFAULT_SUBAGENT_MODEL);
+    expect(state.reviewerEffective).toBe(DEFAULT_REVIEWER_MODEL);
     expect(state.stale).toBe(false);
   });
 });
@@ -137,9 +170,11 @@ describe("terminal latch", () => {
   it("clears the latch on a deliberate re-selection", () => {
     const state = restoreRoutingState([], catalog);
     recordFallbackFailure(state, "quota");
-    selectModels(state, modelKey(FAUX), modelKey(OTHER));
+    selectModels(state, modelKey(FAUX), modelKey(OTHER), "medium", "high");
     expect(state.routingFailed).toBe(false);
     expect(routingBlockReason(state)).toBeUndefined();
     expect(state.effective).toBe("faux/faux-1");
+    expect(state.effectiveThinking).toBe("medium");
+    expect(state.reviewerEffectiveThinking).toBe("high");
   });
 });

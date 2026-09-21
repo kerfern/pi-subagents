@@ -9,7 +9,10 @@
  * with the recorded reason; nothing here ever picks another model on its own.
  */
 
-export const DEFAULT_SUBAGENT_MODEL = "commandcode/deepseek/deepseek-v4.1-flash";
+import type { ThinkingLevel } from "./types.js";
+
+export const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-5.6-luna";
+export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-5.6-sol";
 /**
  * Where one provider failure retries to. Deliberately a DIFFERENT provider from
  * the default: retrying inside the provider that just failed re-dials the same
@@ -34,6 +37,14 @@ export interface SubagentRoutingState {
   selected?: string;
   /** Reviewer selection recorded separately. */
   reviewerSelected?: string;
+  /** Shared thinking-level selection recorded for every non-reviewer agent. */
+  selectedThinking?: ThinkingLevel;
+  /** Reviewer thinking-level selection recorded separately. */
+  reviewerSelectedThinking?: ThinkingLevel;
+  /** Effective shared thinking level, after route restoration. */
+  effectiveThinking?: ThinkingLevel;
+  /** Effective reviewer thinking level, after route restoration. */
+  reviewerEffectiveThinking?: ThinkingLevel;
   /** A stored selection points at a model the catalog has lost. */
   stale: boolean;
   /** Terminal: every later fresh dispatch is refused with `terminalReason`. */
@@ -78,7 +89,11 @@ export function resolveExactSelection(text: string, catalog: readonly ModelRef[]
 function emptyState(): SubagentRoutingState {
   return {
     effective: DEFAULT_SUBAGENT_MODEL,
-    reviewerEffective: DEFAULT_SUBAGENT_MODEL,
+    reviewerEffective: DEFAULT_REVIEWER_MODEL,
+    selectedThinking: undefined,
+    reviewerSelectedThinking: undefined,
+    effectiveThinking: undefined,
+    reviewerEffectiveThinking: undefined,
     stale: false,
     routingFailed: false,
   };
@@ -86,6 +101,16 @@ function emptyState(): SubagentRoutingState {
 
 export function modelForSubagent(state: SubagentRoutingState, type: string): string {
   return type === "reviewer" ? state.reviewerEffective : state.effective;
+}
+
+export function thinkingForSubagent(state: SubagentRoutingState, type: string): ThinkingLevel | undefined {
+  return type === "reviewer" ? state.reviewerEffectiveThinking : state.effectiveThinking;
+}
+
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function parseThinkingLevel(value: unknown): ThinkingLevel | undefined {
+  return typeof value === "string" && THINKING_LEVELS.has(value) ? value as ThinkingLevel : undefined;
 }
 
 /**
@@ -108,6 +133,8 @@ export function restoreRoutingState(
       model?: unknown;
       reviewerProvider?: unknown;
       reviewerModel?: unknown;
+      thinking?: unknown;
+      reviewerThinking?: unknown;
     };
     if (typeof data.provider !== "string" || typeof data.model !== "string") continue;
     if (data.provider.length === 0 || data.model.length === 0) continue;
@@ -117,6 +144,8 @@ export function restoreRoutingState(
       && data.reviewerProvider.length > 0 && data.reviewerModel.length > 0
       ? `${data.reviewerProvider}/${data.reviewerModel}`
       : selected;
+    const selectedThinking = parseThinkingLevel(data.thinking);
+    const reviewerThinking = parseThinkingLevel(data.reviewerThinking) ?? selectedThinking;
     const migrated = legacy ? { migratedFrom: LEGACY_ROUTING_STATE_TYPE } : {};
     const stale = !known.includes(selected) || !known.includes(reviewer);
     return {
@@ -124,7 +153,11 @@ export function restoreRoutingState(
       selected,
       reviewerSelected: reviewer,
       effective: known.includes(selected) ? selected : DEFAULT_SUBAGENT_MODEL,
-      reviewerEffective: known.includes(reviewer) ? reviewer : DEFAULT_SUBAGENT_MODEL,
+      reviewerEffective: known.includes(reviewer) ? reviewer : DEFAULT_REVIEWER_MODEL,
+      selectedThinking,
+      reviewerSelectedThinking: reviewerThinking,
+      effectiveThinking: selectedThinking,
+      reviewerEffectiveThinking: reviewerThinking,
       stale,
       ...migrated,
     };
@@ -137,11 +170,23 @@ export function restoreRoutingState(
  * Applies a deliberate session selection. Re-selecting is the only way out of a
  * latched route, and it is deliberate: the user typed a model.
  */
-export function selectModels(state: SubagentRoutingState, shared: string, reviewer: string): void {
+export function selectModels(
+  state: SubagentRoutingState,
+  shared: string,
+  reviewer: string,
+  sharedThinking?: ThinkingLevel,
+  reviewerThinking?: ThinkingLevel,
+): void {
   state.selected = shared;
   state.reviewerSelected = reviewer;
   state.effective = shared;
   state.reviewerEffective = reviewer;
+  if (sharedThinking !== undefined || reviewerThinking !== undefined) {
+    state.selectedThinking = sharedThinking;
+    state.reviewerSelectedThinking = reviewerThinking;
+    state.effectiveThinking = sharedThinking;
+    state.reviewerEffectiveThinking = reviewerThinking;
+  }
   state.stale = false;
   state.routingFailed = false;
   state.terminalReason = undefined;

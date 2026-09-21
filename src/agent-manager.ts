@@ -33,6 +33,7 @@ import {
   recordUnavailableModel,
   routingBlockReason,
   type SubagentRoutingState,
+  thinkingForSubagent,
 } from "./model-routing.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
@@ -870,6 +871,9 @@ export class AgentManager {
       ? this.resolveRoute(ctx, options, type)
       : undefined;
     if (typeof routed === "string") throw new Error(routed);
+    const routedThinking = this.routing !== undefined && routed !== undefined
+      ? thinkingForSubagent(this.routing.state, type)
+      : undefined;
 
     // Take the running state — and with it the concurrency slot — BEFORE the
     // first await. Creating a worktree is an awaited git call, and drainQueue
@@ -962,7 +966,7 @@ export class AgentManager {
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
-      thinkingLevel: options.thinkingLevel,
+      thinkingLevel: options.thinkingLevel ?? routedThinking,
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,

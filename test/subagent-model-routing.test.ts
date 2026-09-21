@@ -102,6 +102,22 @@ describe("shared routing at startAgent", () => {
     expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
   });
 
+  it("uses reviewer and shared thinking routes by agent type", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state({
+      reviewerEffectiveThinking: "high",
+      effectiveThinking: "low",
+    } as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+
+    await spawnAndSettle(manager, { type: "reviewer" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
+
+    vi.mocked(runAgent).mockClear();
+    await spawnAndSettle(manager, { type: "worker" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("low");
+  });
+
   it("runs the routed model instead of the caller's inherited model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));

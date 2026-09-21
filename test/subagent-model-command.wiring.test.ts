@@ -48,6 +48,7 @@ function commandCtx(overrides: Record<string, unknown> = {}) {
       setWidget: vi.fn(),
       getEditorText: vi.fn(() => ""),
       custom: vi.fn(),
+      select: vi.fn(async () => undefined),
     },
     scopedModels: [],
     modelRegistry: {
@@ -157,7 +158,7 @@ describe("/subagent-model", () => {
 
     expect(statuses.at(-1)).toEqual({
       key: ROUTING_KEY,
-      text: "routing:faux/faux-1 | others:faux/faux-1",
+      text: "🧿: faux/faux-1 | 👷🏻‍♂️: faux/faux-1",
     });
   });
 });
@@ -167,7 +168,10 @@ describe("the /subagent-model picker", () => {
   const ENTER = "\r";
 
   /** Holds the picker component open and hands out its input stream. */
-  function picker(models: { provider: string; id: string }[] = LUNA) {
+  function picker(
+    models: { provider: string; id: string }[] = LUNA,
+    thinkingChoices: string[] = ["off", "off"],
+  ) {
     let instance: { handleInput: (data: string) => void } | undefined;
     const build = (factory: unknown, done: (value: string | null) => void) => {
       instance = (
@@ -191,6 +195,7 @@ describe("the /subagent-model picker", () => {
         setStatus: vi.fn(),
         custom: vi.fn((factory: unknown) =>
           new Promise((resolve) => { build(factory, resolve as (value: string | null) => void); })),
+        select: vi.fn(async () => thinkingChoices.shift()),
       },
       scopedModels: [],
       modelRegistry: {
@@ -205,7 +210,7 @@ describe("the /subagent-model picker", () => {
 
   it("takes the row the arrow keys moved to, not the top fuzzy match", async () => {
     const booted = boot();
-    const { context, send } = picker();
+    const { context, send } = picker(LUNA, ["high", "minimal"]);
 
     const pending = booted.commands.get("subagent-model").handler("", context);
     // "luna" matches both rows; the shorter key (commandcode) sorts first, so
@@ -213,7 +218,9 @@ describe("the /subagent-model picker", () => {
     for (const char of "luna") send(char);
     send(DOWN);
     send(ENTER);
-    // First prompt is reviewer; second prompt is shared model for all others.
+    // Series: reviewer model → reviewer thinking → other model → other thinking.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    send(ENTER);
     await new Promise(resolve => setTimeout(resolve, 0));
     send(ENTER);
     await pending;
@@ -225,18 +232,22 @@ describe("the /subagent-model picker", () => {
         model: "gpt-5.6-luna",
         reviewerProvider: "openai-codex",
         reviewerModel: "gpt-5.6-luna",
+        thinking: "minimal",
+        reviewerThinking: "high",
       },
     ]]);
   });
 
   it("still picks the top match when no arrow key is pressed", async () => {
     const booted = boot();
-    const { context, send } = picker();
+    const { context, send } = picker(LUNA, ["off", "off"]);
 
     const pending = booted.commands.get("subagent-model").handler("", context);
     for (const char of "luna") send(char);
     send(ENTER);
     // Reviewer first; choose same top match for shared agents in second prompt.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    send(ENTER);
     await new Promise(resolve => setTimeout(resolve, 0));
     send(ENTER);
     await pending;
@@ -248,6 +259,8 @@ describe("the /subagent-model picker", () => {
         model: "gpt-5.6-luna",
         reviewerProvider: "commandcode",
         reviewerModel: "gpt-5.6-luna",
+        thinking: "off",
+        reviewerThinking: "off",
       },
     ]]);
   });
@@ -284,7 +297,11 @@ describe("the Agent tool under a live route", () => {
       { prompt: "go", description: "d", subagent_type: "general-purpose", model: "faux/faux-1" },
       undefined,
       undefined,
-      agentCtx([FAUX, { provider: "commandcode", id: "deepseek/deepseek-v4.1-flash" }]),
+      agentCtx([
+        FAUX,
+        { provider: "openai-codex", id: "gpt-5.6-luna" },
+        { provider: "openai-codex", id: "gpt-5.6-sol" },
+      ]),
     )).rejects.toThrow(/override/i);
   });
 
@@ -316,7 +333,7 @@ describe("routing restore on session start", () => {
 
     expect(statuses.at(-1)).toEqual({
       key: ROUTING_KEY,
-      text: "routing:faux/faux-1 | others:faux/faux-1",
+      text: "🧿: faux/faux-1 | 👷🏻‍♂️: faux/faux-1",
     });
   });
 
@@ -332,8 +349,10 @@ describe("routing restore on session start", () => {
     });
     await booted.lifecycle.get("session_start")({}, context);
 
-    expect(statuses.at(-1)?.key).toBe(ROUTING_KEY);
-    expect(statuses.at(-1)?.text).toContain("commandcode/deepseek/deepseek-v4.1-flash");
+    expect(statuses.at(-1)).toEqual({
+      key: ROUTING_KEY,
+      text: "🧿: openai-codex/gpt-5.6-sol | 👷🏻‍♂️: openai-codex/gpt-5.6-luna",
+    });
     expect(notes.some(note => note.level === "warning" && note.text.includes("gone/x"))).toBe(true);
   });
 

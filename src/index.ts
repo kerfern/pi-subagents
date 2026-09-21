@@ -30,6 +30,7 @@ import { describeMention, handleBase, isReservedHandle, parseMention, resolveHan
 import { runMentionClone } from "./mention-clone.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import {
+  DEFAULT_REVIEWER_MODEL,
   DEFAULT_SUBAGENT_MODEL,
   type ModelRef,
   modelKey,
@@ -47,7 +48,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -583,7 +584,7 @@ export default function (pi: ExtensionAPI) {
    */
   const routingState: SubagentRoutingState = {
     effective: DEFAULT_SUBAGENT_MODEL,
-    reviewerEffective: DEFAULT_SUBAGENT_MODEL,
+    reviewerEffective: DEFAULT_REVIEWER_MODEL,
     stale: false,
     routingFailed: false,
   };
@@ -4015,11 +4016,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
   /** One status key, so the blocked state and the chosen model can't draw twice. */
   function updateRoutingStatus(sessionCtx: ExtensionContext): void {
     if (!sessionCtx.hasUI) return;
+    const describeRoute = (model: string, thinking: ThinkingLevel | undefined) =>
+      thinking === undefined ? model : `${model} (${thinking})`;
     sessionCtx.ui.setStatus(
       "subagent",
       routingState.routingFailed
-        ? "routing:blocked"
-        : `routing:${routingState.reviewerEffective} | others:${routingState.effective}`,
+        ? "🧿: blocked | 👷🏻‍♂️: blocked"
+        : `🧿: ${describeRoute(routingState.reviewerEffective, routingState.reviewerEffectiveThinking)} | ` +
+          `👷🏻‍♂️: ${describeRoute(routingState.effective, routingState.effectiveThinking)}`,
     );
   }
 
@@ -4045,6 +4049,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
               reviewerProvider: reviewer.slice(0, reviewerSlash),
               reviewerModel: reviewer.slice(reviewerSlash + 1),
             }
+          : {}),
+        ...(routingState.effectiveThinking !== undefined
+          ? { thinking: routingState.effectiveThinking }
+          : {}),
+        ...(routingState.reviewerEffectiveThinking !== undefined
+          ? { reviewerThinking: routingState.reviewerEffectiveThinking }
           : {}),
       });
     }
@@ -4164,6 +4174,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
     });
   }
 
+  async function pickSubagentThinking(
+    commandCtx: ExtensionCommandContext,
+    label: string,
+  ): Promise<ThinkingLevel | null> {
+    const choice = await commandCtx.ui.select(label, [...THINKING_LEVELS]);
+    return choice === undefined ? null : choice as ThinkingLevel;
+  }
+
   /**
    * Persists the choice; a failed write changes neither state nor status, so a
    * session that cannot record the model keeps routing the one it had.
@@ -4171,6 +4189,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
   function applyRoutingSelection(
     shared: string,
     reviewer: string,
+    sharedThinking: ThinkingLevel | undefined,
+    reviewerThinking: ThinkingLevel | undefined,
     sessionCtx: ExtensionContext,
   ): void {
     const slash = shared.indexOf("/");
@@ -4181,6 +4201,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
         model: shared.slice(slash + 1),
         reviewerProvider: reviewer.slice(0, reviewerSlash),
         reviewerModel: reviewer.slice(reviewerSlash + 1),
+        ...(sharedThinking !== undefined ? { thinking: sharedThinking } : {}),
+        ...(reviewerThinking !== undefined ? { reviewerThinking } : {}),
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -4192,9 +4214,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
       return;
     }
     // Re-selecting is the deliberate way out of a latched route.
-    selectModels(routingState, shared, reviewer);
+    selectModels(routingState, shared, reviewer, sharedThinking, reviewerThinking);
     updateRoutingStatus(sessionCtx);
-    sessionCtx.ui.notify(`Subagent models set: reviewer=${reviewer}, others=${shared}.`, "info");
+    const thinkingSuffix = sharedThinking !== undefined && reviewerThinking !== undefined
+      ? ` reviewer thinking=${reviewerThinking}, others thinking=${sharedThinking}`
+      : "";
+    sessionCtx.ui.notify(
+      `Subagent models set: reviewer=${reviewer}, others=${shared}.${thinkingSuffix}`,
+      "info",
+    );
   }
 
   async function subagentModelCommand(args: string, commandCtx: ExtensionCommandContext): Promise<void> {
@@ -4219,7 +4247,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         );
         return;
       }
-      applyRoutingSelection(selection, selection, sessionCtx);
+      applyRoutingSelection(selection, selection, undefined, undefined, sessionCtx);
       return;
     }
 
@@ -4233,12 +4261,18 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
     const reviewer = await pickSubagentModel(commandCtx, "Reviewer model");
     if (reviewer === null) return;
+    const reviewerThinking = await pickSubagentThinking(commandCtx, "Reviewer thinking");
+    if (reviewerThinking === null) return;
     const shared = await pickSubagentModel(commandCtx, "Other agents model");
-    if (shared !== null) applyRoutingSelection(shared, reviewer, sessionCtx);
+    if (shared === null) return;
+    const sharedThinking = await pickSubagentThinking(commandCtx, "Other agents thinking");
+    if (sharedThinking !== null) {
+      applyRoutingSelection(shared, reviewer, sharedThinking, reviewerThinking, sessionCtx);
+    }
   }
 
   pi.registerCommand("subagent-model", {
-    description: "Set reviewer model, then one shared model for all other subagents",
+    description: "Set reviewer model/thinking, then other-subagent model/thinking",
     handler: subagentModelCommand,
   });
   pi.registerCommand("implementer-model", {
