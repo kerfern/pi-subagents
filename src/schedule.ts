@@ -259,6 +259,7 @@ export class SubagentScheduler {
         maxTurns: job.max_turns,
         isolated: job.isolated,
         thinkingLevel: job.thinking,
+        ...(job.thinking !== undefined ? { thinkingOverride: job.thinking } : {}),
         isolation: job.isolation,
         // A scheduled run has no tool call to build this, so without it the
         // conversation viewer shows nothing about how the job was configured.
@@ -282,8 +283,6 @@ export class SubagentScheduler {
       return;
     }
 
-    this.emit({ type: "fired", jobId: id, agentId, name: job.name });
-
     const finalize = (status: "success" | "error") => {
       const next = this.getNextRun(id);
       const current = store.get(id);
@@ -301,13 +300,20 @@ export class SubagentScheduler {
     // awaitStartup first: with isolation: "worktree" the run promise only exists
     // once the repo copy is made, and a failed copy rejects here.
     manager.awaitStartup(agentId)
-      .then(() => manager.getRecord(agentId)?.promise)
+      .then(() => {
+        this.emit({ type: "fired", jobId: id, agentId, name: job.name });
+        return manager.getRecord(agentId)?.promise;
+      })
       .then(() => {
         const r = manager.getRecord(agentId);
         const failed = r?.status === "error" || r?.status === "aborted" || r?.status === "stopped";
         finalize(failed ? "error" : "success");
       })
-      .catch(() => finalize("error"));
+      .catch((err) => {
+        const error = err instanceof Error ? err.message : String(err);
+        finalize("error");
+        this.emit({ type: "error", jobId: id, error });
+      });
   }
 
   private emit(event: ScheduleChangeEvent): void {

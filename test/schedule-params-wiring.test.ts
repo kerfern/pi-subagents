@@ -40,8 +40,9 @@ function bootedCtx() {
  */
 async function scheduleAndReadBack(
   params: Record<string, unknown>,
+  agentFiles?: Record<string, string>,
 ): Promise<{ job: ScheduledSubagent; reply: string; restore: () => void }> {
-  const hermetic = hermeticDir();
+  const hermetic = hermeticDir({ agentFiles });
   const { pi, tools, lifecycle } = makePi();
   subagentsExtension(pi);
 
@@ -79,6 +80,18 @@ describe("Agent tool → persisted scheduled job", () => {
       expect(job.isolation).toBe("worktree");
       expect(job.prompt).toBe("do the thing");
       expect(job.enabled).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not persist frontmatter thinking as a caller override", async () => {
+    const { job, restore } = await scheduleAndReadBack(
+      { subagent_type: "scout" },
+      { scout: "---\ndescription: scout\nthinking: low\n---\nScout" },
+    );
+    try {
+      expect(job.thinking).toBeUndefined();
     } finally {
       restore();
     }

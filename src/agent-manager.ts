@@ -246,6 +246,8 @@ interface SpawnOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /** Caller-supplied thinking level; routed sessions reject conflicts. */
+  thinkingOverride?: ThinkingLevel;
   isBackground?: boolean;
   /**
    * Skip whichever pool's queue check applies to this spawn — start immediately
@@ -751,6 +753,13 @@ export class AgentManager {
       }
     }
 
+    const routedThinking = thinkingForSubagent(routing.state, type);
+    if (options.thinkingOverride !== undefined && routedThinking !== undefined
+      && options.thinkingOverride !== routedThinking) {
+      return `Thinking override "${options.thinkingOverride}" is refused: this session routes ${type} to ` +
+        `${routedThinking}. Change it with /subagent-model.`;
+    }
+
     const fallback = this.exactCatalogModel(ctx, catalog, FALLBACK_SUBAGENT_MODEL);
     if (typeof fallback === "string") {
       recordUnavailableModel(routing.state, FALLBACK_SUBAGENT_MODEL);
@@ -966,7 +975,7 @@ export class AgentManager {
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
-      thinkingLevel: options.thinkingLevel ?? routedThinking,
+      thinkingLevel: routedThinking ?? options.thinkingLevel,
       structuredOutput: options.structuredOutput,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,

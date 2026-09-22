@@ -339,6 +339,8 @@ describe("SubagentScheduler — fire path", () => {
 
     vi.advanceTimersByTime(1_000);
     const optsArg = manager.spawn.mock.calls[0][4];
+    expect(optsArg.thinkingLevel).toBe("high");
+    expect(optsArg.thinkingOverride).toBe("high");
     expect(optsArg.invocation).toEqual({
       thinking: "high",
       maxTurns: 12,
@@ -369,12 +371,13 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(0);
   });
 
-  it("emits fired event with agentId on successful spawn", () => {
+  it("emits fired event with agentId after successful startup", async () => {
     scheduler.addJob({
       name: "fire-once", description: "x", schedule: "+1s",
       subagent_type: "general-purpose", prompt: "x",
     });
     vi.advanceTimersByTime(2_000);
+    await vi.advanceTimersByTimeAsync(0);
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
       type: "fired", name: "fire-once", agentId: expect.stringMatching(/^agent-/),
     }));
@@ -408,6 +411,15 @@ describe("SubagentScheduler — fire path", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(scheduler.list().find(j => j.id === job.id)?.lastStatus).toBe("error");
+    expect(pi.events.emit).not.toHaveBeenCalledWith(
+      "subagents:scheduled",
+      expect.objectContaining({ type: "fired", jobId: job.id }),
+    );
+    expect(pi.events.emit).toHaveBeenCalledWith("subagents:scheduled", expect.objectContaining({
+      type: "error",
+      jobId: job.id,
+      error: 'Cannot run with isolation: "worktree"',
+    }));
   });
 
   // ── Status reflection from record.status (regression for bug #1) ────

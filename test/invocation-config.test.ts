@@ -43,6 +43,7 @@ describe("resolveAgentInvocationConfig", () => {
 
     expect(resolved.modelInput).toBe("provider/config-model");
     expect(resolved.modelFromParams).toBe(false);
+    expect(resolved.thinkingFromParams).toBe(true);
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
@@ -64,6 +65,7 @@ describe("resolveAgentInvocationConfig", () => {
 
     expect(resolved.modelInput).toBe("provider/param-model");
     expect(resolved.modelFromParams).toBe(true);
+    expect(resolved.thinkingFromParams).toBe(true);
     expect(resolved.thinking).toBe("minimal");
     expect(resolved.maxTurns).toBe(3);
     expect(resolved.inheritContext).toBe(true);
@@ -171,10 +173,12 @@ describe("resolveAgentInvocationConfig — overridden params (#182)", () => {
   it("records nothing when only one side named a value", () => {
     // Config-only is the agent's own default, not an override; param-only won
     // outright. Neither is a request that went unhonored.
-    expect(resolveAgentInvocationConfig(
+    const configOnly = resolveAgentInvocationConfig(
       makeConfig({ model: "provider/config-model", thinking: "low" }),
       {},
-    ).overridden).toBeUndefined();
+    );
+    expect(configOnly.overridden).toBeUndefined();
+    expect(configOnly.thinkingFromParams).toBe(false);
 
     expect(resolveAgentInvocationConfig(
       makeConfig(),

@@ -276,17 +276,22 @@ describe("the Agent tool under a live route", () => {
     process.env.PI_SUBAGENTS_MODEL_ROUTING = "off";
   });
 
-  function agentCtx(models: { provider: string; id: string }[]) {
-    return ctx({
-      hasUI: true,
-      scopedModels: [],
+  function agentCtx(
+    models: { provider: string; id: string }[],
+    branch: unknown[] = [],
+  ) {
+    return commandCtx({
+      sessionManager: {
+        getSessionId: vi.fn(() => "s1"),
+        getBranch: vi.fn(() => branch),
+      },
       modelRegistry: {
         find: vi.fn((provider: string, id: string) =>
           models.find(model => model.provider === provider && model.id === id)),
         getAll: vi.fn(() => models),
         getAvailable: vi.fn(() => models),
       },
-    });
+    }).context;
   }
 
   it("refuses a per-call model override that the route cannot honour", async () => {
@@ -303,6 +308,43 @@ describe("the Agent tool under a live route", () => {
         { provider: "openai-codex", id: "gpt-5.6-sol" },
       ]),
     )).rejects.toThrow(/override/i);
+  });
+
+  it("refuses a per-call thinking override that conflicts with the route", async () => {
+    const booted = boot();
+    const models = [
+      FAUX,
+      { provider: "openai-codex", id: "gpt-5.6-luna" },
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      { provider: "openrouter", id: "nvidia/nemotron-3-ultra-550b-a55b:free" },
+    ];
+    const context = agentCtx(models, [{
+      type: "custom",
+      customType: "subagent-model-state",
+      data: {
+        provider: "openai-codex",
+        model: "gpt-5.6-luna",
+        reviewerProvider: "openai-codex",
+        reviewerModel: "gpt-5.6-sol",
+        thinking: "high",
+        reviewerThinking: "medium",
+      },
+    }]);
+    await booted.lifecycle.get("session_start")({}, context);
+
+    await expect(booted.tools.get("Agent").execute(
+      "tc",
+      {
+        prompt: "go",
+        description: "d",
+        subagent_type: "general-purpose",
+        thinking: "medium",
+        run_in_background: false,
+      },
+      undefined,
+      undefined,
+      context,
+    )).rejects.toThrow(/Thinking override "medium" is refused.*routes general-purpose to high/i);
   });
 
   it("refuses the dispatch, before running anything, when the route's model is unavailable", async () => {

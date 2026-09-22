@@ -253,13 +253,14 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(stub.spawnAndWait.mock.calls[0][4].workflowId).toBeUndefined();
   });
 
-  it("maps opts.effort onto the spawn's thinking level", async () => {
+  it("maps opts.effort onto the spawn's thinking level and override marker", async () => {
     const stub = stubManager();
     const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
 
     await host.spawnAgent(request({ effort: "high" }));
 
     expect(stub.spawnAndWait.mock.calls[0][4].thinkingLevel).toBe("high");
+    expect(stub.spawnAndWait.mock.calls[0][4].thinkingOverride).toBe("high");
   });
 
   it("leaves thinkingLevel unset when no effort was asked for", async () => {

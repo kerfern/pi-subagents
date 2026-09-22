@@ -20,7 +20,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
-| `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
+| `thinkingLevel` | ThinkingLevel | With an active [subagent route](../README.md#subagent-model-routing), must match the routed thinking level or the spawn is refused. Pi may clamp the accepted level to what the resolved model supports |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
@@ -77,6 +77,7 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
 | `Model override "<input>" is refused: this session routes <type> to <model>. Change it with /subagent-model.` | `src/agent-manager.ts` — the session's [reviewer/shared model routes](../README.md#subagent-model-routing); the override never reaches a model |
+| `Thinking override "<level>" is refused: this session routes <type> to <level>. Change it with /subagent-model.` | `src/agent-manager.ts` — explicit RPC thinking must match the session's role route |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
 | `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
 | `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |

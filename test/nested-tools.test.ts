@@ -111,6 +111,22 @@ describe("child-safe nested Agent tools", () => {
     );
   });
 
+  it("marks caller-supplied thinking for route conflict checks", async () => {
+    const [agent] = tools();
+    await execute(agent, {
+      subagent_type: "scout",
+      description: "find files",
+      prompt: "Find them",
+      thinking: "high",
+    });
+
+    expect(spawnAndWait).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), "scout", "Find them",
+      expect.objectContaining({ thinkingLevel: "high", thinkingOverride: "high" }),
+      expect.any(Function),
+    );
+  });
+
   it("keeps agent discovery rooted in inherited config, not the working directory", async () => {
     const workCwd = mkdtempSync(join(tmpdir(), "nested-tools-work-"));
     const workAgentDir = join(workCwd, ".pi", "agents");

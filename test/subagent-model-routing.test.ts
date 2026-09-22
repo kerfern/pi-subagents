@@ -118,6 +118,37 @@ describe("shared routing at startAgent", () => {
     expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("low");
   });
 
+  it("runs routed thinking instead of inherited or frontmatter thinking", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state({ effectiveThinking: "high" } as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+
+    await spawnAndSettle(manager, { thinkingLevel: "low" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
+  });
+
+  it("refuses an explicit thinking level that conflicts with the route", async () => {
+    const routing = state({ effectiveThinking: "high" } as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+
+    await expect(spawnRefused(manager, {
+      thinkingLevel: "medium",
+      thinkingOverride: "medium",
+    })).rejects.toThrow(
+      'Thinking override "medium" is refused: this session routes general-purpose to high. Change it with /subagent-model.',
+    );
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("allows an explicit thinking level that matches the route", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state({ effectiveThinking: "high" } as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+
+    await spawnAndSettle(manager, { thinkingLevel: "high", thinkingOverride: "high" });
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
+  });
+
   it("runs the routed model instead of the caller's inherited model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));

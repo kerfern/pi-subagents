@@ -58,6 +58,7 @@ interface NestedSpawnOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  thinkingOverride?: ThinkingLevel;
   isBackground?: boolean;
   isolation?: IsolationMode;
   invocation?: AgentInvocation;
@@ -267,6 +268,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
+        ...(invocation.thinkingFromParams ? { thinkingOverride: params.thinking as ThinkingLevel } : {}),
         isolation: invocation.isolation,
         invocation: {
           thinking: invocation.thinking,

@@ -109,6 +109,22 @@ describe("cross-extension RPC", () => {
       );
     });
 
+    it("marks RPC thinkingLevel as a caller override", async () => {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-thinking", reply);
+      events.emit("subagents:rpc:spawn", {
+        requestId: "req-thinking", type: "Explore", prompt: "find it",
+        options: { thinkingLevel: "high" },
+      });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(manager.spawn).toHaveBeenCalledWith(
+        deps.pi, ctx, "Explore", "find it",
+        { thinkingLevel: "high", thinkingOverride: "high" },
+      );
+    });
+
     it("returns error when no active session", async () => {
       ctx = undefined;
       registerRpcHandlers(deps);

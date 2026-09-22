@@ -240,7 +240,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku`. **Refused while the session's [subagent model route](../README.md#subagent-model-routing) is active** unless it names the routed model — the route decides what every child runs, so a script cannot pick one. Change the route with `/subagent-model` |
-| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
+| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. With an active [subagent route](../README.md#subagent-model-routing), a conflicting value is refused; omit it to use routed thinking. Without routing, omission falls back to agent definition then parent |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
@@ -250,7 +250,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 
-Every child of a run is a fresh subagent, so every one of them runs the session's routed model (see [Subagent Model Routing](../README.md#subagent-model-routing)): the row's model column reports what it actually ran on, and an `agent({ model })` that names something else is refused rather than ignored — typically surfacing to the script as a `null` agent and a run-level error, the same shape a bad agent type takes.
+Every child of a run is a fresh subagent, so every one of them runs the session's routed model and thinking level (see [Subagent Model Routing](../README.md#subagent-model-routing)): the row reports what it actually ran on, and an `agent({ model })` or `agent({ effort })` that conflicts with its route is refused rather than ignored — typically surfacing to the script as a `null` agent and a run-level error, the same shape a bad agent type takes.
 
 ### `pipeline()` and `parallel()`
 

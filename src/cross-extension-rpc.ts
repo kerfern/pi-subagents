@@ -155,6 +155,13 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         if (verdict.kind === "error") throw new Error(verdict.message);
       }
 
+      if (normalizedOptions.thinkingLevel != null) {
+        normalizedOptions = {
+          ...normalizedOptions,
+          thinkingOverride: normalizedOptions.thinkingLevel,
+        };
+      }
+
       const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
       // With isolation: "worktree" the agent starts asynchronously — wait for
       // it, so a strict-isolation failure is still an error envelope rather

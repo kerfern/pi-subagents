@@ -311,10 +311,15 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // silently running a different one.
             ...(request.model !== undefined ? { modelOverride: request.model } : {}),
             // Validated worker-side against the same list pi accepts, so the
-            // cast asserts what the boundary has already checked. Left unset,
-            // the agent definition's `thinking` (then the parent's) still wins —
-            // same precedence as `model` above.
-            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            // cast asserts what the boundary has already checked. With routing,
+            // an explicit value must match; left unset, the route wins. Without
+            // routing, agent definition then parent thinking retains precedence.
+            ...(request.effort !== undefined
+              ? {
+                  thinkingLevel: request.effort as ThinkingLevel,
+                  thinkingOverride: request.effort as ThinkingLevel,
+                }
+              : {}),
             // Seeded with the REQUEST, not the outcome. The manager overwrites
             // the effective half at session creation; without a seed there is
             // nothing for it to compare against, so a level pi clamped would be

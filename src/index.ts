@@ -1657,7 +1657,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       thinking: Type.Optional(
         Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default; must match an active session route.`,
         }),
       ),
       max_turns: Type.Optional(
@@ -1995,7 +1995,9 @@ Terse command-style prompts produce shallow, generic work.
             subagent_type: requestedType,
             prompt: params.prompt as string,
             model: params.model as string | undefined,
-            thinking: thinking,
+            // Persist only a caller choice. Frontmatter is re-resolved at fire
+            // time and must not masquerade as an explicit route override.
+            thinking: params.thinking as ThinkingLevel | undefined,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
             isolation: isolation,
@@ -2107,6 +2109,7 @@ Terse command-style prompts produce shallow, generic work.
           isolated,
           inheritContext,
           thinkingLevel: thinking,
+          ...(resolvedConfig.thinkingFromParams ? { thinkingOverride: params.thinking as ThinkingLevel } : {}),
           isBackground: true,
           isolation,
           invocation: agentInvocation,
@@ -2262,6 +2265,7 @@ Terse command-style prompts produce shallow, generic work.
           isolated,
           inheritContext,
           thinkingLevel: thinking,
+          ...(resolvedConfig.thinkingFromParams ? { thinkingOverride: params.thinking as ThinkingLevel } : {}),
           isolation,
           invocation: agentInvocation,
           signal,
