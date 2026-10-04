@@ -74,6 +74,10 @@ grep -rn "pi-subagents" ~/.pi/agent/settings.json
 
 Keep exactly one entry — the local path. If a clone or npm copy reappears, remove that entry rather than editing the stale tree. `pi install git:…` re-creates `~/.pi/agent/git/<host>/<path>`; never point the dev loop back at it.
 
+## Global planner agent
+
+The global read-only planner is `Plan` (`~/.pi/agent/agents/Plan.md`); call it as `subagent_type: "Plan"`, not `Planner`. `src/model-routing.ts` classifies exact type `Plan` with reviewer/advisor, so it follows reviewer selection from `/subagent-model`. Keep model and thinking unset in its frontmatter so route selection controls both. Global `disableDefaultAgents: true` stays intentional: custom agents remain available without enabling built-in all-tools `general-purpose`.
+
 ## Git
 
 - **Never commit.** The user commits manually. At most, suggest a concise commit message as text.

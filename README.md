@@ -240,11 +240,13 @@ Group completions render each agent as a separate block. The LLM receives struct
 
 ## Default Agent Types
 
-| Type | Tools | Model | Prompt Mode | Description |
+| Type | Tools | Configured model | Prompt Mode | Description |
 | ------ | ------- | ------- | ------------- | ------------- |
 | `general-purpose` | all 7 | inherit | `append` (parent twin) | Inherits the parent's full system prompt — same rules, CLAUDE.md, project conventions |
-| `Explore` | read, bash, grep, find, ls | haiku (falls back to inherit) | `replace` (standalone) | Fast codebase exploration (read-only) |
-| `Plan` | read, bash, grep, find, ls | inherit | `replace` (standalone) | Software architect for implementation planning (read-only) |
+| `Explore` | read, grep, find, ls | `anthropic/claude-haiku-4-5` | `replace` (standalone) | Fast codebase exploration (read-only) |
+| `Plan` | read, grep, find, ls | reviewer default | `replace` (standalone) | Software architect for implementation planning (read-only) |
+
+On fresh routed runs, `/subagent-model` overrides configured models: `general-purpose` and `Explore` use shared route; `Plan` uses reviewer/specialist route.
 
 The `general-purpose` agent is a **parent twin** — it receives the parent's entire system prompt plus a sub-agent context bridge, so it follows the same rules the parent does. Explore and Plan use standalone prompts tailored to their read-only roles.
 
@@ -614,14 +616,15 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Subagent Model Routing
 
-Two session-scoped routes decide fresh subagent models — reviewer calls use the reviewer route; `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns for every other role use the shared route. The same command stores one thinking level per route. Pi's main-session model is deliberately untouched: switching either route never changes what you are talking to.
+Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, and `advisor` use reviewer/specialist route; `Agent` calls, workflow children, nested delegation, scheduled jobs, and cross-extension RPC spawns for all other roles use the shared route. The same command stores one thinking level per route. Pi's main-session model is deliberately untouched: switching either route never changes what you are talking to.
 
 | | |
 | --------- | ------------- |
-| Defaults | Reviewer `openai-codex/gpt-5.6-sol`; others `openai-codex/gpt-5.6-luna` |
+| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.1-sol` (high); other agents `github-copilot/gpt-6-luna` (low) |
+| Roles | Reviewer, built-in `Plan`, and custom `advisor` use specialist route; all other types use shared route |
 | Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
-| Picker order | Reviewer model → reviewer thinking → other-subagent model → other-subagent thinking |
+| Picker order | Reviewer/Plan/advisor model → thinking → other-agent model → thinking |
 | Stored | Session entry `subagent-model-state` — shared `provider/model` + `thinking`, reviewer `reviewerProvider/reviewerModel` + `reviewerThinking`, per session, never per project |
 | Status line | `🧿: <reviewer model> (<thinking>) | 👷🏻‍♂️: <other model> (<thinking>)`, or blocked |
 
