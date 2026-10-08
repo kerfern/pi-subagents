@@ -179,21 +179,49 @@ export function installQuotaGuard(options: {
       // prototype's getAuth would bind `this` to the prototype, which has none of the runtime's
       // private state. The instance that dispatches is the only object that can answer.
       const receiver = this as GuardRuntime | undefined;
-      const owner: GuardRuntime = receiver && typeof receiver.getAuth === 'function' ? receiver : runtime;
+      // Only a live instance can answer: the prototype itself carries `getAuth`, so `receiver !== runtime`
+      // must exclude it explicitly rather than falling back to resolving identity on the prototype.
+      const owner: GuardRuntime | undefined = receiver && receiver !== runtime
+        && typeof receiver.getAuth === 'function' ? receiver : undefined;
       const [model, contextOrHandle, maybeOptions] =
         args as [GuardModel, unknown, GuardOptions | undefined];
+      const api = model?.api;
       const provider = guardedProvider(model);
-      if (!provider) return original.call(this, model, contextOrHandle, maybeOptions);
+      if (!provider) {
+        // Passthrough forwards the model the provider will actually read, so the decision must be
+        // made on that object. A getter that reads unguarded while we route and guarded later would
+        // otherwise take a path the check never approved - the same flip the guarded branch pins
+        // against. Only a plain object can be pinned; anything else must be refused, because
+        // descriptor inspection cannot be trusted - reading a Proxy's descriptor runs its traps, so
+        // a Proxy can report a plain data property while its `get` trap answers unguarded now and
+        // guarded on the SDK's later dispatch.
+        const prototype = model !== null && typeof model === 'object'
+          ? Object.getPrototypeOf(model) : undefined;
+        const plain = prototype === Object.prototype || prototype === null;
+        if (!plain) {
+          return pauseAndThrow(coordinator,
+            'Quota guard: model is not a plain object; refusing to dispatch');
+        }
+        const forwarded: GuardModel = { ...model, api, provider: model.provider };
+        if (guardedProvider(forwarded)) {
+          return pauseAndThrow(coordinator,
+            'Quota guard: model provider changed after the guard check; refusing to dispatch');
+        }
+        return original.call(this, forwarded, contextOrHandle, maybeOptions);
+      }
       // One own copy, made before anything is validated: a spread invokes each getter once, so a
       // `client` accessor cannot read as undefined while we validate and as a real client when the
       // provider later reads it - which is exactly how a supplied client slips past the fetch.
       const callerOptions: GuardOptions = { ...(maybeOptions ?? {}) };
-      const api = model.api;
       if (!transportIsGuardable(provider, { api }, callerOptions)) {
         const why = callerOptions.client !== undefined
           ? ' with a supplied client, which bypasses the injected fetch' : '';
         return pauseAndThrow(coordinator,
           `Quota guard: ${provider} on api "${String(api)}" cannot be guarded${why}; refusing to dispatch`);
+      }
+      if (!owner) {
+        return pauseAndThrow(coordinator,
+          'Quota guard: no live runtime receiver; refusing to resolve identity');
       }
       const inner = callerOptions.fetch ?? fetchImpl ?? globalThis.fetch;
       const next: Record<string, unknown> = {
