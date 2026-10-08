@@ -4,9 +4,10 @@
  * These are always available but can be overridden by user .md files with the same name.
  */
 
+import { DEFAULT_REVIEWER_MODEL } from "./model-routing.js";
 import type { AgentConfig } from "./types.js";
 
-const READ_ONLY_TOOLS = ["read", "bash", "grep", "find", "ls"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 
 export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
   [
@@ -32,7 +33,7 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       displayName: "Explore",
       description: "Fast read-only search agent for locating code. Use it to find files by pattern (eg. \"src/components/**/*.tsx\"), grep for symbols or keywords (eg. \"API endpoints\"), or answer \"where is X defined / which files reference Y.\" Do NOT use it for code review, design-doc auditing, cross-file consistency checks, or open-ended analysis — it reads excerpts rather than whole files and will miss content past its read window. When calling, specify search breadth: \"quick\" for a single targeted lookup, \"medium\" for moderate exploration, or \"very thorough\" to search across multiple locations and naming conventions.",
       builtinToolNames: READ_ONLY_TOOLS,
-      extensions: true,
+      extensions: false,
       skills: true,
       // Fast/cheap model for read-only search. Provider-preferred but resilient:
       // resolveModel matches this fuzzily (date-stamp optional) and falls back to
@@ -51,13 +52,13 @@ You are STRICTLY PROHIBITED from:
 - Using redirect operators (>, >>, |) or heredocs to write to files
 - Running ANY commands that change system state
 
-Use Bash ONLY for read-only operations: ls, git status, git log, git diff, find, cat, head, tail.
+Use only the available read-only tools; shell access is not provided.
 
 # Tool Usage
-- Use the find tool for file pattern matching (NOT the bash find command)
-- Use the grep tool for content search (NOT bash grep/rg command)
-- Use the read tool for reading files (NOT bash cat/head/tail)
-- Use Bash ONLY for read-only operations
+- Use the find tool for file pattern matching
+- Use the grep tool for content search
+- Use the read tool for reading files
+- Do not use shell commands; only the available read-only tools are enabled
 - Make independent tool calls in parallel for efficiency
 - Adapt search approach based on thoroughness level specified
 
@@ -77,8 +78,11 @@ Use Bash ONLY for read-only operations: ls, git status, git log, git diff, find,
       displayName: "Plan",
       description: "Software architect agent for designing implementation plans. Use this when you need to plan the implementation strategy for a task. Returns step-by-step plans, identifies critical files, and considers architectural trade-offs.",
       builtinToolNames: READ_ONLY_TOOLS,
-      extensions: true,
+      extensions: false,
       skills: true,
+      model: DEFAULT_REVIEWER_MODEL,
+      thinking: "high",
+      persistSession: true,
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a software architect and planning specialist.
 Your role is EXCLUSIVELY to explore the codebase and design implementation plans.
@@ -106,10 +110,10 @@ You are STRICTLY PROHIBITED from:
 - Follow existing patterns where appropriate
 
 # Tool Usage
-- Use the find tool for file pattern matching (NOT the bash find command)
-- Use the grep tool for content search (NOT bash grep/rg command)
-- Use the read tool for reading files (NOT bash cat/head/tail)
-- Use Bash ONLY for read-only operations
+- Use the find tool for file pattern matching
+- Use the grep tool for content search
+- Use the read tool for reading files
+- Do not use shell commands; only the available read-only tools are enabled
 
 # Output Format
 - Use absolute file paths

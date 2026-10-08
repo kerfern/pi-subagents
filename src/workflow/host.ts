@@ -40,6 +40,14 @@ import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
+import {
+  appendWorkflowCheck,
+  createWorkflowArtifacts,
+  finishWorkflowArtifacts,
+  registerWorkflowArtifacts,
+  type WorkflowArtifactStore,
+  type WorkflowTextArtifact,
+} from "./artifacts.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
 import { resolveWorkflowSource } from "./saved.js";
 
@@ -168,6 +176,20 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    * as it was at agent 1.
    */
   const warnedScopeMessages = new Set<string>();
+  let artifactTaskId: string | undefined;
+  let artifactStore: WorkflowArtifactStore | undefined;
+
+  function artifactsFor(taskId: string): WorkflowArtifactStore {
+    if (artifactTaskId !== undefined && artifactTaskId !== taskId) {
+      throw new Error("Workflow artifacts: task ID cannot change during a workflow run.");
+    }
+    artifactTaskId = taskId;
+    artifactStore ??= createWorkflowArtifacts(ctx.cwd, taskId);
+    if (deps.workflowId !== undefined) {
+      registerWorkflowArtifacts(deps.workflowId, taskId, artifactStore);
+    }
+    return artifactStore;
+  }
 
   /**
    * Run a gate command in `cwd`. The only place a gate is executed — `runGate`
@@ -245,6 +267,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
        * against the wrong tree.
        */
       let gate: WorkflowGateResult | undefined;
+      let gateUnavailable = false;
       let spawnedId: string | undefined;
 
       /**
@@ -286,6 +309,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
               try {
                 gate = await executeGate(command, worktreePath);
               } catch (error) {
+                gateUnavailable = true;
                 gate = { ok: false, output: error instanceof Error ? error.message : String(error) };
               }
             };
@@ -354,6 +378,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             reportResolved();
           },
         );
+        if (gate !== undefined && deps.workflowId !== undefined) {
+          await appendWorkflowCheck(deps.workflowId, {
+            outcome: gateUnavailable ? "unavailable" : gate.ok ? "passed" : "failed",
+            exitCode: !gateUnavailable && gate.ok ? 0 : null,
+          });
+        }
         return { ...toSpawnResult(record), ...(gate !== undefined ? { gate } : {}) };
       } catch (error) {
         // Strict worktree isolation rejects out of `awaitStartup` — the child
@@ -401,12 +431,50 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       return resolveWorkflowSource(ref, ctx.cwd);
     },
 
+    async artifactExists(taskId) {
+      return await artifactsFor(taskId).exists();
+    },
+
     // Reached only for a gate the spawn did not already run — a child with no
     // worktree of its own, or a host wired without the pre-cleanup hook.
     async runGate(command, gate) {
       // The child's worktree when it had one and it survived; otherwise the
       // session's own directory, which is where a non-isolated child worked.
-      return await executeGate(command, gate.cwd ?? ctx.cwd);
+      try {
+        const result = await executeGate(command, gate.cwd ?? ctx.cwd);
+        if (deps.workflowId !== undefined) {
+          await appendWorkflowCheck(deps.workflowId, {
+            outcome: result.ok ? "passed" : "failed",
+            exitCode: result.ok ? 0 : null,
+          });
+        }
+        return result;
+      } catch (error) {
+        if (deps.workflowId !== undefined) {
+          await appendWorkflowCheck(deps.workflowId, { outcome: "unavailable", exitCode: null });
+        }
+        throw error;
+      }
+    },
+
+    async readArtifact(taskId, name) {
+      return await artifactsFor(taskId).read(name as WorkflowTextArtifact);
+    },
+
+    async writeArtifact(taskId, name, content) {
+      await artifactsFor(taskId).write(name as WorkflowTextArtifact, content);
+    },
+
+    async appendUsage(taskId, record) {
+      await artifactsFor(taskId).appendUsage(record);
+    },
+
+    async readUsage(taskId) {
+      return await artifactsFor(taskId).readUsage();
+    },
+
+    async finishWorkflow() {
+      if (deps.workflowId !== undefined) await finishWorkflowArtifacts(deps.workflowId);
     },
   };
 }

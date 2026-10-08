@@ -649,6 +649,31 @@ describe("AgentManager — the usage hook fires once per assistant message", () 
     expect(seen.every(s => s.id === id)).toBe(true);
   });
 
+  it("preserves unknown message fields separately from zeroed lifetime totals", async () => {
+    const observed = { input: 100, output: 50, cacheRead: null, cacheWrite: 0, cost: null };
+    const seen: Array<{ usage: unknown; observed?: unknown }> = [];
+    manager = new AgentManager(undefined, undefined, undefined, undefined, (_r, usage, raw) => {
+      seen.push({ usage, observed: raw });
+    });
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
+      opts.onAssistantUsage?.(
+        { input: 100, output: 50, cacheWrite: 0, cacheRead: 0, cost: 0 },
+        observed,
+      );
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].observed).toEqual(observed);
+    expect(manager.getRecord(id)!.lifetimeUsage).toMatchObject({ input: 100, output: 50, cost: 0 });
+  });
+
   it("fires once for a nested child, even though its spend is booked to ancestors too", async () => {
     // Mimics `nested-tools.ts`: the caller's own onAssistantUsage walks the
     // ancestor chain. If the hook sat below that walk — or if accounting read
@@ -1242,6 +1267,26 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     const plain = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test" });
     await manager.getRecord(plain)!.promise;
     expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(false);
+  });
+
+  it("inherits workflow ownership from a nested parent", async () => {
+    vi.mocked(runAgent).mockClear();
+    resolvedRun();
+
+    manager = new AgentManager();
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
+      description: "parent",
+      workflowId: "wf_abc123",
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child",
+      parentAgentId: parentId,
+    });
+
+    expect(manager.getRecord(childId)?.workflowId).toBe("wf_abc123");
+    await manager.getRecord(childId)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall![3].workflow).toBe(true);
+    await manager.getRecord(parentId)!.promise;
   });
 
   it("relative cwd throws immediately; no orphan record", () => {

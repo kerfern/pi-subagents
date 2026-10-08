@@ -36,7 +36,7 @@ import {
   thinkingForSubagent,
 } from "./model-routing.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
-import { addUsage, type LifetimeUsage } from "./usage.js";
+import { addUsage, type LifetimeUsage, type MessageUsageDelta } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
 
@@ -52,7 +52,7 @@ export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void
  * a basis for anything that must not count a message twice — parent-session
  * accounting above all.
  */
-export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage) => void;
+export type OnAgentUsage = (record: AgentRecord, usage: LifetimeUsage, observed: MessageUsageDelta) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
 /**
@@ -553,6 +553,11 @@ export class AgentManager {
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
+    const parentWorkflowId = options.parentAgentId === undefined
+      ? undefined
+      : this.agents.get(options.parentAgentId)?.workflowId;
+    const workflowId = parentWorkflowId ?? options.workflowId;
+    const effectiveOptions = workflowId === options.workflowId ? options : { ...options, workflowId };
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
@@ -562,7 +567,7 @@ export class AgentManager {
       // Owned children — nested, or a workflow's — are filtered out of every
       // top-level surface, so no handle: nothing can address them and they must
       // not consume a name a top-level sibling could otherwise take.
-      handle: !isTopLevelAgent(options)
+      handle: !isTopLevelAgent(effectiveOptions)
         ? undefined
         // A reclaimed handle is used as-is: it belongs to the conversation this
         // spawn is reopening, and re-deriving it would lose the numbering.
@@ -581,6 +586,7 @@ export class AgentManager {
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
+      providerAttempts: 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
       // foreground (has an inline tool-result surface), undefined = caller never
       // declared it (e.g. a cross-extension RPC spawn). The widget's background-
@@ -594,7 +600,7 @@ export class AgentManager {
       invocation: options.invocation,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
-      workflowId: options.workflowId,
+      workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
     };
@@ -606,7 +612,7 @@ export class AgentManager {
       record.alias = assignHandle(handleBase(options.name), this.takenHandles());
     }
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    const args: SpawnArgs = { pi, ctx, type, prompt, options: effectiveOptions };
 
     const pool = this.poolFor(record);
     if (pool !== undefined && !options.bypassQueue && !this.poolHasRoom(pool)) {
@@ -817,16 +823,18 @@ export class AgentManager {
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route: RoutedModels,
   ): Promise<RunResult> {
+    let first: RunResult;
     try {
-      const first = await startRun(route.model);
-      if (first.aborted || first.failure === undefined) return first;
-      if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
-      return await this.retryOnFallback(startRun, route);
+      first = await startRun(route.model);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
-      return await this.retryOnFallback(startRun, route);
+      return this.retryOnFallback(startRun, route);
     }
+
+    if (first.aborted || first.failure === undefined) return first;
+    if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
+    return this.retryOnFallback(startRun, route);
   }
 
   /**
@@ -843,14 +851,14 @@ export class AgentManager {
       const second = await startRun(route.fallback);
       if (!second.aborted && second.failure !== undefined
         && classifyProviderFailure({ isError: true, text: second.failure })) {
-        recordFallbackFailure(routing.state, second.failure);
+        recordFallbackFailure(routing.state, second.failure, modelKey(route.model));
         this.latched(routing);
       }
       return second;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (classifyProviderFailure({ isError: true, text: detail })) {
-        recordFallbackFailure(routing.state, detail);
+        recordFallbackFailure(routing.state, detail, modelKey(route.model));
         this.latched(routing);
       }
       throw error;
@@ -883,6 +891,8 @@ export class AgentManager {
     const routedThinking = this.routing !== undefined && routed !== undefined
       ? thinkingForSubagent(this.routing.state, type)
       : undefined;
+    record.requestedThinking = routedThinking ?? options.thinkingLevel
+      ?? options.invocation?.requestedThinking ?? options.invocation?.thinking;
 
     // Take the running state — and with it the concurrency slot — BEFORE the
     // first await. Creating a worktree is an awaited git call, and drainQueue
@@ -968,8 +978,12 @@ export class AgentManager {
     // `model ?? options.model`: the unrouted paths (no router, routing disabled,
     // or a resume) must reproduce the old call exactly, including the caller's
     // own resolution.
-    const startRun = (model: Model<any> | undefined) => runAgent(ctx, type, prompt, {
-      pi,
+    const startRun = (model: Model<any> | undefined) => {
+      record.providerAttempts = (record.providerAttempts ?? 0) + 1;
+      const selectedModel = model ?? options.model;
+      if (selectedModel !== undefined) record.selectedModelId = modelKey(selectedModel);
+      return runAgent(ctx, type, prompt, {
+        pi,
       agentId: id,
       model: model ?? options.model,
       maxTurns: options.maxTurns,
@@ -997,9 +1011,9 @@ export class AgentManager {
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
-      onAssistantUsage: (usage) => {
+      onAssistantUsage: (usage, observed) => {
         addUsage(record.lifetimeUsage, usage);
-        this.onUsage?.(record, usage);
+        this.onUsage?.(record, usage, observed);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {
@@ -1030,6 +1044,7 @@ export class AgentManager {
         // authoritative, so every surface reads one place instead of each
         // re-deriving "session, else the request" for itself.
         if (session.model) {
+          record.selectedModelId = modelKey(session.model);
           record.invocation ??= {};
           // Read the kept request first: a caller's level survives being clamped
           // AND, one line later, being replaced by the effective one.
@@ -1055,7 +1070,8 @@ export class AgentManager {
         }
         options.onSessionCreated?.(session);
       },
-    });
+      });
+    };
 
     const promise = this.runRouted(startRun, routed as RoutedModels | undefined)
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
@@ -1391,9 +1407,9 @@ export class AgentManager {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
         },
-        onAssistantUsage: (usage) => {
+        onAssistantUsage: (usage, observed) => {
           addUsage(record.lifetimeUsage, usage);
-          this.onUsage?.(record, usage);
+          this.onUsage?.(record, usage, observed);
           options?.onAssistantUsage?.(usage);
         },
         onCompaction: (info) => {
@@ -1482,9 +1498,9 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onAssistantUsage: (usage) => {
+      onAssistantUsage: (usage, observed) => {
         addUsage(record.lifetimeUsage, usage);
-        this.onUsage?.(record, usage);
+        this.onUsage?.(record, usage, observed);
         options.onAssistantUsage?.(usage);
       },
       onCompaction: (info) => {

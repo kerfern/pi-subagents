@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   // The print-mode e2e suite (test/subagents-print-mode-e2e.test.ts) drives REAL
@@ -12,6 +12,8 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    // Separate Node suites keep their native runner; retain every default Vitest exclusion.
+    exclude: [...configDefaults.exclude, "quota-guard/**", ".superpowers/**"],
     setupFiles: ["test/setup.ts"],
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // The harnesses drive narrow faux catalogs, so the reviewer/shared subagent

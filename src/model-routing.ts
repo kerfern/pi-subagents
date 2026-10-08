@@ -11,8 +11,10 @@
 
 import type { ThinkingLevel } from "./types.js";
 
-export const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-5.6-luna";
-export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-5.6-sol";
+export const DEFAULT_SUBAGENT_MODEL = "github-copilot/gpt-6-luna";
+export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.1-sol";
+const DEFAULT_SUBAGENT_THINKING: ThinkingLevel = "low";
+const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "high";
 /**
  * Where one provider failure retries to. Deliberately a DIFFERENT provider from
  * the default: retrying inside the provider that just failed re-dials the same
@@ -92,19 +94,23 @@ function emptyState(): SubagentRoutingState {
     reviewerEffective: DEFAULT_REVIEWER_MODEL,
     selectedThinking: undefined,
     reviewerSelectedThinking: undefined,
-    effectiveThinking: undefined,
-    reviewerEffectiveThinking: undefined,
+    effectiveThinking: DEFAULT_SUBAGENT_THINKING,
+    reviewerEffectiveThinking: DEFAULT_REVIEWER_THINKING,
     stale: false,
     routingFailed: false,
   };
 }
 
+function isSpecialist(type: string): boolean {
+  return type === "reviewer" || type === "Plan" || type === "advisor";
+}
+
 export function modelForSubagent(state: SubagentRoutingState, type: string): string {
-  return type === "reviewer" ? state.reviewerEffective : state.effective;
+  return isSpecialist(type) ? state.reviewerEffective : state.effective;
 }
 
 export function thinkingForSubagent(state: SubagentRoutingState, type: string): ThinkingLevel | undefined {
-  return type === "reviewer" ? state.reviewerEffectiveThinking : state.effectiveThinking;
+  return isSpecialist(type) ? state.reviewerEffectiveThinking : state.effectiveThinking;
 }
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -156,8 +162,8 @@ export function restoreRoutingState(
       reviewerEffective: known.includes(reviewer) ? reviewer : DEFAULT_REVIEWER_MODEL,
       selectedThinking,
       reviewerSelectedThinking: reviewerThinking,
-      effectiveThinking: selectedThinking,
-      reviewerEffectiveThinking: reviewerThinking,
+      effectiveThinking: selectedThinking ?? (known.includes(selected) ? undefined : DEFAULT_SUBAGENT_THINKING),
+      reviewerEffectiveThinking: reviewerThinking ?? (known.includes(reviewer) ? undefined : DEFAULT_REVIEWER_THINKING),
       stale,
       ...migrated,
     };
@@ -231,10 +237,14 @@ export function recordUnavailableModel(state: SubagentRoutingState, model: strin
 }
 
 /** Latches the route after the fallback leg itself failed. */
-export function recordFallbackFailure(state: SubagentRoutingState, detail: string): void {
+export function recordFallbackFailure(
+  state: SubagentRoutingState,
+  detail: string,
+  primaryModel = state.effective,
+): void {
   state.routingFailed = true;
   state.terminalReason =
-    `Subagent routing stopped: ${state.effective} failed, then the fallback ` +
+    `Subagent routing stopped: ${primaryModel} failed, then the fallback ` +
     `${FALLBACK_SUBAGENT_MODEL} failed (${detail}).`;
 }
 

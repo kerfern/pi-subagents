@@ -76,7 +76,7 @@ Keep exactly one entry — the local path. If a clone or npm copy reappears, rem
 
 ## Global planner agent
 
-The global read-only planner is `Plan` (`~/.pi/agent/agents/Plan.md`); call it as `subagent_type: "Plan"`, not `Planner`. `src/model-routing.ts` classifies exact type `Plan` with reviewer/advisor, so it follows reviewer selection from `/subagent-model`. Keep model and thinking unset in its frontmatter so route selection controls both. Global `disableDefaultAgents: true` stays intentional: custom agents remain available without enabling built-in all-tools `general-purpose`.
+The global read-only planner is `Plan` (`~/.pi/agent/agents/Plan.md`); call it as `subagent_type: "Plan"`, not `Planner`. `src/model-routing.ts` groups exact types `Plan`, `advisor`, and `reviewer` on the specialist route selected by `/subagent-model`. Set `model: sol` in Plan and advisor frontmatter to match reviewer’s default; leave thinking unset so the selector controls it. Global `disableDefaultAgents: true` stays intentional: custom agents remain available without enabling built-in all-tools `general-purpose`.
 
 ## Git
 

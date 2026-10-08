@@ -228,6 +228,12 @@ export const meta = {
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
 
+### Scoped artifacts
+
+The `artifacts` global exposes async `exists`, `read`, `write`, `appendUsage`, and `readUsage` methods. Calls require a string `args.taskId` matching the task-ID format and are bound to `.pi/workflow/<taskId>/`; scripts cannot choose paths. `exists()` checks for an existing task directory without creating one. `read`/`write` accept only `plan.md`, `state.json`, and `review.md`; `state.json` is schema-validated before replacement. Host-recorded verification outcomes live in `state.json` as a generic gate label, outcome, and exit code—never command text or output. `usage.jsonl` is append-only, host-timestamped, and reachable only through the allowlisted usage methods; per-message usage deltas and completion metadata are separate rows, unknown or unpriced values remain `null`, and malformed rows are counted and ignored on read. Unknown telemetry fields are rejected. Never store prompts, secrets, or sensitive records in these files.
+
+These project-local artifacts are separate durable records. The resume journal remains a temporary per-session replay log and still does not survive a Pi restart.
+
 ### `agent(prompt, opts?)`
 
 Spawns one subagent and resolves to its final text — or, with `schema`, to a validated object.
@@ -398,13 +404,13 @@ Concurrency is capped at `max(1, min(16, cpus - 2))`. Queued agents start as slo
 
 ## What workflows can't do
 
-- **No filesystem, network or module access inside the script.** All real work happens in the agents it spawns, which have their normal tools.
+- **No arbitrary filesystem, network or module access inside the script.** The only filesystem exception is the fixed, task-scoped `artifacts` API described above; no general paths or `fs`/`path` modules are exposed.
 - **No `eval` or `Function(...)`** — code generation is off in the vm; they throw `EvalError`.
 - **No cross-session resume.** Journals are per session.
 - **No resume at all for `--subagents-workflow-file` runs** — that path never journals.
 - **No UI that lists or launches saved workflows.** The inspector shows this session's runs.
 - **No scheduled workflows.** The scheduler runs agents, not workflows.
-- **Results are not persisted** beyond the journal and the transcript card.
+- **Results are not automatically persisted.** Scripts must explicitly use the scoped artifact API; the resume journal and transcript card remain separate.
 - **No driving one from another extension.** A workflow cannot be started or steered over the `pi.events` bus, and its agents are invisible to the RPC surface — they emit no lifecycle events, and `subagents:rpc:stop` refuses them. See [`rpc.md`](rpc.md).
 
 The sandbox is a determinism and accident boundary, not a defence against a deliberately hostile script: the injected globals are host closures, and disabled code generation is what actually stops one being used to compile anything.
@@ -434,6 +440,11 @@ Every file below is executed by `test/workflow-examples.test.ts` against a stub 
 | [`structured-findings.js`](../examples/workflows/structured-findings.js) | `schema` on both stages, objects instead of prose | Yes |
 | [`gated-fix.js`](../examples/workflows/gated-fix.js) | `gate`, `isolation: "worktree"`, `resume` retry loop | Needs a real test command |
 | [`review-panel.js`](../examples/workflows/review-panel.js) | An earned `parallel` barrier, `effort` tiering, `model` | Yes |
+| [`cache-aware-orchestration.js`](../examples/workflows/cache-aware-orchestration.js) | Opt-in Plan → bounded worker/gate → advisor/review stages, scoped artifacts, telemetry, two-repair stop | Needs separate stage calls with one `taskId`; Plan approval and review context |
 | [`compose.js`](../examples/workflows/compose.js) | `workflow()` nesting and `args` plumbing | Needs `lib/count-child.js` saved |
+
+### Cache-aware orchestration pilot
+
+[`cache-aware-orchestration.js`](../examples/workflows/cache-aware-orchestration.js) is opt-in: select parent model/thinking manually first; `mode` labels the task but does not switch or verify parent routing. Call `plan`, explicitly approve returned `planVersion`, then call `worker` with a real gate and `review` with a non-sensitive `revisionId` for exact code revision, original request, approved plan, diff summary, validation results, and unresolved issues. Reuse `revisionId` only for unchanged code; changed revision without a new passing worker gate returns unverified. Reuse one `taskId` across separate stage calls; choose a fresh ID for a new task. Routine trivial work can return to the parent without spawning. Complex work remains bounded; advisor calls require an explicit trigger. Escalated or unavailable advice checkpoints blockers and stops worker execution for a manually selected Sol/high-parent handoff; the script never switches routes. A failed review can be repaired only with concise reviewer feedback, must pass its gate again, then receives one new review; repeating review without intervening passing work reuses saved result. The example never changes parent model. Separately, built-in Plan and advisor profiles persist their own agent sessions; pass redacted inputs and never include secrets or patient data.
 
 Copy one into `.pi/workflows/` to make it yours.

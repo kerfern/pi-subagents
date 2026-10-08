@@ -219,6 +219,20 @@ export interface SubagentsSettings {
    */
   workflowsEnabled?: boolean;
   /**
+   * Master switch for the quota guard. Defaults to `false`: enabling it is an
+   * operator action, never something a session turns on for itself.
+   *
+   * When `false` (or absent) the extension is inert - `quotaGuardExtension`
+   * returns before resolving credentials, reading files or decorating a
+   * runtime, and `/quota-guard` is not registered. When `true` the guard
+   * installs against the runtime handle it is handed and the
+   * `/quota-guard enable|pause|resume|status` subcommands become available.
+   *
+   * Read once at extension init, before registration, so flipping it takes
+   * effect on the next pi session - the same contract `schedulingEnabled` has.
+   */
+  quotaGuardEnabled?: boolean;
+  /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
    * disables nesting project-wide. Read when a subagent session is built, so a
@@ -326,6 +340,7 @@ export interface SettingsAppliers {
   setOutputTranscript: (b: boolean) => void;
   setWorktreeIsolation: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
+  setQuotaGuardEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
@@ -451,6 +466,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.workflowsEnabled === "boolean") {
     out.workflowsEnabled = r.workflowsEnabled;
   }
+  if (typeof r.quotaGuardEnabled === "boolean") {
+    out.quotaGuardEnabled = r.quotaGuardEnabled;
+  }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -537,6 +555,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
+  if (typeof s.quotaGuardEnabled === "boolean") appliers.setQuotaGuardEnabled(s.quotaGuardEnabled);
 }
 
 /**

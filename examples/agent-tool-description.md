@@ -24,7 +24,7 @@ If the target is already known, use a direct tool — `read` for a known path, `
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Reviewer agents use the reviewer route; every other agent uses the shared route. A model parameter is refused unless it names that agent's routed model, and the main session's own model is unaffected — change routes with /subagent-model rather than per call.
+- Reviewer, Plan, and advisor use the specialist route; every other agent uses the shared route. A model parameter is refused unless it names that agent's routed model, and the main session's own model is unaffected — change routes with /subagent-model rather than per call.
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.{{isolationGuideline}}{{scheduleGuideline}}
 

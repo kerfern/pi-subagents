@@ -28,8 +28,44 @@ import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
-import type { LifetimeUsage } from "./usage.js";
+import type { LifetimeUsage, MessageUsageDelta } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
+
+function nonNegativeUsage(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function observedCost(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function hasModelPricing(model?: Model<any>): boolean {
+  const rates = model?.cost;
+  if (!rates) return false;
+  const values = [rates.input, rates.output, rates.cacheRead, rates.cacheWrite,
+    ...(rates.tiers ?? []).flatMap(tier => [tier.input, tier.output, tier.cacheRead, tier.cacheWrite])];
+  return values.some(value => Number.isFinite(value) && value > 0);
+}
+
+function observeUsage(usage: any, model?: Model<any>): MessageUsageDelta {
+  return {
+    input: nonNegativeUsage(usage.input),
+    output: nonNegativeUsage(usage.output),
+    cacheRead: nonNegativeUsage(usage.cacheRead),
+    cacheWrite: nonNegativeUsage(usage.cacheWrite),
+    cost: hasModelPricing(model) ? observedCost(usage.cost?.total) : null,
+  };
+}
+
+function lifetimeUsage(delta: MessageUsageDelta): LifetimeUsage {
+  return {
+    input: delta.input ?? 0,
+    output: delta.output ?? 0,
+    cacheRead: delta.cacheRead ?? 0,
+    cacheWrite: delta.cacheWrite ?? 0,
+    cost: delta.cost ?? 0,
+  };
+}
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -469,7 +505,7 @@ export interface RunOptions {
    * We never price anything ourselves; every dollar figure this extension shows
    * or reports traces back to this field.
    */
-  onAssistantUsage?: (usage: LifetimeUsage) => void;
+  onAssistantUsage?: (usage: LifetimeUsage, observed: MessageUsageDelta) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
    * pre-compaction context size estimate. Aborted compactions don't fire.
@@ -1080,13 +1116,10 @@ export async function runAgent(
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
       const u = (event.message as any).usage;
-      if (u) options.onAssistantUsage?.({
-        input: u.input ?? 0,
-        output: u.output ?? 0,
-        cacheWrite: u.cacheWrite ?? 0,
-        cacheRead: u.cacheRead ?? 0,
-        cost: u.cost?.total ?? 0,
-      });
+      if (u) {
+        const observed = observeUsage(u, session.model);
+        options.onAssistantUsage?.(lifetimeUsage(observed), observed);
+      }
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
@@ -1156,7 +1189,7 @@ export async function resumeAgent(
   prompt: string,
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: LifetimeUsage) => void;
+    onAssistantUsage?: (usage: LifetimeUsage, observed: MessageUsageDelta) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
@@ -1174,13 +1207,10 @@ export async function resumeAgent(
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
           const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
+          if (u) {
+            const observed = observeUsage(u, session.model);
+            options.onAssistantUsage?.(lifetimeUsage(observed), observed);
+          }
         }
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });

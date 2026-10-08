@@ -76,7 +76,7 @@ afterEach(() => {
 });
 
 describe("shared routing at startAgent", () => {
-  it("uses reviewer model only for reviewer agents", async () => {
+  it("routes reviewer, Plan, and advisor roles to reviewer model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
@@ -85,11 +85,14 @@ describe("shared routing at startAgent", () => {
       FALLBACK,
     ]));
 
-    await spawnAndSettle(manager, { type: "reviewer" });
-    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual({ provider: "faux", id: "reviewer-1" });
+    for (const type of ["reviewer", "Plan", "advisor"]) {
+      vi.mocked(runAgent).mockClear();
+      await spawnAndSettle(manager, { type });
+      expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual({ provider: "faux", id: "reviewer-1" });
+    }
   });
 
-  it("uses shared model for every non-reviewer agent", async () => {
+  it("uses shared model for ordinary agents and Explore", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
@@ -98,11 +101,14 @@ describe("shared routing at startAgent", () => {
       FALLBACK,
     ]));
 
-    await spawnAndSettle(manager, { type: "worker" });
-    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
+    for (const type of ["worker", "Explore"]) {
+      vi.mocked(runAgent).mockClear();
+      await spawnAndSettle(manager, { type });
+      expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
+    }
   });
 
-  it("uses reviewer and shared thinking routes by agent type", async () => {
+  it("uses reviewer thinking route for reviewer, Plan, and advisor roles", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({
       reviewerEffectiveThinking: "high",
@@ -110,8 +116,11 @@ describe("shared routing at startAgent", () => {
     } as any);
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
 
-    await spawnAndSettle(manager, { type: "reviewer" });
-    expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
+    for (const type of ["reviewer", "Plan", "advisor"]) {
+      vi.mocked(runAgent).mockClear();
+      await spawnAndSettle(manager, { type });
+      expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
+    }
 
     vi.mocked(runAgent).mockClear();
     await spawnAndSettle(manager, { type: "worker" });
@@ -168,6 +177,20 @@ describe("shared routing at startAgent", () => {
     expect(record?.status).toBe("completed");
   });
 
+  it("does not retry fallback again when its provider error is thrown", async () => {
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce(providerFail() as RunResult)
+      .mockRejectedValueOnce(new Error("429 fallback quota exceeded"))
+      .mockResolvedValueOnce(ok() as RunResult);
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+
+    await spawnAndSettle(manager);
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(routing.routingFailed).toBe(true);
+  });
+
   it("does not retry a task failure", async () => {
     vi.mocked(runAgent).mockResolvedValue({
       ...ok(),
@@ -215,6 +238,20 @@ describe("shared routing at startAgent", () => {
 
     await expect(spawnRefused(manager)).rejects.toThrow(/routing stopped/i);
     expect(runAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports exact primary model when specialist route and fallback both fail", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    const routing = state({ reviewerEffective: "faux/reviewer-1" });
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+      PRIMARY,
+      { provider: "faux", id: "reviewer-1" },
+      FALLBACK,
+    ]));
+
+    await spawnAndSettle(manager, { type: "advisor" });
+    expect(routing.terminalReason).toContain("faux/reviewer-1");
+    expect(routing.terminalReason).not.toContain("faux/primary-1");
   });
 
   it("fails before running when the routed model is not in the catalog", async () => {

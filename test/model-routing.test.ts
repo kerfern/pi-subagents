@@ -97,13 +97,19 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
-  it("defaults reviewer to Sol and other agents to Luna", () => {
+  it("routes reviewer, Plan, and advisor to Sol; ordinary agents use GitHub Copilot Luna", () => {
     const state = restoreRoutingState([], [
-      { provider: "openai-codex", id: "gpt-5.6-sol" },
-      { provider: "openai-codex", id: "gpt-5.6-luna" },
+      { provider: "openai-codex", id: "gpt-6.1-sol" },
+      { provider: "github-copilot", id: "gpt-6-luna" },
     ]);
-    expect(state.reviewerEffective).toBe("openai-codex/gpt-5.6-sol");
-    expect(state.effective).toBe("openai-codex/gpt-5.6-luna");
+    for (const role of ["reviewer", "Plan", "advisor"]) {
+      expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.1-sol");
+      expect(thinkingForSubagent(state, role)).toBe("high");
+    }
+    for (const role of ["worker", "Explore", "custom-role"]) {
+      expect(modelForSubagent(state, role)).toBe("github-copilot/gpt-6-luna");
+      expect(thinkingForSubagent(state, role)).toBe("low");
+    }
   });
 
   it("keeps the default when a stored selection is gone, and reports it stale", () => {
@@ -114,6 +120,8 @@ describe("restore + migration", () => {
     expect(state.selected).toBe("gone/x");
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
     expect(state.reviewerEffective).toBe(DEFAULT_REVIEWER_MODEL);
+    expect(thinkingForSubagent(state, "worker")).toBe("low");
+    expect(thinkingForSubagent(state, "reviewer")).toBe("high");
     expect(state.stale).toBe(true);
   });
 

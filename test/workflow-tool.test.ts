@@ -122,6 +122,21 @@ describe("createWorkflowHost — spawn mapping", () => {
     expect(options.description).toBe("review:bugs");
   });
 
+  it("maps only fixed artifact methods into the opened project", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-workflow-host-artifacts-"));
+    try {
+      const stub = stubManager();
+      const host = createWorkflowHost({ pi: {} as any, ctx: ctx({ cwd: root }), manager: stub.manager });
+      await host.writeArtifact!("task-1", "plan.md", "# plan");
+      expect(await host.readArtifact!("task-1", "plan.md")).toBe("# plan");
+      await expect(host.readArtifact!("task-1", "../../secret")).rejects.toThrow(/artifact name/i);
+      await expect(host.writeArtifact!("../escape", "plan.md", "x")).rejects.toThrow(/task id/i);
+      expect(readFileSync(join(root, ".pi", "workflow", "task-1", "plan.md"), "utf-8")).toBe("# plan");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes isolation and the run's abort signal down to the spawn", async () => {
     const stub = stubManager();
     const controller = new AbortController();

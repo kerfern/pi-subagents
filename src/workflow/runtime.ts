@@ -15,6 +15,7 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import type { WorkflowUsageInput, WorkflowUsageRecord } from "./artifacts.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -227,6 +228,16 @@ export interface WorkflowHost {
    * rejects `workflow()` outright rather than silently running nothing.
    */
   loadWorkflow?(ref: WorkflowScriptRef): Promise<WorkflowScriptSource> | WorkflowScriptSource;
+  /** Whether the fixed task-scoped artifact directory already exists. */
+  artifactExists?(taskId: string): Promise<boolean> | boolean;
+  /** Fixed-name project-local artifacts; taskId is validated again by the host. */
+  readArtifact?(taskId: string, name: string): Promise<string | undefined> | string | undefined;
+  writeArtifact?(taskId: string, name: string, content: string): Promise<void> | void;
+  appendUsage?(taskId: string, record: WorkflowUsageInput): Promise<void> | void;
+  readUsage?(taskId: string): Promise<{ records: WorkflowUsageRecord[]; malformedLines: number }>
+    | { records: WorkflowUsageRecord[]; malformedLines: number };
+  /** Drain host-side telemetry writes and release workflowId ownership. */
+  finishWorkflow?(): Promise<void> | void;
 }
 
 /**
@@ -447,7 +458,7 @@ interface AgentCallPayload {
 }
 
 type WorkerMessage =
-  | { type: "call"; callId: number; method: string; payload: AgentCallPayload }
+  | { type: "call"; callId: number; method: string; payload: unknown }
   | { type: "progress"; entries: WorkflowEntry[] }
   | { type: "complete"; resultJson?: string }
   | { type: "error"; message: string; stack?: string };
@@ -1167,6 +1178,68 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       }
     }
 
+    async function handleArtifact(callId: number, method: string, payload: unknown): Promise<void> {
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+        respond(callId, false, undefined, "Invalid workflow artifact request.");
+        return;
+      }
+      const request = payload as Record<string, unknown>;
+      if (typeof request.taskId !== "string") {
+        respond(callId, false, undefined, "Workflow artifacts require a string args.taskId.");
+        return;
+      }
+      let operation: (() => unknown | Promise<unknown>) | undefined;
+      switch (method) {
+        case "artifact.exists":
+          if (host.artifactExists === undefined) {
+            respond(callId, false, undefined, "This workflow host cannot access artifacts.", true);
+            return;
+          }
+          operation = () => host.artifactExists!(request.taskId as string);
+          break;
+        case "artifact.read":
+          if (typeof request.name !== "string") break;
+          if (host.readArtifact === undefined) {
+            respond(callId, false, undefined, "This workflow host cannot access artifacts.", true);
+            return;
+          }
+          operation = () => host.readArtifact!(request.taskId as string, request.name as string);
+          break;
+        case "artifact.write":
+          if (typeof request.name !== "string" || typeof request.content !== "string") break;
+          if (host.writeArtifact === undefined) {
+            respond(callId, false, undefined, "This workflow host cannot access artifacts.", true);
+            return;
+          }
+          operation = () => host.writeArtifact!(request.taskId as string, request.name as string, request.content as string);
+          break;
+        case "artifact.appendUsage":
+          if (typeof request.record !== "object" || request.record === null || Array.isArray(request.record)) break;
+          if (host.appendUsage === undefined) {
+            respond(callId, false, undefined, "This workflow host cannot access artifacts.", true);
+            return;
+          }
+          operation = () => host.appendUsage!(request.taskId as string, request.record as WorkflowUsageInput);
+          break;
+        case "artifact.readUsage":
+          if (host.readUsage === undefined) {
+            respond(callId, false, undefined, "This workflow host cannot access artifacts.", true);
+            return;
+          }
+          operation = () => host.readUsage!(request.taskId as string);
+          break;
+      }
+      if (operation === undefined) {
+        respond(callId, false, undefined, "Invalid workflow artifact request.");
+        return;
+      }
+      try {
+        respond(callId, true, await operation());
+      } catch (error) {
+        respond(callId, false, undefined, error instanceof Error ? error.message : String(error));
+      }
+    }
+
     worker.on("message", (message: WorkerMessage) => {
       if (settled) return;
       switch (message.type) {
@@ -1176,6 +1249,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         case "call":
           if (message.method === "workflow") {
             void handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef);
+            break;
+          }
+          if (message.method.startsWith("artifact.")) {
+            void handleArtifact(message.callId, message.method, message.payload);
             break;
           }
           if (message.method !== "agent") {

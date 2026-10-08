@@ -726,8 +726,34 @@ function makeBudget() {
  * ------------------------------------------------------------------ */
 
 async function main() {
+  const rawArgs = workerData.argsJson === undefined ? undefined : JSON.parse(workerData.argsJson);
+  const taskId = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+    && typeof rawArgs.taskId === "string" ? rawArgs.taskId : undefined;
+  const artifacts = Object.freeze({
+    exists: function () {
+      return callHost("artifact.exists", { taskId: taskId });
+    },
+    read: function (name) {
+      checkBoundary(name, "artifacts.read name");
+      return callHost("artifact.read", { taskId: taskId, name: name });
+    },
+    write: function (name, content) {
+      checkBoundary(name, "artifacts.write name");
+      checkBoundary(content, "artifacts.write content");
+      return callHost("artifact.write", { taskId: taskId, name: name, content: content });
+    },
+    appendUsage: function (record) {
+      checkBoundary(record, "artifacts.appendUsage record");
+      return callHost("artifact.appendUsage", { taskId: taskId, record: record });
+    },
+    async readUsage() {
+      const result = await callHost("artifact.readUsage", { taskId: taskId });
+      return realmParse(JSON.stringify(result));
+    },
+  });
   rootScope = makeScope(undefined, 0);
   const sandbox = {
+    artifacts: artifacts,
     agent: rootScope.agent,
     parallel: parallel,
     pipeline: pipeline,

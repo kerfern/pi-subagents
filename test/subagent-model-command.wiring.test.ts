@@ -83,8 +83,16 @@ describe("/subagent-model", () => {
     const alias = booted.commands.get("implementer-model");
     expect(canonical).toBeDefined();
     expect(alias).toBeDefined();
+    expect(canonical.description).toBe("Set reviewer/Plan/advisor model/thinking, then other-agent model/thinking");
     // One handler, so the alias cannot drift from the canonical command.
     expect(alias.handler).toBe(canonical.handler);
+  });
+
+  it("documents specialist route coverage in the Agent tool", () => {
+    const booted = boot();
+    const description = booted.tools.get("Agent").description as string;
+    expect(description).toContain("Reviewer, Plan, and advisor");
+    expect(description).toContain("every other agent uses the shared route");
   });
 
   it("persists an exact provider/model argument as a routing session entry", async () => {
@@ -304,8 +312,8 @@ describe("the Agent tool under a live route", () => {
       undefined,
       agentCtx([
         FAUX,
-        { provider: "openai-codex", id: "gpt-5.6-luna" },
-        { provider: "openai-codex", id: "gpt-5.6-sol" },
+        { provider: "github-copilot", id: "gpt-6-luna" },
+        { provider: "openai-codex", id: "gpt-6.1-sol" },
       ]),
     )).rejects.toThrow(/override/i);
   });
@@ -393,7 +401,7 @@ describe("routing restore on session start", () => {
 
     expect(statuses.at(-1)).toEqual({
       key: ROUTING_KEY,
-      text: "🧿: openai-codex/gpt-5.6-sol | 👷🏻‍♂️: openai-codex/gpt-5.6-luna",
+      text: "🧿: openai-codex/gpt-6.1-sol (high) | 👷🏻‍♂️: github-copilot/gpt-6-luna (low)",
     });
     expect(notes.some(note => note.level === "warning" && note.text.includes("gone/x"))).toBe(true);
   });

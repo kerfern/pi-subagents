@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeAgentFile } from "../src/agent-file-toggle.js";
 import { BUILTIN_TOOL_NAMES } from "../src/agent-types.js";
-import { loadCustomAgents } from "../src/custom-agents.js";
+import { loadCustomAgents, parseAgentFrontmatter } from "../src/custom-agents.js";
+import { resolveAgentInvocationConfig } from "../src/invocation-config.js";
 import type { AgentConfig } from "../src/types.js";
 
 describe("loadCustomAgents", () => {
@@ -41,6 +42,33 @@ describe("loadCustomAgents", () => {
   function writeWorkspaceAgent(name: string, content: string) {
     writeAgentIn(".agents", name, content);
   }
+
+  it("loads advisor example as a read-only, unpinned profile", () => {
+    const source = readFileSync(join(process.cwd(), "examples/agents/advisor.md"), "utf-8");
+    const { frontmatter } = parseAgentFrontmatter<Record<string, unknown>>(source);
+    expect(frontmatter).toMatchObject({
+      name: "advisor",
+      tools: "read, grep, find, ls",
+      extensions: false,
+      skills: true,
+      persist_session: true,
+    });
+
+    writeAgent("advisor", source);
+    const advisor = loadCustomAgents(tmpDir).get("advisor");
+    expect(advisor?.builtinToolNames).toEqual(["read", "grep", "find", "ls"]);
+    expect(advisor?.extensions).toBe(false);
+    expect(advisor?.persistSession).toBe(true);
+    expect(advisor?.model).toBeUndefined();
+    expect(advisor?.thinking).toBeUndefined();
+    expect(advisor?.builtinToolNames).not.toContain("bash");
+    expect(advisor?.builtinToolNames).not.toContain("write");
+    expect(advisor?.builtinToolNames).not.toContain("edit");
+
+    const invocation = resolveAgentInvocationConfig(advisor, {});
+    expect(invocation.modelInput).toBeUndefined();
+    expect(invocation.thinking).toBeUndefined();
+  });
 
   it("returns empty map when custom agent dirs do not exist", () => {
     const result = loadCustomAgents(tmpDir);

@@ -238,6 +238,12 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
+  /** Exact canonical provider/model selected at the runner boundary when known. */
+  selectedModelId?: string;
+  /** Requested level passed to the runner, distinct from effective session thinking. */
+  requestedThinking?: EffectiveThinkingLevel;
+  /** Number of primary/fallback provider attempts started for this run. */
+  providerAttempts?: number;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */

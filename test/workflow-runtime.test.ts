@@ -99,6 +99,62 @@ describe("script globals", () => {
     expect(calls[0].label).toBe("hello");
   });
 
+  it("exposes only task-scoped artifact RPCs to scripts", async () => {
+    const { host } = stubHost();
+    const calls: unknown[] = [];
+    Object.assign(host, {
+      artifactExists: async (taskId: string) => {
+        calls.push(["exists", taskId]);
+        return false;
+      },
+      readArtifact: async (taskId: string, name: string) => {
+        calls.push(["read", taskId, name]);
+        return "# saved";
+      },
+      writeArtifact: async (taskId: string, name: string, content: string) => {
+        calls.push(["write", taskId, name, content]);
+      },
+      appendUsage: async (taskId: string, record: { role: string }) => {
+        calls.push(["append", taskId, record.role]);
+      },
+      readUsage: async (taskId: string) => {
+        calls.push(["readUsage", taskId]);
+        return { records: [{ role: "advisor" }], malformedLines: 0 };
+      },
+    });
+
+    const result = await run(`
+      const exists = await artifacts.exists();
+      await artifacts.write("plan.md", "plan");
+      const plan = await artifacts.read("plan.md");
+      await artifacts.appendUsage({ role: "advisor" });
+      const usage = await artifacts.readUsage();
+      return {
+        api: Object.keys(artifacts).sort(),
+        exists,
+        plan,
+        usageRealm: usage instanceof Object && usage.records instanceof Array,
+        noFilesystem: typeof fs === "undefined" && typeof path === "undefined" && typeof require === "undefined",
+      };
+    `, { host, args: { taskId: "task-1" } });
+
+    expect(result.status).toBe("completed");
+    expect(result.value).toEqual({
+      api: ["appendUsage", "exists", "read", "readUsage", "write"],
+      exists: false,
+      plan: "# saved",
+      usageRealm: true,
+      noFilesystem: true,
+    });
+    expect(calls).toEqual([
+      ["exists", "task-1"],
+      ["write", "task-1", "plan.md", "plan"],
+      ["read", "task-1", "plan.md"],
+      ["append", "task-1", "advisor"],
+      ["readUsage", "task-1"],
+    ]);
+  });
+
   it("carries opts.effort to the spawn request", async () => {
     const { host, calls } = stubHost();
     const result = await run('await agent("deep", { effort: "xhigh" });\nreturn null;', { host });

@@ -57,6 +57,13 @@ const readExample = (dir: string, name: string) => readFileSync(join(dir, name),
 const SAMPLE_ARGS: Record<string, unknown> = {
   "fan-out-audit.js": { root: "src/routes/" },
   "compose.js": { root: "src/" },
+  "cache-aware-orchestration.js": {
+    taskId: "example-task",
+    mode: "routine",
+    stage: "plan",
+    task: "Implement one bounded change.",
+    originalRequestRef: "example-request",
+  },
 };
 
 /**
@@ -71,24 +78,80 @@ const SAMPLE_ARGS: Record<string, unknown> = {
  * The payloads still have to satisfy the real schemas — the runtime validates
  * them — so a wrong shape here fails the example rather than passing quietly.
  */
-function stubHost(options: { gateFailsFor?: string[] } = {}): {
+function stubHost(options: {
+  gateFailsFor?: string[];
+  failSpawnsFor?: string[];
+  existingTaskIds?: string[];
+  reviewFailsFirst?: boolean;
+  reviewUnverifiedFirst?: boolean;
+  advisorEscalates?: boolean;
+} = {}): {
   host: WorkflowHost;
   spawns: WorkflowSpawnRequest[];
+  artifacts: Map<string, string>;
 } {
   const spawns: WorkflowSpawnRequest[] = [];
+  const artifacts = new Map<string, string>();
+  let currentTaskId: string | undefined;
   /** agentId → label, so `runGate` can tell which child it is gating. */
   const labels = new Map<string, string>();
+  let reviewCalls = 0;
 
   const host: WorkflowHost = {
     async spawnAgent(request) {
       spawns.push(request);
       labels.set(request.agentId, request.label);
       const label = request.label;
+      if (options.failSpawnsFor?.includes(label)) {
+        return { ok: false, error: "mocked provider failure" };
+      }
 
       // Only a call that ASKED for a schema gets JSON. Keying on the label
       // alone would hand fan-out-audit's un-schema'd `verify:<file>` calls a
       // JSON blob, since structured-findings labels its verifiers the same way.
       if (request.schema !== undefined) {
+        if (label === "plan") {
+          return {
+            ok: true,
+            text: JSON.stringify({
+              objective: "Implement bounded change",
+              invariants: ["Keep tests passing"],
+              files: ["src/example.ts"],
+              steps: [{ id: "step-1", task: "Make change", dependsOn: [], verify: "npm test" }],
+              acceptance: ["Focused tests pass"],
+              assumptions: [],
+            }),
+            outputTokens: 10,
+          };
+        }
+        if (label === "advisor") {
+          return {
+            ok: true,
+            text: JSON.stringify({
+              question: "Is scope safe?",
+              evidence: ["state:scope-change"],
+              recommendation: "Continue with review",
+              risks: [],
+              escalate: options.advisorEscalates === true,
+            }),
+            outputTokens: 10,
+          };
+        }
+        if (label === "review") {
+          reviewCalls++;
+          const failed = options.reviewFailsFirst === true && reviewCalls === 1;
+          const unverified = options.reviewUnverifiedFirst === true && reviewCalls === 1;
+          const status = failed ? "fail" : unverified ? "unverified" : "pass";
+          return {
+            ok: true,
+            text: JSON.stringify({
+              requirements: [{ item: "Focused tests pass", status, evidence: ["check:1"] }],
+              blockers: failed ? ["review finding"] : [],
+              residualRisks: [],
+            }),
+            outputTokens: 10,
+          };
+        }
         // structured-findings: one finding per dimension.
         if (label.startsWith("review:")) {
           return {
@@ -128,10 +191,32 @@ function stubHost(options: { gateFailsFor?: string[] } = {}): {
     // would make gated-fix's whole reason for existing untestable.
     async runGate(command, gate) {
       const label = labels.get(gate.agentId) ?? "";
-      if (options.gateFailsFor?.includes(label)) {
-        return { ok: false, output: `${command}: 1 failing` };
+      const ok = !options.gateFailsFor?.includes(label);
+      if (currentTaskId !== undefined) {
+        const key = `${currentTaskId}/state.json`;
+        const content = artifacts.get(key);
+        if (content !== undefined) {
+          const state = JSON.parse(content);
+          state.checks.push({ command: "workflow gate", outcome: ok ? "passed" : "failed", exitCode: ok ? 0 : null });
+          artifacts.set(key, JSON.stringify(state));
+        }
       }
-      return { ok: true, output: `${command}: ok` };
+      return { ok, output: ok ? `${command}: ok` : `${command}: 1 failing` };
+    },
+    async artifactExists(taskId) {
+      return options.existingTaskIds?.includes(taskId)
+        || [...artifacts.keys()].some(key => key.startsWith(`${taskId}/`));
+    },
+    async readArtifact(taskId, name) {
+      return artifacts.get(`${taskId}/${name}`);
+    },
+    async writeArtifact(taskId, name, content) {
+      if (name === "state.json") currentTaskId = taskId;
+      artifacts.set(`${taskId}/${name}`, content);
+    },
+    async appendUsage() {},
+    async readUsage() {
+      return { records: [], malformedLines: 0 };
     },
     loadWorkflow(ref) {
       // WorkflowScriptRef is { name?, scriptPath? } — never a bare string.
@@ -142,16 +227,32 @@ function stubHost(options: { gateFailsFor?: string[] } = {}): {
       return { ok: true, script: readExample(LIB_DIR, file) };
     },
   };
-  return { host, spawns };
+  return { host, spawns, artifacts };
 }
 
 const runExample = (name: string, host: WorkflowHost) =>
   runWorkflow({ script: readExample(EXAMPLES_DIR, name), host, args: SAMPLE_ARGS[name] });
 
+const cacheArgs = (overrides: Record<string, unknown> = {}) => ({
+  taskId: "pilot-task",
+  mode: "routine",
+  stage: "plan",
+  task: "Implement one bounded change.",
+  originalRequestRef: "REQ-42",
+  ...overrides,
+});
+
+const runCacheAware = (args: unknown, host: WorkflowHost) =>
+  runWorkflow({ script: readExample(EXAMPLES_DIR, "cache-aware-orchestration.js"), host, args });
+
+const storedState = (artifacts: Map<string, string>, taskId = "pilot-task") =>
+  JSON.parse(artifacts.get(`${taskId}/state.json`)!);
+
 describe("shipped example workflows", () => {
   it("ships at least the examples the guide links", () => {
     // docs/workflows.md has a row per file; a deletion should break this first.
     expect(exampleFiles).toEqual([
+      "cache-aware-orchestration.js",
       "compose.js",
       "fan-out-audit.js",
       "gated-fix.js",
@@ -189,18 +290,299 @@ describe("shipped example workflows", () => {
       expect(result.status).toBe("completed");
     });
 
-    it("tolerates being run with no args at all", async () => {
-      // Every example documents `args?.x ?? default`; this is what pins it.
-      const { host } = stubHost();
+    it("validates required args before spawning when run without args", async () => {
+      const { host, spawns } = stubHost();
       const result = await runWorkflow({ script: readExample(EXAMPLES_DIR, name), host });
 
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe("completed");
+      if (name === "cache-aware-orchestration.js") {
+        expect(result.error).toMatch(/args|taskId|mode|stage/i);
+        expect(result.agentCount).toBe(0);
+        expect(spawns).toHaveLength(0);
+      } else {
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe("completed");
+      }
     });
   });
 
   // Tier 3 — explicit values, including the fan-out width.
   describe("returned values", () => {
+    describe("cache-aware orchestration", () => {
+      it("rejects invalid args before spawning", async () => {
+        for (const args of [
+          undefined,
+          { taskId: "../escape", mode: "routine", stage: "plan", task: "change" },
+          { taskId: "safe-id", mode: "unknown", stage: "plan", task: "change" },
+          { taskId: "safe-id", mode: "routine", stage: "unknown", task: "change" },
+        ]) {
+          const { host, spawns } = stubHost();
+          const result = await runCacheAware(args, host);
+          expect(result.error).toBeTruthy();
+          expect(result.agentCount).toBe(0);
+          expect(spawns).toHaveLength(0);
+        }
+      });
+
+      it("lets routine plan stage delegate trivial work to parent", async () => {
+        const { host, spawns, artifacts } = stubHost();
+        const result = await runCacheAware(cacheArgs({ trivial: true }), host);
+
+        expect(result.value).toMatchObject({ handledByParent: true });
+        expect(spawns).toHaveLength(0);
+        expect(artifacts.size).toBe(0);
+      });
+
+      it("refuses a plan stage when task directory already exists", async () => {
+        const { host, spawns } = stubHost({ existingTaskIds: ["occupied"] });
+        const result = await runCacheAware(cacheArgs({ taskId: "occupied" }), host);
+
+        expect(result.error).toMatch(/already exists/i);
+        expect(spawns).toHaveLength(0);
+      });
+
+      it("requires plan-version approval before worker and persists the gate result", async () => {
+        const { host, spawns, artifacts } = stubHost();
+        const plan = await runCacheAware(cacheArgs(), host);
+        expect(plan.error).toBeUndefined();
+        expect(spawns[0]).toMatchObject({ label: "plan", agentType: "Plan", effort: "high" });
+        expect(spawns[0].model).toBeUndefined();
+        expect(artifacts.get("pilot-task/plan.md")).toContain("Implement bounded change");
+        expect(storedState(artifacts)).toMatchObject({
+          taskId: "pilot-task", mode: "routine", stage: "plan", planVersion: 1, approvedPlanVersion: null,
+        });
+
+        const unapproved = await runCacheAware(cacheArgs({ stage: "worker", test: "npm test" }), host);
+        expect(unapproved.error).toMatch(/approved.*plan/i);
+        expect(spawns).toHaveLength(1);
+
+        const worker = await runCacheAware(
+          cacheArgs({ stage: "worker", approvedPlanVersion: 1, test: "npm test" }),
+          host,
+        );
+        expect(worker.error).toBeUndefined();
+        expect(spawns[1]).toMatchObject({ label: "worker", agentType: "general-purpose", effort: "low", gate: "npm test" });
+        expect(spawns[1].model).toBeUndefined();
+        expect(storedState(artifacts)).toMatchObject({
+          stage: "worker",
+          approvedPlanVersion: 1,
+          checks: [{ command: "workflow gate", outcome: "passed", exitCode: 0 }],
+        });
+
+        const reviewContext = {
+          revisionId: "rev-1",
+          originalRequest: "redacted original request",
+          approvedPlan: artifacts.get("pilot-task/plan.md")!,
+          actualDiff: "diff summary",
+          validationResults: "npm test passed",
+          unresolvedIssues: "none",
+        };
+        const review = await runCacheAware(cacheArgs({ stage: "review", reviewContext }), host);
+        expect(review.value).toMatchObject({ status: "pass", pass: true });
+        expect(spawns[2]).toMatchObject({ label: "review", agentType: "reviewer", effort: "high" });
+        for (const [key, evidence] of Object.entries(reviewContext)) {
+          if (key !== "revisionId") expect(spawns[2].prompt).toContain(evidence);
+        }
+        expect(spawns[2].prompt).not.toContain(reviewContext.revisionId);
+        expect(spawns[2].model).toBeUndefined();
+        expect(storedState(artifacts)).toMatchObject({ stage: "review", reviewStatus: "pass" });
+        expect(JSON.parse(artifacts.get("pilot-task/review.md")!)).toMatchObject({ status: "pass" });
+      });
+
+      it("requires review feedback for fixes and does not re-review unchanged work", async () => {
+        const { host, spawns, artifacts } = stubHost({ reviewFailsFirst: true });
+        await runCacheAware(cacheArgs({}), host);
+        await runCacheAware(cacheArgs({ stage: "worker", approvedPlanVersion: 1 }), host);
+        const reviewContext = {
+          revisionId: "rev-1",
+          originalRequest: "redacted request",
+          approvedPlan: artifacts.get("pilot-task/plan.md")!,
+          actualDiff: "initial diff",
+          validationResults: "gate passed",
+          unresolvedIssues: "none",
+        };
+        const firstReview = await runCacheAware(cacheArgs({ stage: "review", reviewContext }), host);
+        expect(firstReview.value).toMatchObject({ status: "fail", pass: false });
+
+        const unchangedReview = await runCacheAware(cacheArgs({ stage: "review" }), host);
+        expect(unchangedReview.value).toMatchObject({ status: "fail", pass: false, reused: true });
+        expect(spawns.filter(spawn => spawn.label === "review")).toHaveLength(1);
+
+        const changedWithoutGate = await runCacheAware(cacheArgs({
+          stage: "review",
+          reviewContext: { ...reviewContext, revisionId: "rev-2", actualDiff: "different diff" },
+        }), host);
+        expect(changedWithoutGate.value).toMatchObject({
+          status: "unverified", pass: false, requiresGate: true,
+        });
+        expect(spawns.filter(spawn => spawn.label === "review")).toHaveLength(1);
+
+        const missingFeedback = await runCacheAware(cacheArgs({ stage: "worker", approvedPlanVersion: 1 }), host);
+        expect(missingFeedback.error).toMatch(/review feedback/i);
+        expect(spawns.filter(spawn => spawn.label === "worker")).toHaveLength(1);
+
+        const repair = await runCacheAware(cacheArgs({
+          stage: "worker",
+          approvedPlanVersion: 1,
+          reviewFeedback: "Address reviewer finding at src/example.ts:1.",
+        }), host);
+        expect(repair.error).toBeUndefined();
+        expect(spawns.filter(spawn => spawn.label === "worker")).toHaveLength(2);
+        expect(spawns.find(spawn => spawn.label === "worker" && spawn.prompt.includes("reviewer finding"))).toBeDefined();
+        expect(storedState(artifacts)).toMatchObject({
+          reviewStatus: "pending",
+          repairAttempts: 1,
+          checks: [{ outcome: "passed" }, { outcome: "passed" }],
+        });
+
+        const secondReview = await runCacheAware(cacheArgs({
+          stage: "review",
+          reviewContext: { ...reviewContext, revisionId: "rev-2", actualDiff: "fixed diff" },
+        }), host);
+        expect(secondReview.value).toMatchObject({ status: "pass", pass: true });
+        expect(spawns.filter(spawn => spawn.label === "review")).toHaveLength(2);
+      });
+
+      it("requires a fresh passing gate when unverified review moves to a new revision", async () => {
+        const { host, spawns, artifacts } = stubHost({ reviewUnverifiedFirst: true });
+        await runCacheAware(cacheArgs({}), host);
+        await runCacheAware(cacheArgs({ stage: "worker", approvedPlanVersion: 1 }), host);
+        const reviewContext = {
+          revisionId: "review-rev-1",
+          originalRequest: "redacted request",
+          approvedPlan: artifacts.get("pilot-task/plan.md")!,
+          actualDiff: "initial diff",
+          validationResults: "gate passed",
+          unresolvedIssues: "none",
+        };
+        const firstReview = await runCacheAware(cacheArgs({ stage: "review", reviewContext }), host);
+        expect(firstReview.value).toMatchObject({ status: "unverified", pass: false });
+        const unchangedReview = await runCacheAware(cacheArgs({ stage: "review" }), host);
+        expect(unchangedReview.value).toMatchObject({ status: "unverified", pass: false, reused: true });
+
+        const changedWithoutGate = await runCacheAware(cacheArgs({
+          stage: "review",
+          reviewContext: { ...reviewContext, revisionId: "review-rev-2", actualDiff: "changed diff" },
+        }), host);
+        expect(changedWithoutGate.value).toMatchObject({
+          status: "unverified", pass: false, staleReview: true, requiresGate: true,
+        });
+        expect(spawns.filter(spawn => spawn.label === "review")).toHaveLength(1);
+
+        await runCacheAware(cacheArgs({ stage: "worker", approvedPlanVersion: 1 }), host);
+        expect(storedState(artifacts).checks).toHaveLength(2);
+        const secondReview = await runCacheAware(cacheArgs({
+          stage: "review",
+          reviewContext: { ...reviewContext, revisionId: "review-rev-2", actualDiff: "changed diff" },
+        }), host);
+        expect(secondReview.value).toMatchObject({ status: "pass", pass: true });
+        expect(spawns.filter(spawn => spawn.label === "review")).toHaveLength(2);
+      });
+
+      it("keeps complex worker bounded without switching parent model", async () => {
+        const { host, spawns } = stubHost();
+        await runCacheAware(cacheArgs({ mode: "complex", taskId: "complex-task" }), host);
+        await runCacheAware(
+          cacheArgs({ mode: "complex", taskId: "complex-task", stage: "worker", approvedPlanVersion: 1 }),
+          host,
+        );
+
+        expect(spawns.map(spawn => spawn.agentType)).toEqual(["Plan", "general-purpose"]);
+        expect(spawns[1].effort).toBe("low");
+        expect(spawns.every(spawn => spawn.model === undefined)).toBe(true);
+      });
+
+      it("consults advisor only for an explicit supported trigger", async () => {
+        const { host, spawns } = stubHost();
+        await runCacheAware(cacheArgs({ taskId: "advisor-task" }), host);
+        const invalid = await runCacheAware(
+          cacheArgs({ taskId: "advisor-task", stage: "advisor", trigger: "routine" }),
+          host,
+        );
+        expect(invalid.error).toMatch(/trigger/i);
+        expect(spawns).toHaveLength(1);
+
+        const result = await runCacheAware(cacheArgs({
+          taskId: "advisor-task",
+          stage: "advisor",
+          trigger: "security-change",
+          question: "Does this change cross a security boundary?",
+          evidence: ["src/auth.ts:12"],
+        }), host);
+        expect(result.error).toBeUndefined();
+        expect(spawns[1]).toMatchObject({ label: "advisor", agentType: "advisor", effort: "high" });
+        expect(spawns[1].model).toBeUndefined();
+      });
+
+      it("preserves artifacts and blocks workers when advisor requires parent escalation", async () => {
+        const { host, spawns, artifacts } = stubHost({ advisorEscalates: true });
+        await runCacheAware(cacheArgs({ taskId: "escalate-task" }), host);
+        const advice = await runCacheAware(cacheArgs({
+          taskId: "escalate-task",
+          stage: "advisor",
+          trigger: "security-change",
+          question: "Does this cross a security boundary?",
+          evidence: ["src/auth.ts:12"],
+        }), host);
+        expect(advice.value).toMatchObject({ escalate: true, handoffRequired: true });
+        expect(artifacts.get("escalate-task/state.json")).toContain("Advisor escalation: security-change");
+
+        const blocked = await runCacheAware(cacheArgs({
+          taskId: "escalate-task",
+          stage: "worker",
+          approvedPlanVersion: 1,
+        }), host);
+        expect(blocked.error).toMatch(/manually selected Sol\/high parent/i);
+        expect(spawns.map(spawn => spawn.label)).toEqual(["plan", "advisor"]);
+      });
+
+      it("stops after two failed repair attempts and does not count provider failure", async () => {
+        const gateHost = stubHost({ gateFailsFor: ["worker"] });
+        await runCacheAware(cacheArgs({ taskId: "repair-task" }), gateHost.host);
+        const workerArgs = cacheArgs({ taskId: "repair-task", stage: "worker", approvedPlanVersion: 1 });
+        const initial = await runCacheAware(workerArgs, gateHost.host);
+        const repairOne = await runCacheAware(workerArgs, gateHost.host);
+        const repairTwo = await runCacheAware(workerArgs, gateHost.host);
+        const stopped = await runCacheAware(workerArgs, gateHost.host);
+
+        expect(initial.value).toMatchObject({ needsRepair: true, repairAttempts: 0 });
+        expect(repairOne.value).toMatchObject({ needsRepair: true, repairAttempts: 1 });
+        expect(repairTwo.value).toMatchObject({ needsRepair: true, repairAttempts: 2 });
+        expect(stopped.value).toMatchObject({ advisorRequired: true, repairAttempts: 2 });
+        expect(gateHost.spawns.filter(spawn => spawn.label === "worker")).toHaveLength(3);
+        expect(storedState(gateHost.artifacts, "repair-task").repairAttempts).toBe(2);
+        const advisor = await runCacheAware(cacheArgs({
+          taskId: "repair-task",
+          stage: "advisor",
+          trigger: "two-failed-repairs",
+          question: "What is blocking verification?",
+          evidence: ["state.json"],
+        }), gateHost.host);
+        expect(advisor.error).toBeUndefined();
+        expect(gateHost.spawns[4]).toMatchObject({ agentType: "advisor", effort: "high" });
+
+        const providerHost = stubHost({ failSpawnsFor: ["worker"] });
+        await runCacheAware(cacheArgs({ taskId: "provider-task" }), providerHost.host);
+        const failed = await runCacheAware(
+          cacheArgs({ taskId: "provider-task", stage: "worker", approvedPlanVersion: 1 }),
+          providerHost.host,
+        );
+        expect(failed.value).toMatchObject({ providerFailure: true, repairAttempts: 0 });
+        expect(storedState(providerHost.artifacts, "provider-task")).toMatchObject({ repairAttempts: 0, checks: [] });
+      });
+
+      it("leaves review unverified without supplied review evidence", async () => {
+        const { host, spawns, artifacts } = stubHost();
+        await runCacheAware(cacheArgs(), host);
+        await runCacheAware(cacheArgs({ stage: "worker", approvedPlanVersion: 1 }), host);
+        const result = await runCacheAware(cacheArgs({ stage: "review" }), host);
+
+        expect(result.value).toMatchObject({ status: "unverified", pass: false });
+        expect(spawns).toHaveLength(2);
+        expect(storedState(artifacts)).toMatchObject({ stage: "review", reviewStatus: "unverified" });
+      });
+
+    });
+
     it("fan-out-audit returns one verified finding per discovered file", async () => {
       const { host } = stubHost();
       const result = await runExample("fan-out-audit.js", host);

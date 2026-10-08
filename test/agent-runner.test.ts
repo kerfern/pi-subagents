@@ -138,6 +138,7 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import type { LifetimeUsage, MessageUsageDelta } from "../src/usage.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -551,11 +552,11 @@ describe("agent-runner usage callback wiring", () => {
     for (const l of listeners) l(event);
   }
 
-  it("runAgent forwards full usage from message_end events", async () => {
+  it("runAgent separates unpriced per-message deltas from lifetime totals", async () => {
     const { session, listeners } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 
-    const seen: Array<{ input: number; output: number; cacheWrite: number; cost?: number }> = [];
+    const seen: Array<{ lifetime: LifetimeUsage; delta: MessageUsageDelta }> = [];
     session.prompt = vi.fn(async () => {
       // Two assistant messages over the run
       emitMessageEnd(listeners, { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: { total: 0.002 } });
@@ -565,14 +566,16 @@ describe("agent-runner usage callback wiring", () => {
 
     await runAgent(ctx, "Explore", "go", {
       pi,
-      onAssistantUsage: (u) => seen.push(u),
+      onAssistantUsage: (lifetime, delta) => seen.push({ lifetime, delta }),
     });
 
-    // cacheRead rides along even though the display total drops it (#38): the
- // prefix is genuinely re-billed per call, and the parent-session report needs it.
-    expect(seen).toEqual([
-      { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.002 },
-      { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: 0.004 },
+    expect(seen.map(sample => sample.lifetime)).toEqual([
+      { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0 },
+      { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: 0 },
+    ]);
+    expect(seen.map(sample => sample.delta)).toEqual([
+      { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: null },
+      { input: 200, output: 80, cacheWrite: 20, cacheRead: 1800, cost: null },
     ]);
   });
 
@@ -611,9 +614,9 @@ describe("agent-runner usage callback wiring", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 
-  it("resumeAgent forwards usage on message_end the same way", async () => {
+  it("resumeAgent preserves observed deltas separately from lifetime totals", async () => {
     const { session, listeners } = createSession("RESUMED");
-    const seen: any[] = [];
+    const seen: Array<{ lifetime: LifetimeUsage; delta: MessageUsageDelta }> = [];
 
     session.prompt = vi.fn(async () => {
       emitMessageEnd(listeners, { input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: { total: 0.001 } });
@@ -621,10 +624,13 @@ describe("agent-runner usage callback wiring", () => {
     });
 
     await resumeAgent(session as any, "continue", {
-      onAssistantUsage: (u) => seen.push(u),
+      onAssistantUsage: (lifetime, delta) => seen.push({ lifetime, delta }),
     });
 
-    expect(seen).toEqual([{ input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: 0.001 }]);
+    expect(seen).toEqual([{
+      lifetime: { input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: 0 },
+      delta: { input: 10, output: 20, cacheWrite: 5, cacheRead: 90, cost: null },
+    }]);
   });
 
   it("forwards compaction_end events to onCompaction (only when not aborted)", async () => {

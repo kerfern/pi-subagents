@@ -68,6 +68,21 @@ function documentedAgentOptions(): { keys: Set<string>; efforts: string[]; line:
   return found;
 }
 
+describe("the artifact boundary it documents", () => {
+  it("names task scope, fixed filenames, and no arbitrary filesystem access", () => {
+    expect(description).toContain("artifacts");
+    expect(description).toContain("exists()");
+    expect(description).toContain("without creating it");
+    expect(description).toContain("args.taskId");
+    expect(description).toContain("plan.md");
+    expect(description).toContain("state.json");
+    expect(description).toContain("review.md");
+    expect(description).toContain("usage.jsonl");
+    expect(description).toContain("never accepts arbitrary paths");
+    expect(description).toContain("never persist prompts, secrets, or sensitive data");
+  });
+});
+
 describe("the agent() contract it documents", () => {
   it("names every option the runtime accepts", () => {
     for (const option of AGENT_OPTIONS) {

@@ -19,6 +19,14 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test
+      # The guard ships as a default-disabled package inside this extension and its tests
+      # substitute a fake runtime, so Vitest never exercises it (vitest.config.mts excludes
+      # quota-guard/**). Run its own Node suite and mutation checks here, or a green CI says
+      # nothing about it.
+      - name: Quota guard suite
+        run: npm run test:quota
+      - name: Quota guard mutation checks
+        run: npm run mutate:quota
 
   # The pi devDependencies pin the compile baseline POST-migration (0.84.2), so the `build`
   # job above is what guards the modelRegistry -> modelRuntime world: PR #152's
@@ -72,3 +80,11 @@ jobs:
         run: npm run typecheck
       - name: Test suite against current Pi
         run: npx vitest run --reporter=dot
+      # Host conformance: the guard gates traffic by injecting a per-request `fetch`, and
+      # whether that fetch reaches the final built request is the seam whose silent failure
+      # would dispatch unguarded. This job is the forward canary, so it is where a host
+      # change should surface first. Deliberately NOT in compat-floor-pi: on a Pi older than
+      # the guard's supported baseline the guard refuses to activate, which is correct
+      # fail-closed behaviour rather than breakage (see docs/quota-guard-compatibility.md).
+      - name: Quota guard host conformance
+        run: npm run check:quota-host

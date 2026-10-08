@@ -44,6 +44,7 @@ import {
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { isQuotaGuardEnabled, quotaGuardExtension, setQuotaGuardEnabled } from "./quota-guard/index.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
@@ -74,6 +75,7 @@ import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
+import { appendWorkflowUsage } from "./workflow/artifacts.js";
 import { decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
 import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "./workflow/entry.js";
 import { createWorkflowHost } from "./workflow/host.js";
@@ -83,6 +85,7 @@ import { elapsedMs } from "./workflow/progress.js";
 import { runWorkflow } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { workflowCompletionEvent, workflowUsageEvent } from "./workflow/telemetry.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -604,6 +607,10 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    if (record.workflowId !== undefined) {
+      const completion = workflowCompletionEvent(record);
+      if (completion !== undefined) appendWorkflowUsage(record.workflowId, completion);
+    }
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
     // and dialog. Keep them out of top-level lifecycle, transcript,
@@ -676,7 +683,11 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
-  }, (_record, usage) => {
+  }, (record, usage, observed) => {
+    if (record.workflowId !== undefined) {
+      const event = workflowUsageEvent(record, observed);
+      if (event !== undefined) appendWorkflowUsage(record.workflowId, event);
+    }
     // Every assistant message from every agent — nested included, exactly once.
     // Parked here until a tool result can carry it back to the parent session;
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
@@ -1462,6 +1473,7 @@ export default function (pi: ExtensionAPI) {
       setOutputTranscript: setOutputTranscriptDefault,
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
+      setQuotaGuardEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
@@ -1524,7 +1536,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- Reviewer uses its route; all others use shared. Model params must name route; change with /subagent-model.
+- Reviewer, Plan, and advisor use the specialist route; every other agent uses the shared route. Model params must match route; change with /subagent-model.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -1553,7 +1565,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Reviewer agents use the reviewer route; every other agent uses the shared route. A model parameter is refused unless it names that agent's routed model, and the main session's own model is unaffected — change routes with /subagent-model rather than per call.
+- Reviewer, Plan, and advisor use the specialist route; every other agent uses the shared route. A model parameter is refused unless it names that agent's routed model, and the main session's own model is unaffected — change routes with /subagent-model rather than per call.
 - Use thinking to control extended thinking level.
 - Use inherit_context if the agent needs the parent conversation history.${isolationGuideline}${scheduleGuideline}
 
@@ -2394,19 +2406,21 @@ Terse command-style prompts produce shallow, generic work.
    * detached — a rejection would surface as an unhandled one.
    */
   async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
+    let host: ReturnType<typeof createWorkflowHost> | undefined;
     try {
+      host = createWorkflowHost({
+        pi,
+        ctx,
+        manager,
+        signal: task.abortController.signal,
+        rootSessionId: ctx.sessionManager.getSessionId(),
+        workflowId: task.id,
+      });
       const result = await runWorkflow({
         script: task.script,
         args: task.args,
         signal: task.abortController.signal,
-        host: createWorkflowHost({
-          pi,
-          ctx,
-          manager,
-          signal: task.abortController.signal,
-          rootSessionId: ctx.sessionManager.getSessionId(),
-          workflowId: task.id,
-        }),
+        host,
         onProgress: entries => updateWorkflowProgressBatch(task, entries),
         // The dialog's pause / skip / retry keys run through this; it is dropped
         // again when the task settles.
@@ -2418,9 +2432,16 @@ Terse command-style prompts produce shallow, generic work.
             : {}),
         },
       });
+      await host.finishWorkflow?.();
       completeWorkflowTask(task, result);
     } catch (err) {
-      failWorkflowTask(task, err instanceof Error ? err.message : String(err));
+      let message = err instanceof Error ? err.message : String(err);
+      try {
+        await host?.finishWorkflow?.();
+      } catch (finishError) {
+        message += `; usage telemetry flush failed: ${finishError instanceof Error ? finishError.message : String(finishError)}`;
+      }
+      failWorkflowTask(task, message);
     }
   }
 
@@ -3524,6 +3545,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
       reportUsage: isReportUsageEnabled(),
+      // Defaults off: the guard is inert until an operator enables it, so an
+      // unset value must round-trip as unset rather than being materialized as
+      // an explicit `false` (same reasoning as `fallbackSubagent` above).
+      quotaGuardEnabled: isQuotaGuardEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
@@ -4263,9 +4288,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       return;
     }
 
-    const reviewer = await pickSubagentModel(commandCtx, "Reviewer model");
+    const reviewer = await pickSubagentModel(commandCtx, "Reviewer/Plan/advisor model");
     if (reviewer === null) return;
-    const reviewerThinking = await pickSubagentThinking(commandCtx, "Reviewer thinking");
+    const reviewerThinking = await pickSubagentThinking(commandCtx, "Reviewer/Plan/advisor thinking");
     if (reviewerThinking === null) return;
     const shared = await pickSubagentModel(commandCtx, "Other agents model");
     if (shared === null) return;
@@ -4276,11 +4301,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
   }
 
   pi.registerCommand("subagent-model", {
-    description: "Set reviewer model/thinking, then other-subagent model/thinking",
+    description: "Set reviewer/Plan/advisor model/thinking, then other-agent model/thinking",
     handler: subagentModelCommand,
   });
   pi.registerCommand("implementer-model", {
-    description: "Alias for /subagent-model (reviewer + shared subagent models)",
+    description: "Alias for /subagent-model (specialist + shared subagent routes)",
     handler: subagentModelCommand,
   });
 
@@ -4288,6 +4313,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
   });
+
+  // Quota guard is opt-in: default-off, so this is inert unless an operator
+  // set `quotaGuardEnabled`. It registers `/quota-guard` and installs against
+  // the runtime handle it is handed; it never forces aborts or patches fetch.
+  quotaGuardExtension(pi);
 
   /**
    * What `/agents → Workflows` and the fleet list's `workflow` rows need from

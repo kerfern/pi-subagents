@@ -231,6 +231,22 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
+  it("round-trips quotaGuardEnabled; a non-boolean leaves it off", () => {
+    // Default is off, so an unrecognised value must be dropped rather than
+    // coerced — anything else would enable the guard without the operator.
+    writeProject({ quotaGuardEnabled: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ quotaGuardEnabled: 1 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+
+    saveSettings({ quotaGuardEnabled: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: true });
+
+    // Absence stays absent so the caller's "use default" signal is preserved.
+    saveSettings({}, projectDir);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
     writeProject({ schedulingEnabled: "yes" } as any);
     expect(loadSettings(projectDir)).toEqual({});
@@ -555,6 +571,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setQuotaGuardEnabled: vi.fn(),
       };
     });
 
@@ -806,6 +823,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setQuotaGuardEnabled: vi.fn(),
       };
     });
 

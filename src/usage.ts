@@ -21,6 +21,15 @@
  */
 export type LifetimeUsage = { input: number; output: number; cacheWrite: number; cacheRead?: number; cost?: number };
 
+/** Raw per-assistant-message usage; null means Pi or model pricing did not expose it. */
+export type MessageUsageDelta = {
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  cost: number | null;
+};
+
 /**
  * Sum of lifetime *token* components for DISPLAY, or 0 if undefined.
  * Deliberately excludes `cacheRead` (see above) and `cost` — that is money, not

@@ -24,7 +24,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
-- **Session-scoped subagent routes** — `/subagent-model` picks reviewer model → reviewer thinking → shared model → shared thinking for every other fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC), independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
+- **Session-scoped subagent routes** — `/subagent-model` picks specialist model (Plan, advisor, reviewer) → specialist thinking → shared model → shared thinking for every other fresh subagent (the `Agent` tool, workflow children, nested delegation, the scheduler, cross-extension RPC), independent of the main session's own model. One same-task retry on a fallback provider after a recognized provider failure; when that fails too the route latches and refuses later dispatches rather than quietly choosing another model. See [Subagent Model Routing](#subagent-model-routing)
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
@@ -460,6 +460,8 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.
 
+**Opt-in staged pilot:** [`cache-aware-orchestration.js`](examples/workflows/cache-aware-orchestration.js) — Plan approval → gated worker → advisor/review stages with task-scoped artifacts and usage telemetry. Use redacted task summaries; see workflow guide for stage arguments and limits.
+
 ### `get_subagent_result`
 
 Check status and retrieve results from a background agent.
@@ -486,7 +488,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 | --------- | ------------- |
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
-| `/subagent-model [provider/model]` | Set reviewer model → reviewer thinking → other-subagent model → other-subagent thinking. No argument opens four pickers in series; model pickers support filtering and `↑↓`, thinking pickers offer `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. An exact `provider/model` argument applies models only, preserving current thinking routes. See [Subagent Model Routing](#subagent-model-routing) |
+| `/subagent-model [provider/model]` | Set specialist (Plan/advisor/reviewer) model → specialist thinking → other-subagent model → other-subagent thinking. No argument opens four pickers in series; model pickers support filtering and `↑↓`, thinking pickers offer `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. An exact `provider/model` argument applies models only, preserving current thinking routes. See [Subagent Model Routing](#subagent-model-routing) |
 | `/implementer-model` | Alias for `/subagent-model` |
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
@@ -712,11 +714,30 @@ Two rewrites are suppressed outright rather than left to the mode, because they 
 
 Turn `all` on for tools that genuinely emit Markdown, and off again for a diff or a log. `m` in the viewer cycles the three and persists the choice, so the key and this setting are the same value — the footer shows which is in force as `m raw` / `m md` / `m md+`. Code fences are syntax-highlighted using pi's own Markdown theme — which is also why fenced code is the one part of a result *not* dimmed under `all`; result prose still is, so the transcript keeps its hierarchy. Applied live; also settable from `/agents → Settings → Viewer markdown`.
 
+**Quota guard** (`quotaGuardEnabled`, default `false`): a default-off guard that reads OpenAI Codex and Command Code
+subscription usage and admits a request only after a fresh check, serialising one lane per verified account and
+latching the whole fleet — draining admitted work rather than aborting it — when a window is close to exhausted.
+Nothing runs until an operator sets `"quotaGuardEnabled": true` in `subagents.json`; while it is off the package is
+inert. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
+failure mode it exists to prevent is a guard that looks installed while dispatching unguarded. Upgrade procedure: run
+`npm run check:quota-host` after a pi upgrade. See [the compatibility guide](docs/quota-guard-compatibility.md).
+
 **Workflows** (`workflowsEnabled`, default `true`): the master switch for scripted workflows. Toggle it via `/agents → Settings → Workflows`, or set it in `subagents.json`. Off, the `SubagentWorkflow` tool is never registered — the model is not told the feature exists and cannot call it, so it costs no tool-spec context — the `/agents → Workflows` entry is hidden, and `--subagents-workflow-file` refuses with a pointer to the setting rather than doing nothing. Read at extension load, so it applies on the next pi session; runs already in flight are left alone.
 
 Leaving it unset is not quite the same as `true`. Unset means *auto*: on, unless another extension already provides a workflow tool, in which case this one warns and stands down for the session. Two orchestrators in one tool spec is a worse default than none — the model has to guess which to call and pays for both descriptions to find out — and the extension that was installed on purpose is the one that should survive. Setting `workflowsEnabled` explicitly pins the answer: `true` keeps ours whatever else is loaded, `false` is off regardless.
 
 The match is on the exact tool names `Workflow` (Claude Code's) and `SubagentWorkflow` (ours), never a substring, so a `list_workflows` or `github_workflow_run` from some CI integration does not silently take the feature down. The check runs at `session_start` and nowhere earlier, because `getAllTools` throws during extension loading and load order means a check at registration time could not see an extension that has not loaded yet — so the tool is registered first and withdrawn from the active set through `setActiveTools`, which rebuilds the system prompt before any turn runs. When the other extension took the `SubagentWorkflow` name itself, pi's first-registration-wins rule already dropped ours, so there is nothing to withdraw and only the menu and the CLI flag come down.
+
+**Quota guard** (`quotaGuardEnabled`, default `false`): an opt-in, operator-controlled guard that holds subagent dispatch behind a quota check and latches the fleet when a provider's quota is exhausted. **Enabling it is an operator action** — it is off by default, and the extension does no I/O, resolves no credentials and decorates nothing until it is on. Set `"quotaGuardEnabled": true` in `subagents.json`; read at extension load, so it applies on the next pi session. The `/quota-guard` command takes four subcommands:
+
+| Subcommand | What it does |
+| ---------- | ------------ |
+| `/quota-guard enable` | Turn the guard on for the session |
+| `/quota-guard pause` | Pause the fleet (`manual`); admitted work finishes, new dispatch waits |
+| `/quota-guard resume` | Resume — refused unless a fresh check is available |
+| `/quota-guard status` | Print the fleet snapshot (state, reason, active/inference/coding counts) and wake/backoff state |
+
+It never force-aborts active work and never patches `globalThis.fetch`.
 
 **Tool description** (`toolDescriptionMode`, default `"full"`): which Agent tool description the LLM sees. `"full"` is the rich Claude Code-style prompt (~1,400 tokens with the default agents); `"compact"` is ~75% smaller — one-line agent type list, terse usage notes — for small/local models where tool-spec tokens are expensive. Per-option details stay in the parameter descriptions in every mode (the parameter schema is never customizable). Applies on the next pi session.
 

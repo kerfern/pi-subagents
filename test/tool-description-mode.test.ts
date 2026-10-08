@@ -112,7 +112,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("- Explore: Fast read-only search agent for locating code. (Tools:");
     expect(desc).not.toContain("very thorough");
     // The point of the feature: materially smaller than the full version.
-    expect(desc.length).toBeLessThan(1600);
+    expect(desc.length).toBeLessThan(1650);
   });
 
   it("invalid mode in the settings file is dropped — full description", () => {
