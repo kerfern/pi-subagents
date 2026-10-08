@@ -258,6 +258,26 @@ export interface SubagentsSettings {
    */
   quotaGuardCodexLimits?: CodexLimit[];
   /**
+   * Operator-asserted per-window reserve units, keyed by window id (`monthly`, `fiveHour`, `weekly`
+   * for CommandCode; `<limit>.<primary_window|secondary_window>` for Codex). These are the units one
+   * dispatch may burn in that window, which is what the guard holds back.
+   *
+   * The guard sizes a reserve from its own observations, and needs two observations with a rising
+   * `used` counter. On a fresh install over an idle account nothing ever moves, so the guard stays
+   * closed forever. This seed is how the operator unblocks that first run: it is consulted ONLY where
+   * the estimator has no observation, never as a default, and never blends with a calibrated number.
+   *
+   * Window ids are visible from `node quota-guard/certify-live.mjs --dry-run`. A value that is too
+   * small under-protects - the operator owns that risk.
+   *
+   * Entries must be finite numbers >= 0 with non-empty ids. A malformed entry drops the whole value
+   * rather than the entry, so a bad seed cannot half-configure the guard while the windows it
+   * omitted stay unknown.
+   *
+   * Read once at extension init, like `quotaGuardEnabled`.
+   */
+  quotaGuardReserveUnits?: Record<string, number>;
+  /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
    * disables nesting project-wide. Read when a subagent session is built, so a
@@ -368,6 +388,7 @@ export interface SettingsAppliers {
   setQuotaGuardEnabled: (b: boolean) => void;
   setQuotaGuardStateDir: (dir: string) => void;
   setQuotaGuardCodexLimits: (limits: readonly CodexLimit[]) => void;
+  setQuotaGuardReserveUnits: (units: Record<string, number>) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
@@ -410,6 +431,23 @@ function sanitizeCodexLimits(value: unknown): CodexLimit[] | undefined {
     if (!Array.isArray(windows) || windows.length === 0) return undefined;
     if (!windows.every((w) => typeof w === "string" && VALID_CODEX_WINDOWS.has(w))) return undefined;
     out.push({ id, windows: windows as unknown as CodexLimit["windows"] });
+  }
+  return out;
+}
+
+/**
+ * Validate a persisted `quotaGuardReserveUnits`: every key a non-empty string, every value a finite
+ * number >= 0. All-or-nothing on purpose: one bad entry drops the whole seed, so a malformed value
+ * cannot leave the guard looking seeded while the windows it omitted stay unknown.
+ */
+function sanitizeReserveUnits(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return undefined;
+  const out: Record<string, number> = {};
+  for (const [id, units] of entries) {
+    if (id.length === 0 || typeof units !== "number" || !Number.isFinite(units) || units < 0) return undefined;
+    out[id] = units;
   }
   return out;
 }
@@ -523,6 +561,8 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   const codexLimits = sanitizeCodexLimits(r.quotaGuardCodexLimits);
   if (codexLimits) out.quotaGuardCodexLimits = codexLimits;
+  const reserveUnits = sanitizeReserveUnits(r.quotaGuardReserveUnits);
+  if (reserveUnits) out.quotaGuardReserveUnits = reserveUnits;
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -612,6 +652,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.quotaGuardEnabled === "boolean") appliers.setQuotaGuardEnabled(s.quotaGuardEnabled);
   if (typeof s.quotaGuardStateDir === "string") appliers.setQuotaGuardStateDir(s.quotaGuardStateDir);
   if (s.quotaGuardCodexLimits) appliers.setQuotaGuardCodexLimits(s.quotaGuardCodexLimits);
+  if (s.quotaGuardReserveUnits) appliers.setQuotaGuardReserveUnits(s.quotaGuardReserveUnits);
 }
 
 /**

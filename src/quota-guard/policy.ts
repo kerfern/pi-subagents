@@ -71,6 +71,40 @@ export function assess(
   return { state: 'open', reason: 'healthy' };
 }
 
+/**
+ * Strictly validate an operator-supplied reserve seed: every key a non-empty string, every value
+ * finite and >= 0. All-or-nothing on purpose - one bad entry drops the whole seed, so a malformed
+ * value cannot leave the guard looking seeded while the windows it omitted stay unknown.
+ *
+ * This is a defence in depth behind `sanitizeReserveUnits` in settings: the guard re-validates what
+ * it is handed rather than trusting its transport.
+ */
+export function validateReserveSeed(seed: ReadonlyMap<string, number> | undefined): ReadonlyMap<string, number> | undefined {
+  if (!seed || seed.size === 0) return undefined;
+  const out = new Map<string, number>();
+  for (const [id, units] of seed) {
+    if (typeof id !== 'string' || id.length === 0 || !Number.isFinite(units) || units < 0) return undefined;
+    out.set(id, units);
+  }
+  return out;
+}
+
+/**
+ * Fills ONLY the unknown reserves with the operator's seed: an observed value always wins, and a
+ * window that has an observation is never made to look unobserved. The seed is not a default and is
+ * never consulted where the estimator already produced a number, so it cannot blend with calibration.
+ */
+export function seedReserves(
+  observed: ReadonlyMap<string, number | null>,
+  seed: ReadonlyMap<string, number>,
+): ReadonlyMap<string, number | null> {
+  const out = new Map<string, number | null>(observed);
+  for (const id of observed.keys()) {
+    if (out.get(id) === null && seed.has(id)) out.set(id, seed.get(id) as number);
+  }
+  return out;
+}
+
 interface Sample {
   resetAt: string;
   cap: number;

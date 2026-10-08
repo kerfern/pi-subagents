@@ -54,6 +54,11 @@ export interface QuotaGuardHost {
   wake?: QuotaGuardWake;
   /** Verified Codex meter scope. Absent means a Codex attempt is refused, never misattributed. */
   codexLimits?: readonly CodexLimit[];
+  /**
+   * Operator-asserted per-window reserve units, filling only a reserve the estimator cannot compute.
+   * A host field wins over the settings-supplied `config`, the same way `stateDir` and `codexLimits` do.
+   */
+  reserveUnits?: ReadonlyMap<string, number>;
   /** Unwrapped transport for the quota reads themselves; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
   /** Fresh quota check a manual resume must pass; absent means resume is refused. */
@@ -153,17 +158,19 @@ let rootWake: RootWake | undefined;
 /** The one in-flight wake construction, so a second enabled call does not race a second store. */
 let rootWakeInit: Promise<void> | undefined;
 
-function resolveCoordinator(host: QuotaGuardHost): GatedCoordinator | undefined {
+function resolveCoordinator(host: QuotaGuardHost, config?: QuotaGuardConfig): GatedCoordinator | undefined {
   if (host.coordinator && typeof host.coordinator.gatedFetch === 'function') return host.coordinator;
+  const reserveUnits = host.reserveUnits ?? config?.reserveUnits;
   rootBinding ??= createQuotaGuardCoordinator({
     rootId: rootIdOf(host),
     ...(host.fetchImpl ? { fetchImpl: host.fetchImpl } : {}),
+    ...(reserveUnits ? { reserveUnits } : {}),
   });
   return rootBinding.coordinator;
 }
 
 function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
-  const coordinator = resolveCoordinator(host);
+  const coordinator = resolveCoordinator(host, config);
   if (!coordinator) return;
   // The hook path has no host-supplied handle, so lend it the root's own latch: state, active
   // counts and manual pause/resume all read from it. Without this the controls report 'unknown'.
@@ -338,6 +345,12 @@ export interface QuotaGuardConfig {
   stateDir?: string;
   /** Verified Codex meter scope. Absent means a Codex attempt is refused, never misattributed. */
   codexLimits?: readonly CodexLimit[];
+  /**
+   * Operator-asserted per-window reserve units (`quotaGuardReserveUnits`). Consulted ONLY where the
+   * estimator has no observation for a window; an observed reserve always wins. Absent keeps an
+   * unknown reserve unknown, which keeps the guard closed.
+   */
+  reserveUnits?: ReadonlyMap<string, number>;
 }
 
 /**

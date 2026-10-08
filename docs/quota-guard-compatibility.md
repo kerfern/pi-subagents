@@ -175,6 +175,16 @@ out of up to five, ignoring refills — a decrease, or a change of scope or rese
 and starts over. Until then, waiting and retrying is the intended path, not a stuck session; each
 retry gives the estimator another observation, and nothing is dispatched unguarded in the meantime.
 
+**On an idle account, retrying does not help — assert a reserve.** Every observation the estimator
+gets happens inside dispatch, and dispatch is what the pause blocks, so on a fresh install over an
+account that is not spending anything nothing ever moves and the reserve stays unknown forever. No
+amount of retrying, and no amount of waiting, will free it: the only thing that would is a *different*
+client spending quota in the same window. That is a deadlock, not the designed steady state, and the
+way out is `quotaGuardReserveUnits`. Set it to your best estimate of the units one dispatch burns in
+each window, and the guard opens on the first check. Get the window ids from
+`node quota-guard/certify-live.mjs --dry-run` — for CommandCode they are `monthly`, `fiveHour` and
+`weekly`; for Codex, `<meter-id>.primary_window` and `<meter-id>.secondary_window`.
+
 **Codex needs its meter scope supplied.** `quotaGuardCodexLimits` is the set of verified meter ids and windows
 for the account — which metered features are real, and that each is read from `primary_window` and
 `secondary_window`. The meter ids come from the account's own usage response, and the guard
@@ -206,7 +216,9 @@ The feature is called the **quota guard**. Two names matter:
   // Optional, and both are read once at extension load. The keys are the settings names, not the
   // guard's internal host-field names.
   "quotaGuardStateDir": "/absolute/path/to/quota-guard-state",
-  "quotaGuardCodexLimits": [{ "id": "codex", "windows": ["primary_window", "secondary_window"] }]
+  "quotaGuardCodexLimits": [{ "id": "codex", "windows": ["primary_window", "secondary_window"] }],
+  // Only needed on an idle account the estimator cannot calibrate; see First run.
+  "quotaGuardReserveUnits": { "monthly": 20, "fiveHour": 8, "weekly": 8 }
 }
 ```
 
@@ -221,14 +233,17 @@ Check it took effect:
 - `enabled, installed` → it is live and gating.
 - `enabled, not installed` → the switch is on but installation failed. The reason is on stderr at startup and from `quotaGuardInstallFailure()`. The usual cause is that pi was started through the bare `pi` binary rather than the harness entry point, so the runtime hook is absent.
 
-**The one remaining fail-open path, and how to close it.** Installation can fail *after* startup — the harness publishes the hook before the runtime prototype exists, so the decorator is applied asynchronously and can fail then (a host whose prototype lacks `stream`/`streamSimple`, or a refused double-install). The guard detects that failure, records it and calls `pause('identity')` — but a latch is only consulted *by* the decorator, and the decorator is exactly what failed to install. So in that state the guard cannot block anything, and no change inside the guard fixes it: it has no interception point. The enforcement belongs to the seam owner. Set `QUOTA_GUARD_REQUIRE_SEAM=1` and the harness refuses to continue when a decorator fails to install, exactly as it already refuses a missing dispatch method; without it the default is to report the failure on stderr and keep running with nothing gated. That default is a deliberate trade: refusing unconditionally would end every session whose guard cannot install, including benign cases such as a double-install during reload.
+**The one remaining fail-open path, and how to close it.** Installation can fail *after* startup — the harness publishes the hook before the runtime prototype exists, so the decorator is applied asynchronously and can fail then (a host whose prototype lacks `stream`/`streamSimple`, or a refused double-install). The guard detects that failure, records it and calls `pause('identity')` — but a latch is only consulted *by* the decorator, and the decorator is exactly what failed to install. So in that state the guard cannot block anything, and no change inside the guard fixes it: it has no interception point. The enforcement belongs to the seam owner. Set `QUOTA_GUARD_REQUIRE_SEAM=1` and the harness refuses to continue when a decorator fails to install, for every refusal path: a missing `ModelRuntime` prototype, a missing dispatch method, an already-decorated prototype, a decorator that throws, or one that returns no dispose function. Without the flag the default is to report the failure on stderr and keep running — which means genuinely ungated only in the cases where the runtime is left undecorated.
+
+Two consequences worth knowing before you set it. First, without the flag an install failure leaves pi running with nothing gated, so the flag is the only way to make that condition stop the session. Second, **with** the flag a redundant double-install also refuses to continue: the runtime is already decorated and gating, so that refusal is unnecessary, but the harness cannot distinguish "someone else is gating" from "nothing is gating". A reload that installs the guard twice will therefore end a strict-mode session; that is the accepted cost of the flag.
 - `disabled` → your settings file is not being read from where you put it.
 
 **Deactivate.** Delete the line or set it to `false`, and restart pi. With it off the package is inert: no coordinator is constructed, no hook is looked up, no runtime is decorated, nothing is written. There is no half-on state.
 
-**Two optional keys, and what happens without them:**
+**Three optional keys, and what happens without them:**
 
 - `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, checkpoints and backoff survive a restart and `status.wake` is real. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
+- `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number `>= 0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
 
 **Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` re-reads quota for the last scope the guard saw with the same reader and estimator it gates with, so a paused guard can calibrate and reopen; `/quota-guard enable` re-asserts the switch in-session. The check runs *outside* dispatch, which is what breaks the old deadlock where the only observation happened inside `admit` and `admit` itself blocked on the pause. It reopens only on a verified, in-policy read for every window the guard has seen; an unreadable read, an uncalibrated reserve, or no retained scope keeps it closed. Because only observed scopes can be re-checked, a resume before any attempt has reached `admit` is refused.

@@ -213,18 +213,31 @@ export function installQuotaGuard(options: {
         // Passthrough forwards the model the provider will actually read, so the decision must be
         // made on that object. A getter that reads unguarded while we route and guarded later would
         // otherwise take a path the check never approved - the same flip the guarded branch pins
-        // against. Only a plain object can be pinned; anything else must be refused, because
-        // descriptor inspection cannot be trusted - reading a Proxy's descriptor runs its traps, so
-        // a Proxy can report a plain data property while its `get` trap answers unguarded now and
-        // guarded on the SDK's later dispatch.
-        const prototype = model !== null && typeof model === 'object'
-          ? Object.getPrototypeOf(model) : undefined;
-        const plain = prototype === Object.prototype || prototype === null;
-        if (!plain) {
+        // against. A plain object is pinned by spreading; anything else (a class instance, or a Proxy
+        // whose descriptor reads cannot be trusted) is pinned with our own wrapper that answers the
+        // pinned `provider`/`api` and delegates every other key to the original. Dispatch reads the
+        // model through `get`, so the pinned values are what it sees - a lying `get` trap on the
+        // target cannot influence the route. Only a non-object - which cannot be wrapped at all - is
+        // still refused.
+        const isObject = model !== null && typeof model === 'object';
+        if (!isObject) {
           return pauseAndThrow(coordinator,
             'Quota guard: model is not a plain object; refusing to dispatch');
         }
-        const forwarded: GuardModel = { ...model, api, provider: model.provider };
+        const prototype = Object.getPrototypeOf(model);
+        const plain = prototype === Object.prototype || prototype === null;
+        // Read the pinned value once, before wrapping, so a later `get` cannot re-litigate it.
+        const pinnedProvider = model.provider;
+        const forwarded: GuardModel = plain
+          ? { ...model, api, provider: pinnedProvider }
+          : new Proxy(model as object, {
+              get(target, key, receiver): unknown {
+                if (key === 'provider') return pinnedProvider;
+                if (key === 'api') return api;
+                // Reflect with the receiver so prototype members and accessors keep working.
+                return Reflect.get(target, key, receiver);
+              },
+            }) as GuardModel;
         if (guardedProvider(forwarded)) {
           return pauseAndThrow(coordinator,
             'Quota guard: model provider changed after the guard check; refusing to dispatch');

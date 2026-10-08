@@ -22,6 +22,7 @@ import {
   quotaGuardRootBinding,
   resetQuotaGuardStateForTest,
   setQuotaGuardEnabled,
+  type QuotaGuardConfig,
   type QuotaGuardHost,
 } from '../../src/quota-guard/index.ts';
 import { assess, DEFAULT_POLICY } from '../../src/quota-guard/policy.ts';
@@ -88,10 +89,10 @@ function commandcodeFetch(level: { monthly: number; rolling: number }): typeof f
 }
 
 /** Enabled guard over a hook, with the given transport, so the real production wiring is exercised. */
-async function enabledHost(fetchImpl: typeof fetch, extra: Partial<QuotaGuardHost> = {}): Promise<QuotaGuardHost> {
+async function enabledHost(fetchImpl: typeof fetch, extra: Partial<QuotaGuardHost> = {}, config?: QuotaGuardConfig): Promise<QuotaGuardHost> {
   const host: QuotaGuardHost = { rootId: ROOT_ID, fetchImpl, hookSource: hookSource(fakeRuntime().prototype), ...extra };
   setQuotaGuardEnabled(true);
-  quotaGuardExtension(host);
+  quotaGuardExtension(host, config);
   await flush();
   return host;
 }
@@ -126,7 +127,13 @@ beforeEach(async () => {
   setQuotaGuardEnabled(false);
   output = [];
   // console only: the node:test reporter owns process.stdout (it uses it as its IPC channel).
-  const capture = (...args: unknown[]) => { output.push(args.map(String).join(' ')); };
+  // Serialise rather than stringify: `String({ scope })` is '[object Object]', so a credential
+  // carried as a structured log argument would slip past the sentinel check below.
+  const serialise = (value: unknown): string => {
+    if (typeof value === 'string') return value;
+    try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
+  };
+  const capture = (...args: unknown[]) => { output.push(args.map(serialise).join(' ')); };
   const originalError = console.error;
   const originalLog = console.log;
   console.error = capture as typeof console.error;
@@ -549,4 +556,90 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
     () => (bare.runtime?.stream as (this: unknown, ...args: unknown[]) => unknown).call(receiver, model, undefined, {}),
     /no verified Codex meter scope configured/,
   );
+});
+
+/**
+ * Reserve seeding. A fresh install over an idle account never moves a `used` counter, so the
+ * estimator can never compute `2 * max(delta)` and `assess` returns `wait/unknown-reserve` forever -
+ * the guard deadlocks on a window only a *different* client could move. An operator asserts a seed
+ * for exactly that case; it fills only the unknown and never overrides an observation.
+ */
+test('reserve seed: a valid operator seed opens a lane whose counters never move', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  // Headroom is 69/99/99 against caps 70/100/100; a seed below the headroom opens, and the pause
+  // threshold (10%) passes, so nothing but the seed is deciding this.
+  const reserveUnits = new Map([['monthly', 60], ['fiveHour', 60], ['weekly', 60]]);
+  const host = await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  const release = await binding.coordinator.admit(commandcodeAttempt());
+  release();
+  assert.equal(binding.fleet.snapshot().state, 'open', 'the seed must let a flat lane open');
+});
+
+test('reserve seed: no seed leaves a flat lane unknown, so the guard stays closed', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  await enabledHost(commandcodeFetch(level));
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+});
+
+test('reserve seed: an observed reserve wins over the seed', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  // The seed over-protects monthly (headroom 69 <= seeded 100), so the guard stays closed on it.
+  const reserveUnits = new Map([['monthly', 100], ['fiveHour', 1], ['weekly', 1]]);
+  await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+
+  // A real movement (delta 10) yields an observed monthly reserve of 20, below the 69 headroom. If
+  // the seed still won, 69 <= 100 would keep it closed.
+  level.monthly = 11;
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), true, 'the observed reserve must replace the seed');
+  assert.equal(binding.fleet.snapshot().state, 'open');
+});
+
+test('reserve seed: a malformed seed is dropped whole, so the guard stays closed', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  // One bad entry must drop the whole seed: a half-applied seed would look configured while the
+  // windows it omitted stay unknown.
+  const reserveUnits = new Map([['monthly', 60], ['fiveHour', -1], ['weekly', 60]]);
+  await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+
+  const windows: QuotaWindow[] = [{ id: 'monthly', used: 1, cap: 70, resetAt: iso(Date.now() + 3_600_000) }];
+  const observed = binding.estimator.observe('commandcode:provider', windows);
+  assert.equal(observed.get('monthly'), null, 'a dropped seed must not register as an observation');
+});
+
+test('reserve seed: the seed value is never logged or written to the durable store', async () => {
+  const dir = await tmpDir();
+  const level = { monthly: 1, rolling: 1 };
+  const marker = 98765.4321;
+  const reserveUnits = new Map([['monthly', marker], ['fiveHour', 60], ['weekly', 60]]);
+  const host = await enabledHost(commandcodeFetch(level), { stateDir: dir }, { reserveUnits });
+  await settle(() => host.wake !== undefined && quotaGuardControls()?.status().wake !== null);
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+
+  const raw = await durableText(dir);
+  assert.equal(raw.includes(String(marker)), false, 'the seed must not be written to the durable store');
+  assert.equal(output.join('\n').includes(String(marker)), false, 'the seed must not be logged');
 });

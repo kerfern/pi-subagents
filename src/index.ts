@@ -1252,13 +1252,16 @@ export default function (pi: ExtensionAPI) {
     workflowsPinned = true;
   }
 
-  // The guard's two remaining inputs. `quotaGuardExtension` reads them off the host object, which
-  // the pi API object is not, so they are held here and handed over as its second argument at the
-  // entry call site. Read once at extension init, like `quotaGuardEnabled`, and inert while it is off.
+  // The guard's remaining settings inputs. `quotaGuardExtension` reads them off the host object,
+  // which the pi API object is not, so they are held here and handed over as its second argument at
+  // the entry call site. Read once at extension init, like `quotaGuardEnabled`, and inert while off.
   let quotaGuardStateDir: string | undefined;
   let quotaGuardCodexLimits: CodexLimit[] | undefined;
+  // Keep the persisted record shape here; the guard takes a Map. Read once at init, like the others.
+  let quotaGuardReserveUnits: Record<string, number> | undefined;
   function setQuotaGuardStateDir(dir: string) { quotaGuardStateDir = dir; }
   function setQuotaGuardCodexLimits(limits: readonly CodexLimit[]) { quotaGuardCodexLimits = [...limits]; }
+  function setQuotaGuardReserveUnits(units: Record<string, number>) { quotaGuardReserveUnits = { ...units }; }
 
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
@@ -1485,6 +1488,7 @@ export default function (pi: ExtensionAPI) {
       setQuotaGuardEnabled,
       setQuotaGuardStateDir,
       setQuotaGuardCodexLimits,
+      setQuotaGuardReserveUnits,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
@@ -3645,6 +3649,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // them, so an unset value round-trips as unset rather than being materialized.
       quotaGuardStateDir,
       quotaGuardCodexLimits,
+      quotaGuardReserveUnits,
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
@@ -4416,6 +4421,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   quotaGuardExtension(pi, {
     ...(quotaGuardStateDir !== undefined ? { stateDir: quotaGuardStateDir } : {}),
     ...(quotaGuardCodexLimits !== undefined ? { codexLimits: quotaGuardCodexLimits } : {}),
+    ...(quotaGuardReserveUnits !== undefined ? { reserveUnits: new Map(Object.entries(quotaGuardReserveUnits)) } : {}),
   });
 
   /**

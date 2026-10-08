@@ -280,6 +280,33 @@ describe("settings persistence", () => {
     }
   });
 
+  it("round-trips quotaGuardReserveUnits; a malformed entry drops the whole value", () => {
+    // The per-window reserve seed: the guard cannot size a reserve on an idle account, so an
+    // operator asserts one here. Values are window units, so fractional and zero are both valid.
+    const units = { monthly: 12, fiveHour: 3.5, weekly: 0 };
+    saveSettings({ quotaGuardReserveUnits: units }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardReserveUnits: units });
+
+    // Fail closed: one bad entry drops the whole seed rather than half-configuring the guard, so a
+    // window the seed omitted cannot silently stay unknown while the operator believes it is seeded.
+    for (const bad of [
+      { monthly: -1 },
+      { monthly: 1, fiveHour: "5" },
+      { monthly: null },
+      { monthly: 1, "": 5 },
+      {},
+      [],
+      "monthly",
+    ]) {
+      writeProject({ quotaGuardReserveUnits: bad } as any);
+      expect(loadSettings(projectDir)).toEqual({});
+    }
+
+    // Absence stays absent so the caller's "use default" (unknown stays closed) is preserved.
+    saveSettings({}, projectDir);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
     writeProject({ schedulingEnabled: "yes" } as any);
     expect(loadSettings(projectDir)).toEqual({});
@@ -607,6 +634,7 @@ describe("settings persistence", () => {
         setQuotaGuardEnabled: vi.fn(),
         setQuotaGuardStateDir: vi.fn(),
         setQuotaGuardCodexLimits: vi.fn(),
+        setQuotaGuardReserveUnits: vi.fn(),
       };
     });
 
@@ -655,15 +683,18 @@ describe("settings persistence", () => {
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
     });
 
-    it("applies quotaGuardStateDir and quotaGuardCodexLimits; skips them when absent", () => {
+    it("applies quotaGuardStateDir, quotaGuardCodexLimits and quotaGuardReserveUnits; skips them when absent", () => {
       const limits = [{ id: "codex", windows: ["primary_window"] }];
-      applySettings({ quotaGuardStateDir: "/var/tmp/state", quotaGuardCodexLimits: limits }, appliers);
+      const reserveUnits = { monthly: 12, fiveHour: 3.5 };
+      applySettings({ quotaGuardStateDir: "/var/tmp/state", quotaGuardCodexLimits: limits, quotaGuardReserveUnits: reserveUnits }, appliers);
       expect(appliers.setQuotaGuardStateDir).toHaveBeenCalledWith("/var/tmp/state");
       expect(appliers.setQuotaGuardCodexLimits).toHaveBeenCalledWith(limits);
+      expect(appliers.setQuotaGuardReserveUnits).toHaveBeenCalledWith(reserveUnits);
 
       applySettings({}, appliers);
       expect(appliers.setQuotaGuardStateDir).toHaveBeenCalledTimes(1);
       expect(appliers.setQuotaGuardCodexLimits).toHaveBeenCalledTimes(1); // absence is "use default"
+      expect(appliers.setQuotaGuardReserveUnits).toHaveBeenCalledTimes(1); // absence is "unknown stays closed"
     });
 
     it("applies fallbackSubagent through to the registry", () => {
@@ -872,6 +903,7 @@ describe("settings persistence", () => {
         setQuotaGuardEnabled: vi.fn(),
         setQuotaGuardStateDir: vi.fn(),
         setQuotaGuardCodexLimits: vi.fn(),
+        setQuotaGuardReserveUnits: vi.fn(),
       };
     });
 

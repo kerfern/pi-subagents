@@ -75,41 +75,49 @@ test('a plain unguarded model with a stable provider reaches the original exactl
   } finally { dispose(); }
 });
 
-// Deliberate contract change: models must be plain data objects. A class instance is no longer
-// forwarded as-is, because the object the guard inspects would be the object the provider re-reads.
-test('a non-plain model with data provider/api is refused instead of forwarded untouched', () => {
+// The SDK preserves caller-supplied model objects and copies them itself, so a class-backed model
+// is a legitimate caller. Rather than refuse it, the guard forwards its own wrapper that pins
+// provider/api and delegates every other key, so the pinned values are what the provider reads.
+test('a class-backed model with own data provider/api is pinned and dispatched', () => {
   const { runtime, seen } = makeRuntime();
-  const { coordinator, pauses } = stubCoordinator();
+  const { coordinator, pauses, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator });
   class RealModel { id = 'm'; api = 'anthropic-messages'; provider = 'anthropic'; }
   try {
-    assert.throws(() => runtime.stream(new RealModel(), 'ctx', {}), /not a plain object/);
-    assert.deepEqual(pauses, ['identity']);
-    assert.equal(seen.length, 0, 'the provider must never receive an unpinnable model');
+    assert.equal(runtime.stream(new RealModel(), 'ctx', {}), 'stream-result');
+    const forwarded = seen[0].args[0] as Record<string, unknown>;
+    assert.equal(forwarded.provider, 'anthropic');
+    assert.equal(forwarded.api, 'anthropic-messages');
+    assert.equal(forwarded.id, 'm', 'other own fields are still delegated');
+    assert.deepEqual(pauses, []);
+    assert.equal(gates.length, 0);
   } finally { dispose(); }
 });
 
-test('a non-plain model with a provider accessor is refused instead of forwarded unpinned', () => {
+test('a class-backed model with a prototype provider delegates the read then pins it', () => {
   const { runtime, seen } = makeRuntime();
-  const { coordinator, pauses } = stubCoordinator();
+  const { coordinator, pauses, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator });
   class GetterModel { id = 'm'; api = 'anthropic-messages'; get provider(): string { return 'anthropic'; } }
   try {
-    assert.throws(() => runtime.stream(new GetterModel(), 'ctx', {}), /not a plain object/);
-    assert.deepEqual(pauses, ['identity']);
-    assert.equal(seen.length, 0);
+    assert.equal(runtime.stream(new GetterModel(), 'ctx', {}), 'stream-result');
+    const forwarded = seen[0].args[0] as Record<string, unknown>;
+    assert.equal(forwarded.provider, 'anthropic', 'the pinned provider is what the wrapper answers');
+    assert.equal(forwarded.id, 'm', 'prototype members still resolve through the wrapper');
+    assert.deepEqual(pauses, []);
+    assert.equal(gates.length, 0);
   } finally { dispose(); }
 });
 
-test('a Proxy that lies about its descriptors and flips provider is refused, not forwarded', () => {
+test('a Proxy whose live provider flips to a guarded value cannot route past the pin', () => {
   const { runtime, seen } = makeRuntime();
-  const { coordinator, pauses } = stubCoordinator();
+  const { coordinator, pauses, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator });
   class RealModel { id = 'm'; api = 'anthropic-messages'; provider = 'anthropic'; }
   let reads = 0;
-  // Descriptor inspection reports a plain data property, so an accessor test passes; the get trap
-  // answers unguarded while the guard routes and `commandcode` once the SDK dispatches. No
-  // descriptor read can expose this - the object must simply not be forwarded.
+  // The get trap answers unguarded while the guard routes and `commandcode` on later reads - the
+  // exact flip the plain-object pin defends against. The pin must win, so the SDK only ever sees
+  // `anthropic` and the request never reaches a guarded provider.
   const model = new Proxy(new RealModel(), {
     get(target, key, receiver): unknown {
       if (key === 'provider') { reads++; return reads <= 2 ? 'anthropic' : 'commandcode'; }
@@ -120,8 +128,10 @@ test('a Proxy that lies about its descriptors and flips provider is refused, not
     },
   });
   try {
-    assert.throws(() => runtime.stream(model, 'ctx', {}), /not a plain object/);
-    assert.deepEqual(pauses, ['identity']);
-    assert.equal(seen.length, 0, 'the live proxy must never reach the provider');
+    assert.equal(runtime.stream(model, 'ctx', {}), 'stream-result');
+    const forwarded = seen[0].args[0] as Record<string, unknown>;
+    assert.equal(forwarded.provider, 'anthropic', 'the pinned provider wins over the live proxy');
+    assert.deepEqual(pauses, []);
+    assert.equal(gates.length, 0, 'the request must not reach a guarded provider');
   } finally { dispose(); }
 });
