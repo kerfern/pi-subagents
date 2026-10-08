@@ -63,7 +63,8 @@ function of a host descriptor — it makes no request and reads no credentials.
 
 - The host check proves what can be observed **offline**, with synthetic credentials and fake
   transports. It does not certify a real end-to-end request against a live provider, and it cannot
-  certify providers or request paths that do not exist yet.
+  certify providers or request paths that do not exist yet. The one deliberate exception is the
+  operator-run live certification described below.
 - Version metadata identifies which build the evidence came from. It is not proof of anything: a
   build claiming a familiar version but missing a seam is still refused, and a test pins exactly that.
 - `fetch` does not cover WebSockets. Codex is forced onto SSE for this reason; an unsupported
@@ -76,6 +77,58 @@ function of a host descriptor — it makes no request and reads no credentials.
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
+
+## Certifying against live quotas (operator-authorised)
+
+Everything above is offline: synthetic credentials, fake transports, no request leaving the machine.
+`quota-guard/certify-live.mjs` is the one deliberate exception, and it exists because the adapters had
+only ever been exercised against fixtures. It is the only thing in this package that talks to a
+provider, and it is a separate command the operator runs on purpose rather than anything the guard
+does for itself.
+
+What it does, in full: it reads the credential from the environment of the shell that runs it, calls
+the same `readQuota` the guard calls, and prints the normalised result — provider, scope, each
+window's `id`/`used`/`cap`/`resetAt`, the reserve state, the thresholds it was assessed against, and
+how many requests it made.
+
+- **Read-only.** One bearer-authenticated `GET` per endpoint, to the pinned first-party origins only:
+  `https://api.commandcode.ai/alpha/billing/credits` and `/alpha/billing/subscriptions` for
+  CommandCode, `https://chatgpt.com/backend-api/wham/usage` for Codex. Nothing is written, purchased
+  or sent anywhere else, and a redirect is refused rather than followed.
+- **No secrets on stdout.** Never the credential, an `Authorization` header, or a raw response body —
+  only normalised numbers and window ids. It reads only the variables you export: never `auth.json`,
+  `settings.json`, the keychain, or anything under `~/.pi`.
+- **Never automatic.** Not by the guard, not by the test suite — `quota-guard/test/certify-live.test.ts`
+  injects a fake transport and asserts that nothing is sent — not by CI, and not by `prepublishOnly`.
+- **Refuses rather than guesses.** No provider, an unknown provider, or a missing credential is a
+  refusal that names the variable, never a fallback, and a malformed meter scope is refused before any
+  request, so a typo cannot spend one.
+
+Run it from the repository root, with the credential exported in that shell only:
+
+```bash
+node quota-guard/certify-live.mjs --dry-run commandcode   # validate only: prints origins/paths, sends nothing
+node quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
+node quota-guard/certify-live.mjs codex
+```
+
+| Provider | Environment required |
+| --- | --- |
+| `commandcode` | `COMMANDCODE_API_KEY` |
+| `codex` | `CODEX_ACCESS_TOKEN`, `CODEX_ACCOUNT_ID` (the `chatgpt-account-id` header), `CODEX_LIMITS` (the verified meter scope, as JSON) |
+
+`CODEX_LIMITS` is required for the reason given under [First run](#first-run--what-to-expect): the
+meter ids come from the account's own usage response and the guard does not guess them, so a
+certification that supplied none could not attribute a read to a window.
+
+`--dry-run` prints that plan and exits non-zero when a variable is missing, so it doubles as a
+readiness check. The live run exits non-zero on any refusal, which is what makes it usable as a check
+rather than an observation. Exit codes: `0` certified, `1` refused or failed, `2` usage.
+
+| Outcome | What it means | What to do |
+| --- | --- | --- |
+| The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows and caps as real: the reserve estimator and the thresholds become meaningful against them. Certify again after a provider or host upgrade. |
+| A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. Report the code and the provider, never the credential. |
 
 ## Enabling the guard
 
