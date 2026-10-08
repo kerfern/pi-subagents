@@ -34,8 +34,12 @@ export interface HostDescriptor {
   hasStream: boolean;
   hasStreamSimple: boolean;
   hasGetAuth: boolean;
-  /** Every api id the loaded catalog knows about. */
-  apiIds: readonly string[];
+  /**
+   * Every api id the loaded catalog knows about. Omitted when the caller cannot see the catalogue
+   * (an extension reaching the runtime through the harness hook cannot enumerate it); the check then
+   * reports that contract as unverified rather than pretending it passed.
+   */
+  apiIds?: readonly string[];
   /** Optional per-provider api list, when the runtime exposes one. */
   providerApis?: ReadonlyMap<string, readonly string[]>;
   /** Identity of the build this descriptor was read from; reported, never trusted as proof. */
@@ -46,6 +50,8 @@ export interface CompatibilityVerdict {
   ok: boolean;
   /** One actionable line per failed check; empty when `ok`. */
   failures: readonly string[];
+  /** Contracts this descriptor could not speak to at all. Not failures, but not proof either. */
+  unverified: readonly string[];
   /** Best-effort identity of the checked build, for the operator-visible message. */
   hostIdentity: string;
 }
@@ -65,14 +71,24 @@ function identityOf(host: HostDescriptor): string {
 export function checkHostCompatibility(host: HostDescriptor): CompatibilityVerdict {
   const failures: string[] = [];
   const where = identityOf(host);
+  const unverified: string[] = [];
 
   if (!host.hasStream) failures.push(`${where}: runtime does not expose a public stream()`);
   if (!host.hasStreamSimple) failures.push(`${where}: runtime does not expose a public streamSimple()`);
-  if (!host.hasGetAuth) failures.push(`${where}: runtime does not expose a public getAuth(model)`);
+  if (!host.hasGetAuth) {
+    // Not a failure: the guard resolves identity from the dispatching instance, and an instance may
+    // carry getAuth without the prototype advertising it. A host that truly lacks it still fails
+    // closed at first dispatch (identity pause) rather than dispatching unguarded.
+    unverified.push(`${where}: getAuth was not visible on the decorated runtime`);
+  }
 
-  const present = new Set(host.apiIds);
-  for (const api of REQUIRED_APIS) {
-    if (!present.has(api)) failures.push(`${where}: required api "${api}" is missing from the catalog`);
+  if (host.apiIds === undefined) {
+    unverified.push(`${where}: api ids were not supplied, so the api-id contract is unverified`);
+  } else {
+    const present = new Set(host.apiIds);
+    for (const api of REQUIRED_APIS) {
+      if (!present.has(api)) failures.push(`${where}: required api "${api}" is missing from the catalog`);
+    }
   }
 
   if (host.providerApis) {
@@ -93,6 +109,7 @@ export function checkHostCompatibility(host: HostDescriptor): CompatibilityVerdi
   return Object.freeze({
     ok: failures.length === 0,
     failures: Object.freeze(failures),
+    unverified: Object.freeze(unverified),
     hostIdentity: where,
   });
 }

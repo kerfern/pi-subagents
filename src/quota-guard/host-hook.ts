@@ -1,4 +1,5 @@
 import type { CodexLimit } from './adapters.ts';
+import { checkHostCompatibility, compatibilityRefusal } from './compatibility.ts';
 import type { Release } from './controller.ts';
 import type { GatedCoordinator } from './root.ts';
 import { type GuardRuntime, installQuotaGuard } from './root.ts';
@@ -33,6 +34,8 @@ export interface HookInstallOptions {
   codexLimits?: readonly CodexLimit[];
   fetchImpl?: typeof fetch;
   source?: object;
+  /** Catalogue api ids when the caller can see them; omitted means that contract is unverified. */
+  apiIds?: readonly string[];
 }
 
 /**
@@ -52,13 +55,26 @@ export async function installGuardedRuntimeViaHook(options: HookInstallOptions):
       + 'pi-harness entry point (runtime/jev-host.mjs), or update it if it predates the hook.',
     );
   }
-  return hook.install(async ({ prototype }) => installQuotaGuard({
-    runtime: prototype as unknown as GuardRuntime,
-    rootId: options.rootId,
-    coordinator: options.coordinator,
-    ...(options.codexLimits ? { codexLimits: options.codexLimits } : {}),
-    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
-  }));
+  return hook.install(async ({ prototype, host: hostInfo }) => {
+    // Gate activation on what can actually be seen. A missing seam must stop an enabled guard here,
+    // not surface later as traffic that is quietly not being gated.
+    const shape = prototype as { stream?: unknown; streamSimple?: unknown; getAuth?: unknown };
+    const verdict = checkHostCompatibility({
+      hasStream: typeof shape.stream === 'function',
+      hasStreamSimple: typeof shape.streamSimple === 'function',
+      hasGetAuth: typeof shape.getAuth === 'function',
+      ...(options.apiIds ? { apiIds: options.apiIds } : {}),
+      hostPackage: { name: hostInfo.name, version: hostInfo.version },
+    });
+    if (!verdict.ok) throw new Error(compatibilityRefusal(verdict));
+    return installQuotaGuard({
+      runtime: prototype as unknown as GuardRuntime,
+      rootId: options.rootId,
+      coordinator: options.coordinator,
+      ...(options.codexLimits ? { codexLimits: options.codexLimits } : {}),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    });
+  });
 }
 
 /** Kept so the provider list stays explicit at the call site rather than implicit here. */

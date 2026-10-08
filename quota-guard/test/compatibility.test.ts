@@ -39,17 +39,18 @@ test('a missing public streamSimple() fails closed on its own line', () => {
   assert.match(verdict.failures[0], /streamSimple\(\)/);
 });
 
-test('a missing public getAuth() fails closed on its own line', () => {
+test('a missing public getAuth() is reported as unverified, not as a passed check', () => {
   const verdict = checkHostCompatibility(compatible({ hasGetAuth: false }));
-  assert.equal(verdict.ok, false);
-  assert.equal(verdict.failures.length, 1);
-  assert.match(verdict.failures[0], /getAuth/);
+  assert.equal(verdict.ok, true, 'identity resolves from the instance, so this alone does not fail');
+  assert.equal(verdict.failures.length, 0);
+  assert.equal(verdict.unverified.length, 1);
+  assert.match(verdict.unverified[0], /getAuth/);
 });
 
 test('a familiar version string is not proof: a lost seam still fails', () => {
   // The point of the boundary: a build claiming the version we tested against, but missing a seam,
   // must be refused rather than trusted.
-  const verdict = checkHostCompatibility(compatible({ hasGetAuth: false }));
+  const verdict = checkHostCompatibility(compatible({ hasStream: false }));
   assert.equal(verdict.ok, false);
   assert.match(verdict.hostIdentity, /1\.1\.0$/);
   assert.equal(verdict.failures.length, 1);
@@ -94,7 +95,7 @@ test('an unknown host identity is reported without crashing', () => {
 test('every failure is collected, not just the first', () => {
   const verdict = checkHostCompatibility(compatible({ hasStream: false, hasGetAuth: false, apiIds: [] }));
   assert.equal(verdict.ok, false);
-  assert.equal(verdict.failures.length, 5); // stream, getAuth, and the three required apis
+  assert.equal(verdict.failures.length, 4); // stream and the three required apis (getAuth is unverified)
 });
 
 test('the refusal message names the build, every failure, and the repair path', () => {
