@@ -39,6 +39,14 @@ export interface WorkflowTask {
   workflowName?: string;
   /** The `tool_use_id` of the call that started this, when one did. */
   toolCallId?: string;
+  /**
+   * The session that started this run.
+   *
+   * The map holding tasks is per activation and survives a session switch, so
+   * a run id is not by itself proof of ownership: `stop_workflow` compares this
+   * against the calling session and refuses a run started elsewhere.
+   */
+  sessionId?: string;
 
   /**
    * Pause, skip and retry, once the run is up.
@@ -95,6 +103,7 @@ export function createWorkflowTask(init: {
   args?: unknown;
   meta?: WorkflowMeta;
   toolCallId?: string;
+  sessionId?: string;
   startTime?: number;
   journalPath?: string;
   replay?: readonly WorkflowJournalEntry[];
@@ -110,6 +119,7 @@ export function createWorkflowTask(init: {
     meta: init.meta,
     workflowName: init.meta?.name,
     toolCallId: init.toolCallId,
+    sessionId: init.sessionId,
     journalPath: init.journalPath,
     replay: init.replay,
     resumedFrom: init.resumedFrom,

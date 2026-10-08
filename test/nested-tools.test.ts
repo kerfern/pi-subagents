@@ -81,6 +81,12 @@ beforeEach(() => {
     awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
     resume: vi.fn(),
+    abort: vi.fn((id: string) => {
+      const record = records.get(id);
+      if (!record || record.status !== "running") return false;
+      record.status = "stopped";
+      return true;
+    }),
   } as any;
 });
 
@@ -300,6 +306,28 @@ describe("child-safe nested Agent tools", () => {
       prompt: "Continue",
     })).isError).toBe(true);
     expect(manager.resume).not.toHaveBeenCalled();
+  });
+
+  it("stops an owned child, and refuses a child it does not own", async () => {
+    const [agent, , , stop] = tools(["scout"]);
+    await execute(agent, {
+      subagent_type: "scout",
+      description: "find files",
+      prompt: "Find them",
+      run_in_background: true,
+    });
+
+    records.set("foreign", { id: "foreign", status: "running", parentAgentId: "other" });
+    // A settled child is still owned, but there is nothing left to abort.
+    records.set("done", { id: "done", status: "completed", parentAgentId: "parent-1" });
+
+    expect((await execute(stop, { agent_id: "foreign" })).isError).toBe(true);
+    expect((await execute(stop, { agent_id: "done" })).isError).toBe(false);
+    expect(records.get("done").status).toBe("completed");
+
+    const result = await execute(stop, { agent_id: "child-1" });
+    expect(result.isError).toBe(false);
+    expect(records.get("child-1").status).toBe("stopped");
   });
 
   it("reports a background child that fails to start as a tool error", async () => {

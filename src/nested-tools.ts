@@ -47,7 +47,7 @@ let maxSubagentDepth = 2;
 export function getMaxSubagentDepth(): number { return maxSubagentDepth; }
 export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.max(0, Math.floor(n)); }
 
-const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
+const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent", "stop_subagent"] as const;
 
 interface NestedSpawnOptions {
   description: string;
@@ -93,6 +93,8 @@ export interface NestedAgentManager {
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
   resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  /** Stop an owned child; false when it is neither queued nor running. */
+  abort(id: string): boolean;
 }
 
 export interface NestedToolContext {
@@ -425,5 +427,27 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     },
   });
 
-  return [agentTool, resultTool, steerTool];
+  const stopTool = defineTool({
+    name: NESTED_TOOL_NAMES[3],
+    label: "Stop Nested Agent",
+    description: "Stop a running nested agent owned by this parent.",
+    parameters: Type.Object({
+      agent_id: Type.String(),
+    }),
+    execute: async (_toolCallId, params) => {
+      const record = context.manager.getRecord(params.agent_id);
+      // Ownership, not existence: a child of another parent (or a top-level
+      // agent this child cannot even name) must read exactly like a missing id,
+      // so a stop can never become a way to probe the wider manager for ids.
+      if (!ownsRecord(record, context.parentAgentId)) {
+        return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
+      }
+      if (!context.manager.abort(record.id)) {
+        return textResult(`Nested agent "${params.agent_id}" is not running (status: ${record.status}).`);
+      }
+      return textResult(`Stopped nested agent ${record.id}.`);
+    },
+  });
+
+  return [agentTool, resultTool, steerTool, stopTool];
 }

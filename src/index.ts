@@ -2617,6 +2617,7 @@ Terse command-style prompts produce shallow, generic work.
         args: params.args,
         meta,
         toolCallId,
+        sessionId: ctx.sessionManager.getSessionId(),
         ...(journalPath !== undefined ? { journalPath } : {}),
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
@@ -2653,6 +2654,43 @@ Terse command-style prompts produce shallow, generic work.
   });
 
   if (isWorkflowsEnabled()) pi.registerTool(workflowTool);
+
+  /**
+   * `stop_workflow` — the model-callable half of the dialog's Kill key.
+   *
+   * A run outlives the tool call that started it, so leaving the abort reachable
+   * only from the dialog means a model cannot stop a run it launched by mistake.
+   * Ownership is by SESSION, not by knowing an id: `workflowTasks` lives across
+   * a session switch, so a run id from another session is refused even though it
+   * is a real one. Aborting the run's controller is the whole mechanism — the
+   * signal it carries reaches the worker and every child the run spawned.
+   */
+  const stopWorkflowTool = defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP_WORKFLOW,
+    label: "Stop Workflow",
+    description:
+      "Stop a running SubagentWorkflow run started in this session. Its agents are aborted with it.",
+    promptSnippet: "Stop a running SubagentWorkflow run",
+    parameters: Type.Object({
+      run_id: Type.String({
+        description: "The task id returned by SubagentWorkflow, e.g. `wf_...`.",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const task = workflowTasks.get(params.run_id);
+      if (!task || task.sessionId !== ctx.sessionManager.getSessionId()) {
+        return textResult(
+          `Workflow not found: "${params.run_id}". It may have finished, or it belongs to another session.`,
+        );
+      }
+      if (task.abortController.signal.aborted) {
+        return textResult(`Workflow "${params.run_id}" is already stopping.`);
+      }
+      task.abortController.abort();
+      return textResult(`Stopping workflow ${params.run_id}. Its running agents are aborted with it.`);
+    },
+  });
+  if (isWorkflowsEnabled()) pi.registerTool(stopWorkflowTool);
 
   /**
    * Act on {@link decideWorkflowCollision} — the half that needs the host.
@@ -2711,7 +2749,14 @@ Terse command-style prompts produce shallow, generic work.
       if (!verdict.withdraw) return;
       const active = pi.getActiveTools();
       if (active.includes(SUBAGENT_TOOL_NAMES.WORKFLOW)) {
-        pi.setActiveTools(active.filter(name => name !== SUBAGENT_TOOL_NAMES.WORKFLOW));
+        // Withdraw the stop tool too: it names a run id the model can no longer
+        // obtain from us, and leaving it active would advertise a capability
+        // against another extension's workflow tool.
+        pi.setActiveTools(
+          active.filter(name =>
+            name !== SUBAGENT_TOOL_NAMES.WORKFLOW && name !== SUBAGENT_TOOL_NAMES.STOP_WORKFLOW,
+          ),
+        );
       }
     } catch {
       // getAllTools/setActiveTools are unavailable in some hosts (print mode,
@@ -2777,7 +2822,7 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
+    const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta, sessionId: ctx.sessionManager.getSessionId() });
     workflowTasks.set(task.id, task);
     widget.update();
     fleet.update();
@@ -2943,6 +2988,42 @@ Terse command-style prompts produce shallow, generic work.
       } catch (err) {
         return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
       }
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description:
+      "Stop a running background agent and abort the work it is doing. Only this session's own top-level agents can be stopped — a nested child belongs to its parent agent, and a workflow's agents belong to the run.",
+    promptSnippet: "Stop a running background agent",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to stop. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      // The top-level check is the same one the RPC stop handler runs: a nested
+      // child or a workflow's agent is owned by something waiting on it, and
+      // aborting it from here would fail that owner's step. Reporting it as
+      // "not found" keeps the refusal from doubling as an existence probe.
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(
+          `Agent not found: "${params.agent_id}". It may have been cleaned up, or it is owned by another agent or workflow.`,
+        );
+      }
+      if (!manager.abort(record.id)) {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}).`);
+      }
+      // The stop tool's own reply is the notification: mark the result consumed
+      // and cancel any pending nudge so a later "Stopped" follow-up — which the
+      // model already knows — does not cost it another turn.
+      record.resultConsumed = true;
+      cancelNudge(record.id);
+      return textResult(`Stopped agent ${record.id}.`);
     },
   }));
 
