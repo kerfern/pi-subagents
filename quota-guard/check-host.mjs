@@ -184,6 +184,113 @@ export async function checkRuntimeDispatchReachesInjectedFetch(host, transport) 
     : `expected the injected fetch to receive exactly one POST to ${expectedUrl} carrying the synthetic bearer, observed ${JSON.stringify(calls)}`);
 }
 
+/**
+ * THE ownership check: the guard gates by decorating `ModelRuntime.prototype`, so it only gates if
+ * traffic actually dispatches through that prototype. An SDK build that moved `stream`/`streamSimple`
+ * onto each instance (own properties) - or made the prototype descriptors non-writable/non-configurable
+ * - would let the decoration install and gate nothing. This check establishes that the prototype owns
+ * both methods as writable+configurable data properties and that a receiver built with
+ * `Object.create(prototype)` (the same technique the dispatch check uses) calls a prototype-installed
+ * decoration.
+ *
+ * Honesty about observability: no real instance is constructible offline (private constructor;
+ * `create()` reads credential and catalogue state), so the "does an instance shadow this?" question is
+ * answered only for the synthetic receiver, not for a real one. The detail line says so. `surface` is
+ * injectable so the negative control can prove this check can fail.
+ */
+export async function checkPrototypeOwnershipNotShadowed(host, surface) {
+  const name = 'instance-owned dispatch cannot shadow the prototype the guard decorates';
+  let probe = surface;
+  if (!probe) {
+    let ModelRuntime;
+    try {
+      ({ ModelRuntime } = await import(pathToFileURL(join(host.root, 'dist', 'index.js')).href));
+    } catch (error) {
+      return result(name, false, `could not import ModelRuntime from the host entry: ${error.message}`, 'static');
+    }
+    const prototype = ModelRuntime?.prototype;
+    if (!prototype) return result(name, false, 'the host ModelRuntime no longer exposes a prototype', 'static');
+    probe = { prototype, receiver: Object.create(prototype), label: 'ModelRuntime' };
+  }
+  const { prototype, receiver } = probe;
+  const label = probe.label ?? 'the checked prototype';
+  const problems = [];
+  for (const method of ['stream', 'streamSimple']) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, method);
+    if (!descriptor || typeof descriptor.value !== 'function') {
+      problems.push(`${label}.prototype.${method} is not an own function data property`);
+      continue;
+    }
+    if (!descriptor.writable || !descriptor.configurable) {
+      problems.push(`${label}.prototype.${method} is not writable+configurable, so a prototype decoration cannot be installed reliably`);
+    }
+    if (Object.hasOwn(receiver, method)) {
+      problems.push(`the receiver carries its own ${method}, which would shadow the decorated prototype`);
+    }
+    if (receiver[method] !== descriptor.value) {
+      problems.push(`the receiver's ${method} does not resolve to the prototype's, so dispatch would bypass the decoration`);
+    }
+  }
+
+  // Decoration is only attempted when the descriptors allow it; a non-writable prototype is already a
+  // reported problem above, and assigning to it in strict mode would throw.
+  let decoration = 'skipped: the prototype descriptors are not installable (see the failure detail)';
+  if (problems.length === 0) {
+    const originalStream = prototype.stream;
+    const originalSimple = prototype.streamSimple;
+    const wrapper = function (...args) {
+      return originalStream.apply(this, args);
+    };
+    try {
+      prototype.stream = wrapper;
+      decoration = receiver.stream === wrapper
+        ? 'a prototype-installed decoration is what the receiver calls'
+        : 'the receiver did not dispatch to the prototype-installed decoration';
+      if (receiver.stream !== wrapper) {
+        problems.push('a decoration installed on the prototype was not what the receiver called');
+      }
+    } catch (error) {
+      problems.push(`installing a decoration on ${label}.prototype.stream threw: ${error.message}`);
+    } finally {
+      prototype.stream = originalStream;
+      prototype.streamSimple = originalSimple;
+      if (prototype.stream !== originalStream || prototype.streamSimple !== originalSimple) {
+        problems.push('the ownership probe left the prototype decorated - it would corrupt the host it is checking');
+      }
+    }
+  }
+
+  const notCovered = 'not covered: a real instance was never observed (none is constructible offline), and an SDK that dispatches through a captured bound reference rather than the prototype would still evade this';
+  return result(name, problems.length === 0, problems.length === 0
+    ? `static: ${label}.prototype owns stream/streamSimple as writable+configurable data properties and a synthetic receiver (Object.create(prototype)) dispatches to a prototype-installed decoration; ${decoration}. ${notCovered}`
+    : `${problems.join('; ')}. ${notCovered}`, 'static');
+}
+
+/** Negative control: an instance-owned/non-writable dispatch surface must make the ownership check FAIL. */
+export async function checkPrototypeShadowingNegativeControl(host) {
+  const name = 'negative control: an instance-owned dispatch surface is detected rather than passed';
+  const shadowingPrototype = {};
+  for (const method of ['stream', 'streamSimple']) {
+    Object.defineProperty(shadowingPrototype, method, {
+      value: () => {},
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  }
+  const shadowingReceiver = Object.create(shadowingPrototype);
+  // own, enumerable instance property that shadows the prototype (defined rather than assigned: the
+  // fixture's prototype property is non-writable, so a plain assignment would throw before the check runs)
+  Object.defineProperty(shadowingReceiver, 'stream', { value: () => {}, writable: true, enumerable: true, configurable: true });
+  const broken = await checkPrototypeOwnershipNotShadowed(host, {
+    prototype: shadowingPrototype,
+    receiver: shadowingReceiver,
+    label: 'a synthetic shadowing prototype',
+  });
+  return result(name, broken.ok === false,
+    broken.ok ? 'the ownership check PASSED an instance-owned dispatch surface - it is unsound' : 'an instance-owned, non-writable dispatch surface fails the ownership check', 'static');
+}
+
 /** Static: the supplied-client bypass is the fail-open case the guard refuses at activation. */
 export async function checkAnthropicClientBypass(host) {
   const name = 'a supplied Anthropic client still bypasses the injected fetch (refused by the guard)';
@@ -265,6 +372,8 @@ export async function runChecks(host) {
     await checkFetchReachesFinalRequest(host),
     await checkRuntimeDispatchReachesInjectedFetch(host),
     await checkDispatchNegativeControl(host),
+    await checkPrototypeOwnershipNotShadowed(host),
+    await checkPrototypeShadowingNegativeControl(host),
     await checkAnthropicClientBypass(host),
     await checkCodexSseBranch(host),
     await checkRequiredApis(host),
