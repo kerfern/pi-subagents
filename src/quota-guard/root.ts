@@ -98,16 +98,35 @@ function credentialOf(auth: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-/** Case-insensitive header read; accepts a `ProviderHeaders` record only. */
-function headerValue(auth: unknown, name: string): string | undefined {
-  const headers = (auth as { auth?: { headers?: unknown } } | undefined)?.auth?.headers;
-  if (!headers || typeof headers !== 'object') return undefined;
-  for (const key of Object.keys(headers as Record<string, unknown>)) {
-    if (key.toLowerCase() !== name) continue;
-    const value = (headers as Record<string, unknown>)[key];
-    if (typeof value === 'string' && value.length > 0) return value;
-  }
-  return undefined;
+/**
+ * JWT claim namespace the Codex transport itself trusts for the account id. Mirrors pi-ai's
+ * `JWT_CLAIM_PATH` (`openai-codex-responses.js`) so the guard attributes an attempt exactly as the
+ * transport does, instead of trusting a caller-supplied `chatgpt-account-id` header that the
+ * transport overrides from the token anyway.
+ */
+const CODEX_CLAIM_PATH = 'https://api.openai.com/auth';
+
+/** Tolerant base64url decode: `-`->`+`, `_`->`/`, padded to a multiple of four. */
+function decodeBase64url(segment: string): string {
+  const normalised = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = (4 - (normalised.length % 4)) % 4;
+  return atob(normalised.padEnd(normalised.length + padding, '='));
+}
+
+/**
+ * Derives the Codex account id from the credential itself, the way the transport does
+ * (`extractAccountId`): exactly three dot-separated segments, the second decoding to a JSON payload
+ * carrying the claim. Returns undefined for anything undecodable or without a non-empty string
+ * claim, so the caller fails closed. The credential is never echoed into an error or a log.
+ */
+function codexAccountId(credential: string): string | undefined {
+  const parts = credential.split('.');
+  if (parts.length !== 3) return undefined;
+  let payload: unknown;
+  try { payload = JSON.parse(decodeBase64url(parts[1])); } catch { return undefined; }
+  const claim = (payload as Record<string, unknown> | null)?.[CODEX_CLAIM_PATH];
+  const accountId = (claim as { chatgpt_account_id?: unknown } | undefined)?.chatgpt_account_id;
+  return typeof accountId === 'string' && accountId.length > 0 ? accountId : undefined;
 }
 
 /** Resolves the attempt scope from public host APIs; missing identity pauses and throws. */
@@ -121,7 +140,10 @@ async function resolveScope(runtime: GuardRuntime, coordinator: GatedCoordinator
     if (!credential) return failIdentity(coordinator);
     return { providerId: 'commandcode', scope: 'provider', credential };
   }
-  const accountId = headerValue(auth, 'chatgpt-account-id');
+  // Identity comes from the credential the transport will actually send. A caller-supplied
+  // `chatgpt-account-id` header is deliberately ignored: the transport overrides it from the token,
+  // so trusting it would let a caller aim the gate at another account's quota lane.
+  const accountId = credential ? codexAccountId(credential) : undefined;
   if (!credential || !accountId) return failIdentity(coordinator);
   if (!codexLimits?.length) {
     // Without the verified meter scope the read cannot be attributed to a quota window, so refuse

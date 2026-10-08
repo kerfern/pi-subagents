@@ -27,6 +27,7 @@ import {
 import { assess, DEFAULT_POLICY } from '../../src/quota-guard/policy.ts';
 import { openStore, type Manifest } from '../../src/quota-guard/store.ts';
 import type { QuotaWindow } from '../../src/quota-guard/types.ts';
+import { codexCredential } from './guard-fixtures.ts';
 
 const ROOT_ID = 'root-binding-test';
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -529,7 +530,7 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
   const host: QuotaGuardHost = { rootId: ROOT_ID, runtime, coordinator };
   const limits = [{ id: 'codex', windows: ['primary_window'] as const }];
   const model = { provider: 'openai-codex', api: 'openai-codex-responses' };
-  const receiver = { getAuth: async () => ({ auth: { apiKey: 'k', headers: { 'chatgpt-account-id': 'acct' } } }) };
+  const receiver = { getAuth: async () => ({ auth: { apiKey: codexCredential('acct'), headers: { 'chatgpt-account-id': 'acct' } } }) };
 
   setQuotaGuardEnabled(true);
   quotaGuardExtension(host, { codexLimits: limits });

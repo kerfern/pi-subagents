@@ -4,6 +4,7 @@ import { forceSse, installQuotaGuard } from '../../src/quota-guard/root.ts';
 import type { GatedCoordinator } from '../../src/quota-guard/root.ts';
 import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
 import type { GuardCoordinator } from '../../src/quota-guard/coordinator.ts';
+import { codexCredential, jwt } from './guard-fixtures.ts';
 
 // Compile-time only: the real coordinator must satisfy the public surface root.ts depends on.
 type AssertTrue<T extends true> = T;
@@ -13,6 +14,9 @@ const callerFetch: typeof fetch = async () => new Response('caller', { status: 2
 
 /** Verified meter scope the Codex path requires; without it a Codex attempt is refused. */
 const codexLimits = [{ id: 'codex', windows: ['primary_window', 'secondary_window'] as const }];
+
+/** The suite's default Codex credential; its claim names `acct-1`. */
+const CODEX_CREDENTIAL = codexCredential('acct-1');
 
 /** Stub coordinator: records the scope/inner it is handed and the pauses it observes. */
 function stubCoordinator() {
@@ -41,7 +45,7 @@ function makeRuntime() {
     stream: (...args: unknown[]) => { seen.push({ method: 'stream', args }); return 'stream-result'; },
     streamSimple: (...args: unknown[]) => { seen.push({ method: 'streamSimple', args }); return 'simple-result'; },
     getAuth: async (_model: unknown): Promise<unknown> =>
-      ({ auth: { apiKey: 'cred-token', headers: { 'chatgpt-account-id': 'acct-1' } } }),
+      ({ auth: { apiKey: CODEX_CREDENTIAL, headers: { 'chatgpt-account-id': 'acct-1' } } }),
   };
   // Production installs the decorator on `ModelRuntime.prototype`; dispatch then arrives with an
   // instance as `this`, so the install target and the receiver are distinct. `dispatch` models that
@@ -95,7 +99,7 @@ test('codex is forced to SSE and the transport is replaced by a lazy gated fetch
     assert.equal(response.status, 200);
     assert.equal(gates.length, 1);
     assert.deepEqual(gates[0].scope,
-      { providerId: 'openai-codex', scope: 'account', accountId: 'acct-1', credential: 'cred-token', codexLimits });
+      { providerId: 'openai-codex', scope: 'account', accountId: 'acct-1', credential: CODEX_CREDENTIAL, codexLimits });
     assert.equal(gates[0].inner, callerFetch);
     assert.deepEqual(innerCalls, ['https://chatgpt.com/backend-api/codex/responses']);
   } finally { dispose(); }
@@ -136,7 +140,7 @@ test('missing credential fails closed: pauses identity and never reaches the inn
 
 test('codex without a verified account id fails closed and never calls gatedFetch', async () => {
   const { runtime, dispatch, seen } = makeRuntime();
-  runtime.getAuth = async () => ({ auth: { apiKey: 'cred-token', headers: {} } });
+  runtime.getAuth = async () => ({ auth: { apiKey: jwt({}), headers: {} } });
   const { coordinator, pauses, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
   try {
@@ -147,6 +151,61 @@ test('codex without a verified account id fails closed and never calls gatedFetc
     assert.deepEqual(pauses, ['identity']);
     assert.equal(gates.length, 0);
   } finally { dispose(); }
+});
+
+test('the codex account id is derived from the credential claim itself', async () => {
+  const { runtime, dispatch, seen } = makeRuntime();
+  runtime.getAuth = async () => ({ auth: { apiKey: codexCredential('acct-token') } });
+  const { coordinator, gates } = stubCoordinator();
+  const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
+  try {
+    dispatch.stream({ provider: 'openai-codex', id: 'm', api: 'openai-codex-responses' }, 'ctx', {});
+    await (forwardedOptions(seen).fetch as typeof fetch)('https://chatgpt.com/backend-api/codex/responses', {});
+    assert.equal(gates.length, 1);
+    assert.equal(gates[0].scope.accountId, 'acct-token');
+    assert.equal(gates[0].scope.credential, codexCredential('acct-token'));
+  } finally { dispose(); }
+});
+
+test('the credential claim wins over a conflicting chatgpt-account-id header', async () => {
+  const { runtime, dispatch, seen } = makeRuntime();
+  // The header names one account while the token names another; the token must decide, exactly as
+  // the transport overrides the header from the token before sending.
+  runtime.getAuth = async () => ({
+    auth: { apiKey: codexCredential('acct-token'), headers: { 'chatgpt-account-id': 'acct-header' } },
+  });
+  const { coordinator, gates } = stubCoordinator();
+  const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
+  try {
+    dispatch.stream({ provider: 'openai-codex', id: 'm', api: 'openai-codex-responses' }, 'ctx', {});
+    await (forwardedOptions(seen).fetch as typeof fetch)('https://chatgpt.com/backend-api/codex/responses', {});
+    assert.equal(gates.length, 1);
+    assert.equal(gates[0].scope.accountId, 'acct-token', 'the caller-influenced header must not win');
+  } finally { dispose(); }
+});
+
+test('a claim-less, malformed or header-only credential is refused rather than attributed', async () => {
+  const cases: unknown[] = [
+    { auth: { apiKey: jwt({}), headers: { 'chatgpt-account-id': 'acct-header' } } },        // no claim
+    { auth: { apiKey: 'not-a-jwt', headers: { 'chatgpt-account-id': 'acct-header' } } },      // malformed
+    { auth: { apiKey: jwt('h.s'), headers: { 'chatgpt-account-id': 'acct-header' } } },       // non-object payload
+    { auth: { apiKey: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 42 } }),
+      headers: { 'chatgpt-account-id': 'acct-header' } } },                                   // non-string claim
+    { auth: { headers: { 'chatgpt-account-id': 'acct-header' } } },                           // header only
+  ];
+  for (const auth of cases) {
+    const { runtime, dispatch, seen } = makeRuntime();
+    runtime.getAuth = async () => auth;
+    const { coordinator, pauses, gates } = stubCoordinator();
+    const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
+    try {
+      dispatch.stream({ provider: 'openai-codex', id: 'm', api: 'openai-codex-responses' }, 'ctx', {});
+      await assert.rejects((forwardedOptions(seen).fetch as typeof fetch)('https://chatgpt.com/backend-api/codex/responses', {}),
+        (error: unknown) => (error as { code?: string }).code === 'auth');
+      assert.deepEqual(pauses, ['identity']);
+      assert.equal(gates.length, 0, 'an unattributable attempt must never reach the gate');
+    } finally { dispose(); }
+  }
 });
 
 test('a rejecting getAuth fails closed instead of admitting', async () => {
@@ -166,7 +225,8 @@ test('a rejecting getAuth fails closed instead of admitting', async () => {
 
 test('the credential never reaches console output', async () => {
   const { runtime, dispatch, seen } = makeRuntime();
-  runtime.getAuth = async () => ({ auth: { apiKey: 'super-secret-credential-xyz', headers: { 'chatgpt-account-id': 'acct-1' } } });
+  const secret = codexCredential('acct-secret');
+  runtime.getAuth = async () => ({ auth: { apiKey: secret, headers: { 'chatgpt-account-id': 'acct-1' } } });
   const { coordinator } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
   const logged: string[] = [];
@@ -180,7 +240,7 @@ test('the credential never reaches console output', async () => {
     Object.assign(console, real);
     dispose();
   }
-  assert.equal(logged.join('\n').includes('super-secret-credential-xyz'), false);
+  assert.equal(logged.join('\n').includes(secret), false);
 });
 
 test('dispose restores the exact originals and is idempotent', () => {
@@ -245,7 +305,7 @@ test('a coordinator without a public pause fails closed instead of silently skip
 
 test('the mandatory identity pause reaches the coordinator public pause', async () => {
   const { runtime, dispatch, seen } = makeRuntime();
-  runtime.getAuth = async () => ({ auth: { apiKey: 'cred-token', headers: {} } });
+  runtime.getAuth = async () => ({ auth: { apiKey: jwt({}), headers: {} } });
   const { coordinator, pauses, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
   try {

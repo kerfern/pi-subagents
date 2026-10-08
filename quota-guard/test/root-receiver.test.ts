@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { installQuotaGuard } from '../../src/quota-guard/root.ts';
+import { codexCredential } from './guard-fixtures.ts';
 import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
 
 /** Verified meter scope the Codex path requires; without it a Codex attempt is refused. */
@@ -79,7 +80,10 @@ test('a live instance receiver still resolves identity as before', async () => {
   });
   try {
     const instance = Object.create(prototype) as Receiver;
-    instance.credential = 'cred-token';
+    // The account id lives in the credential's claim, exactly as the transport derives it; the
+    // header names the same account but is not what identity resolves from.
+    const credential = codexCredential('acct-1');
+    instance.credential = credential;
     instance.accountId = 'acct-1';
     assert.equal((instance as unknown as { stream: (...a: unknown[]) => unknown })
       .stream({ provider: 'openai-codex', api: 'openai-codex-responses', id: 'm' }, 'ctx', {}), 'stream-result');
@@ -88,7 +92,7 @@ test('a live instance receiver still resolves identity as before', async () => {
     await gated('https://chatgpt.com/backend-api/codex/responses', {});
     assert.equal(gates.length, 1);
     assert.equal(gates[0].scope.accountId, 'acct-1');
-    assert.equal(gates[0].scope.credential, 'cred-token');
+    assert.equal(gates[0].scope.credential, credential);
   } finally { dispose(); }
 });
 
