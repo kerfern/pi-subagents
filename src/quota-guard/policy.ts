@@ -73,7 +73,7 @@ export function assess(
 
 /**
  * Strictly validate an operator-supplied reserve seed: every key a non-empty string, every value
- * finite and >= 0. All-or-nothing on purpose - one bad entry drops the whole seed, so a malformed
+ * finite and > 0. All-or-nothing on purpose - one bad entry drops the whole seed, so a malformed
  * value cannot leave the guard looking seeded while the windows it omitted stay unknown.
  *
  * This is a defence in depth behind `sanitizeReserveUnits` in settings: the guard re-validates what
@@ -83,7 +83,9 @@ export function validateReserveSeed(seed: ReadonlyMap<string, number> | undefine
   if (!seed || seed.size === 0) return undefined;
   const out = new Map<string, number>();
   for (const [id, units] of seed) {
-    if (typeof id !== 'string' || id.length === 0 || !Number.isFinite(units) || units < 0) return undefined;
+    // `> 0`, not `>= 0`: a zero reserve is an unknown cost treated as zero, which is the one thing the
+    // guard exists to refuse. For a metered window no dispatch burns nothing.
+    if (typeof id !== 'string' || id.length === 0 || !Number.isFinite(units) || units <= 0) return undefined;
     out.set(id, units);
   }
   return out;

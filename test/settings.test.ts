@@ -282,8 +282,9 @@ describe("settings persistence", () => {
 
   it("round-trips quotaGuardReserveUnits; a malformed entry drops the whole value", () => {
     // The per-window reserve seed: the guard cannot size a reserve on an idle account, so an
-    // operator asserts one here. Values are window units, so fractional and zero are both valid.
-    const units = { monthly: 12, fiveHour: 3.5, weekly: 0 };
+    // operator asserts one here. Values are window units; fractional is valid, zero is not - a zero
+    // reserve is an unknown cost treated as zero, which the guard refuses at every other layer too.
+    const units = { monthly: 12, fiveHour: 3.5, weekly: 0.5 };
     saveSettings({ quotaGuardReserveUnits: units }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ quotaGuardReserveUnits: units });
 
@@ -291,6 +292,7 @@ describe("settings persistence", () => {
     // window the seed omitted cannot silently stay unknown while the operator believes it is seeded.
     for (const bad of [
       { monthly: -1 },
+      { monthly: 0 },
       { monthly: 1, fiveHour: "5" },
       { monthly: null },
       { monthly: 1, "": 5 },

@@ -10,6 +10,11 @@
  * reopens only on a fresh, quorum-complete, reserve-complete, in-policy paused-mode assessment with
  * an unchanged fleet generation - elapsed time alone never reopens anything. The manifest stays
  * non-sensitive: it is only the fields already defined by `store.ts`.
+ *
+ * One ceiling is deliberate and stated rather than discovered: a pause is durable only when it names
+ * at least one checkpoint, so a `checkpoint` callback that can name none is refused outright with
+ * `CheckpointUnavailableError` - nothing is written, nothing is armed and `status().durable` is false.
+ * See docs/quota-guard-compatibility.md.
  */
 
 import { QuotaError } from './adapters.ts';
@@ -20,6 +25,19 @@ import type { Assessment, Policy, QuotaSnapshot } from './types.ts';
 
 /** Successive unavailable backoff: 30s, 60s, 120s, then hold at 300s. */
 const BACKOFF_MS: readonly number[] = Object.freeze([30_000, 60_000, 120_000, 300_000]);
+
+/**
+ * A pause is durable only when it names at least one checkpoint: `store.ts` refuses a checkpoint-less
+ * manifest by design, because a pause whose interrupted work cannot be named cannot be restored.
+ * Nothing can enumerate pending effects yet, so the production wiring raises this instead of handing
+ * over an empty list that the store would reject anyway - the refusal is stated, never incidental.
+ */
+export class CheckpointUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointUnavailableError';
+  }
+}
 
 export interface WakeCheck {
   snapshot: QuotaSnapshot;
@@ -33,7 +51,11 @@ export interface WakeDeps {
   now: () => number;
   /** Fresh, generation-bound read of every tracked scope; null means the quorum is incomplete. */
   check: (generation: number) => Promise<WakeCheck | null>;
-  /** Generation-bound checkpoint of pending effects, persisted before the wake arms. */
+  /**
+   * Generation-bound checkpoint of pending effects, persisted before the wake arms. A pause is
+   * durable only when this names at least one checkpoint, so a thrown `CheckpointUnavailableError`
+   * or an empty list is a refusal to record the pause - not a write to attempt and have rejected.
+   */
   checkpoint: (generation: number) => Promise<readonly { id: string; digest: string }[]>;
   /** Injectable scheduling so tests never wait on wall-clock time. */
   schedule: (delayMs: number, run: () => void) => { cancel: () => void };
@@ -41,6 +63,13 @@ export interface WakeDeps {
 }
 
 type Checkpoint = { id: string; digest: string };
+
+/**
+ * The durable manifest plus whether a pause in it is actually recorded. `durable: false` is the
+ * durability ceiling showing through: the wake machine was asked to record a pause it cannot name a
+ * checkpoint for, so it wrote nothing and a reader must not read the latch's pause as restorable.
+ */
+export type WakeStatus = Readonly<Manifest> & { readonly durable: boolean };
 
 function backoffDelay(index: number): number {
   const clamped = Math.min(Math.max(Math.trunc(index) || 0, 0), BACKOFF_MS.length - 1);
@@ -100,6 +129,8 @@ export class RootWake {
   private timer: { cancel: () => void } | null = null;
   private timerToken = 0;
   private pendingWithdrawal: { checkpoints: readonly Checkpoint[]; reason?: PauseReason } | null = null;
+  /** Set once a pause could not be recorded, so `status()` can never imply durability that is absent. */
+  private unrecorded = false;
 
   constructor(deps: WakeDeps) {
     if (!deps || typeof deps.check !== 'function' || typeof deps.checkpoint !== 'function'
@@ -137,8 +168,8 @@ export class RootWake {
     }
   }
 
-  status(): Readonly<Manifest> | null {
-    return this.manifest;
+  status(): WakeStatus | null {
+    return this.manifest === null ? null : { ...this.manifest, durable: !this.unrecorded };
   }
 
   async dispose(): Promise<void> {
@@ -159,7 +190,17 @@ export class RootWake {
     const generation = loaded.generation;
     await this.#drain();
     if (this.disposed) return false;
-    const checkpoints = await this.deps.checkpoint(generation);
+    let checkpoints: readonly Checkpoint[];
+    try {
+      checkpoints = await this.deps.checkpoint(generation);
+    } catch (error) {
+      return this.#refuseUnrecorded(error);
+    }
+    if (checkpoints.length === 0) {
+      return this.#refuseUnrecorded(new CheckpointUnavailableError(
+        `No durable checkpoints for root ${loaded.rootId}: a pause that names none cannot be restored, so none is recorded`,
+      ));
+    }
     // Bound to the fleet generation the check is authorised against: a pause landing under the check
     // makes the approval stale, so the generation is re-read and must be unchanged before reopening.
     const fleetGeneration = this.deps.fleet.snapshot().generation;
@@ -230,6 +271,21 @@ export class RootWake {
     if (reopened) return true;
     if (this.deps.fleet.snapshot().state === 'open') return false;
     return await this.#withdraw(checkpoints);
+  }
+
+  /**
+   * The durability ceiling as an explicit outcome. A pause that names no checkpoint cannot be stored
+   * (the store refuses such a manifest by design) and nothing can enumerate pending effects yet, so
+   * this writes nothing, arms nothing and reports the refusal through `onError`. Writing the record
+   * and letting the store reject it would make the ceiling an accident; fabricating a checkpoint - or
+   * a pause record with none - would claim a restorable pause whose work will never arrive. `durable`
+   * turns false, so `status()` cannot imply a pause that exists nowhere, the persisted manifest (if
+   * there is one) is left exactly as it is, and the root stays closed until an authorised resume.
+   */
+  #refuseUnrecorded(error: unknown): boolean {
+    this.unrecorded = true;
+    this.deps.onError?.(error);
+    return false;
   }
 
   /** True only while the fleet is still paused at the generation the check was authorised against. */

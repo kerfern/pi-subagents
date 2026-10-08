@@ -69,6 +69,11 @@ function of a host descriptor — it makes no request and reads no credentials.
   build claiming a familiar version but missing a seam is still refused, and a test pins exactly that.
 - `fetch` does not cover WebSockets. Codex is forced onto SSE for this reason; an unsupported
   transport is refused rather than assumed guarded.
+- Unguarded models are forwarded with `provider`/`api` pinned: a plain object as a copy, anything else
+  through a thin wrapper that answers those two keys and delegates the rest. The wrapper is a `Proxy`,
+  so a class-backed model whose prototype getters or methods touch **private** (`#`) fields can fail
+  through it — the receiver is the wrapper, and a private brand check is failed by a proxy. This
+  affects a shape the SDK already degrades: its own model copy drops prototype members.
 - The guard does not self-repair. Nothing rewrites guard code, patches the SDK, or runs on a timer; a
   stale lock in its durable store is reported with the exact command to clear it, and that is
   deliberate — an automatic reclaim protocol that can silently break mutual exclusion is a worse
@@ -77,6 +82,18 @@ function of a host descriptor — it makes no request and reads no credentials.
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
+- **Durability ceiling: a *fresh* pause is not recorded at all.** A pause reaches the durable store
+  only when it can name at least one checkpoint, and nothing in the guard can enumerate pending
+  effects yet. The store refuses a checkpoint-less pause by design, so the guard raises
+  `CheckpointUnavailableError` and records nothing, rather than handing over an empty checkpoint list
+  and letting the store's validation reject it — the refusal is deliberate, not incidental. Concretely,
+  **after a restart a fresh pause is lost: its reason, its generation and its resume deadline are
+  gone, no pending continuation is restored, and a paused root comes back open rather than paused.**
+  Only a pause already present in a manifest (with a checkpoint in it) is reinstated, exactly as
+  before. Where the wake machine refuses to record a pause, `status.wake.durable` is `false` and
+  `/quota-guard status` prints `(not durable)`; with no manifest at all it reports `wake: null`. The
+  guard deliberately does not fabricate a checkpoint id to make a pause look restorable: a reinstated
+  pause that cannot name the work it was waiting for would be worse than the honest gap.
 - A fresh check can only re-read scopes the guard has **actually seen**. The reserve estimator is
   keyed by lane and the account FIFO's lane set is private, so the guard retains the last scope it was
   handed (credential included, in memory only) and re-reads *that* one on a manual resume. It cannot
@@ -242,8 +259,8 @@ Two consequences worth knowing before you set it. First, without the flag an ins
 
 **Three optional keys, and what happens without them:**
 
-- `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, checkpoints and backoff survive a restart and `status.wake` is real. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
+- `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, a pause **already recorded** in that directory is reinstated across a restart, and its deadline, backoff index and checkpoints are what `status.wake` reports. A **fresh** pause made in this session is not recorded, because it cannot name a checkpoint (see the durability ceiling under [Honest limits](#honest-limits)), so it is gone after a restart. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
-- `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number `>= 0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
+- `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number strictly greater than `0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. A seed of `0` is refused for the same reason an unknown reserve is never treated as zero: for a metered window no dispatch burns nothing, so accepting `0` would silently disable the protection this number exists to provide. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
 
 **Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` re-reads quota for the last scope the guard saw with the same reader and estimator it gates with, so a paused guard can calibrate and reopen; `/quota-guard enable` re-asserts the switch in-session. The check runs *outside* dispatch, which is what breaks the old deadlock where the only observation happened inside `admit` and `admit` itself blocked on the pause. It reopens only on a verified, in-policy read for every window the guard has seen; an unreadable read, an uncalibrated reserve, or no retained scope keeps it closed. Because only observed scopes can be re-checked, a resume before any attempt has reached `admit` is refused.

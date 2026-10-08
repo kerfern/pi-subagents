@@ -7,7 +7,7 @@ import { QuotaError } from '../../src/quota-guard/adapters.ts';
 import { FleetLatch } from '../../src/quota-guard/controller.ts';
 import { DEFAULT_POLICY } from '../../src/quota-guard/policy.ts';
 import { openStore, type Manifest, type QuotaStore } from '../../src/quota-guard/store.ts';
-import { RootWake, type WakeCheck, type WakeDeps } from '../../src/quota-guard/wake.ts';
+import { CheckpointUnavailableError, RootWake, type WakeCheck, type WakeDeps } from '../../src/quota-guard/wake.ts';
 
 type Value = Omit<Manifest, 'digest'>;
 const T = 1_000_000;
@@ -126,6 +126,7 @@ test('start reinstates a persisted pause and arms the recorded wake without an e
     assert.equal(checks, 0, 'a future wake must not check early');
     assert.deepEqual(s.timers.map((timer) => timer.delay), [90_000]);
     assert.equal(wake.status()?.generation, 1);
+    assert.equal(wake.status()?.durable, true, 'a pause restored from a recorded manifest is durable');
     await wake.dispose();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -972,6 +973,83 @@ test('round 5 finding 2: a commit-then-throw withdrawal re-reads rather than tru
     const read = await base.read();
     assert.equal(read?.state, 'open', 'the committed pause must be converged to the open latch, not trusted stale');
     assert.equal((read?.state === 'open'), (fleet.snapshot().state === 'open'), 'the latch and the record agree');
+    await wake.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The durability ceiling, pinned. A pause is durable only when it names at least one checkpoint, so
+ * the store refuses a checkpoint-less manifest by design. Both ways of telling the wake machine it
+ * has none - a thrown `CheckpointUnavailableError` and an empty list - must be an explicit refusal:
+ * no write is attempted, no deadline is armed against a record that was never written, and `status()`
+ * reports the pause as not durable rather than implying one that exists nowhere.
+ */
+test('durability ceiling: a refused checkpoint is an explicit refusal, never a doomed write', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wake-'));
+  try {
+    const base = await openStore(dir, 'root-a');
+    await base.write(paused({ wakeAt: iso(T - 1_000) }), null); // overdue: the wake runs on start
+    const fleet = new FleetLatch('root-a');
+    const s = scheduler();
+    const errors: unknown[] = [];
+    let writes = 0;
+    const store: QuotaStore = {
+      read: () => base.read(),
+      write: async () => { writes++; throw new Error('an unrecordable pause must never be written'); },
+      close: () => base.close(),
+    };
+    const wake = new RootWake(deps({
+      fleet, store, schedule: s.schedule,
+      check: async () => exhausted(),
+      checkpoint: async () => { throw new CheckpointUnavailableError('no durable checkpoints for root-a'); },
+      onError: (error) => { errors.push(error); },
+    }));
+
+    await wake.start();
+
+    assert.equal(writes, 0, 'the refusal must be decided before the store is asked to reject it');
+    assert.ok(
+      errors[0] instanceof CheckpointUnavailableError,
+      `the refusal must be reported as itself, not as a store rejection; got ${String(errors[0])}`,
+    );
+    assert.deepEqual(s.armed(), [], 'no deadline may be armed for a pause that was never recorded');
+    assert.equal(wake.status()?.state, 'paused', 'the persisted record is still what status reports');
+    assert.equal(wake.status()?.durable, false, 'status must not imply a durable pause that was never written');
+    await wake.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('durability ceiling: an empty checkpoint list is the same refusal, not a write the store rejects', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wake-'));
+  try {
+    const base = await openStore(dir, 'root-a');
+    await base.write(paused({ wakeAt: iso(T - 1_000) }), null);
+    const fleet = new FleetLatch('root-a');
+    const s = scheduler();
+    const errors: unknown[] = [];
+    let writes = 0;
+    const store: QuotaStore = {
+      read: () => base.read(),
+      write: async () => { writes++; throw new Error('an empty checkpoint list must never reach the store'); },
+      close: () => base.close(),
+    };
+    const wake = new RootWake(deps({
+      fleet, store, schedule: s.schedule,
+      check: async () => exhausted(),
+      checkpoint: async () => [],
+      onError: (error) => { errors.push(error); },
+    }));
+
+    await wake.start();
+
+    assert.equal(writes, 0, 'an empty checkpoint list must be refused, not written and rejected');
+    assert.ok(errors[0] instanceof CheckpointUnavailableError, `expected the ceiling refusal, got ${String(errors[0])}`);
+    assert.deepEqual(s.armed(), [], 'nothing may be armed for a pause that was never recorded');
+    assert.equal(wake.status()?.durable, false);
     await wake.dispose();
   } finally {
     await rm(dir, { recursive: true, force: true });

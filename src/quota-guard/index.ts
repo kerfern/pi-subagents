@@ -20,7 +20,7 @@ import { DEFAULT_POLICY } from './policy.ts';
 import { type GatedCoordinator, type GuardRuntime, installQuotaGuard } from './root.ts';
 import { createQuotaGuardCoordinator, type RootBinding } from './root-binding.ts';
 import { openStore } from './store.ts';
-import { RootWake, type WakeCheck } from './wake.ts';
+import { CheckpointUnavailableError, RootWake, type WakeCheck } from './wake.ts';
 
 /** The fleet surface the controls observe; satisfied by the public `FleetLatch`. */
 export interface QuotaGuardFleet {
@@ -35,6 +35,8 @@ export interface QuotaGuardWake {
     state: string;
     backoffIndex?: number;
     wakeAt?: string;
+    /** False when the reported pause was never written; absent means the surface does not say. */
+    durable?: boolean;
   }> | null;
 }
 
@@ -78,7 +80,7 @@ export interface QuotaGuardStatus {
   active: number;
   inferences: number;
   coding: number;
-  wake: { state: string; backoffIndex?: number; wakeAt?: string } | null;
+  wake: { state: string; backoffIndex?: number; wakeAt?: string; durable?: boolean } | null;
 }
 
 export interface QuotaGuardControls {
@@ -129,6 +131,8 @@ function statusOf(host: QuotaGuardHost, installed: boolean): QuotaGuardStatus {
       state: wake.state,
       ...(wake.backoffIndex !== undefined && { backoffIndex: wake.backoffIndex }),
       ...(wake.wakeAt !== undefined && { wakeAt: wake.wakeAt }),
+      // Carried through so a pause the wake machine refused to record can never read as a durable one.
+      ...(wake.durable !== undefined && { durable: wake.durable }),
     },
   };
 }
@@ -252,9 +256,20 @@ function resolveWake(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
         // confirmed from a single read. `null` is the honest answer and keeps the root closed;
         // fabricating a quorum could reopen it on evidence nobody verified.
         check: async (): Promise<WakeCheck | null> => null,
-        // Nothing is pending checkpointing yet, so the honest checkpoint list is empty. The durable
-        // store refuses a checkpoint-less pause by design, so a fresh pause is not persisted yet.
-        checkpoint: async () => [],
+        // Durability ceiling, stated rather than implied: the guard cannot enumerate pending effects
+        // yet, so it has no checkpoint to name, and the store refuses a checkpoint-less pause by design
+        // (a pause whose interrupted work cannot be named cannot be restored). Returning an empty list
+        // would leave that refusal for the store's validation to discover; this raises the reason
+        // itself, and the wake machine records it as an unrecorded pause (`status.wake.durable: false`)
+        // instead of writing anything. A fresh pause is therefore not durable: after a restart its
+        // reason, generation and resume deadline are gone and no pending continuation is restored.
+        // See docs/quota-guard-compatibility.md.
+        checkpoint: async (): Promise<readonly { id: string; digest: string }[]> => {
+          throw new CheckpointUnavailableError(
+            `Quota guard: no durable checkpoints for root ${rootId} - the owning component cannot yet `
+            + 'enumerate pending effects, so a pause is not recorded and does not survive a restart',
+          );
+        },
         // The real timer in production. `unref` keeps a pending deadline from pinning a process that
         // has nothing else to do; RootWake owns cancellation through the returned handle.
         schedule: (delayMs: number, run: () => void) => {
@@ -296,7 +311,7 @@ function describe(status: QuotaGuardStatus): string {
     `active ${status.active} (inference ${status.inferences}, coding ${status.coding})`,
   ];
   if (status.wake) {
-    parts.push(`wake ${status.wake.state}${status.wake.backoffIndex !== undefined ? ` backoff#${status.wake.backoffIndex}` : ''}${status.wake.wakeAt ? ` @${status.wake.wakeAt}` : ''}`);
+    parts.push(`wake ${status.wake.state}${status.wake.backoffIndex !== undefined ? ` backoff#${status.wake.backoffIndex}` : ''}${status.wake.wakeAt ? ` @${status.wake.wakeAt}` : ''}${status.wake.durable === false ? ' (not durable)' : ''}`);
   }
   return `Quota guard: ${parts.join(' · ')}`;
 }

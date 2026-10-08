@@ -270,7 +270,8 @@ export interface SubagentsSettings {
    * Window ids are visible from `node quota-guard/certify-live.mjs --dry-run`. A value that is too
    * small under-protects - the operator owns that risk.
    *
-   * Entries must be finite numbers >= 0 with non-empty ids. A malformed entry drops the whole value
+   * Entries must be finite numbers > 0 with non-empty ids (a zero reserve would be an unknown cost
+   * treated as zero, the one thing the guard exists to refuse). A malformed entry drops the whole value
    * rather than the entry, so a bad seed cannot half-configure the guard while the windows it
    * omitted stay unknown.
    *
@@ -446,7 +447,7 @@ function sanitizeReserveUnits(value: unknown): Record<string, number> | undefine
   if (entries.length === 0) return undefined;
   const out: Record<string, number> = {};
   for (const [id, units] of entries) {
-    if (id.length === 0 || typeof units !== "number" || !Number.isFinite(units) || units < 0) return undefined;
+    if (id.length === 0 || typeof units !== "number" || !Number.isFinite(units) || units <= 0) return undefined;
     out[id] = units;
   }
   return out;

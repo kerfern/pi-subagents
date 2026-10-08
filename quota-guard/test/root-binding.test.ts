@@ -12,6 +12,7 @@
 
 import assert from 'node:assert/strict';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { inspect } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -129,9 +130,12 @@ beforeEach(async () => {
   // console only: the node:test reporter owns process.stdout (it uses it as its IPC channel).
   // Serialise rather than stringify: `String({ scope })` is '[object Object]', so a credential
   // carried as a structured log argument would slip past the sentinel check below.
+  // `inspect`, not `JSON.stringify`: a cyclic or non-enumerable value makes JSON throw, and the
+  // fallback would render it '[object Object]', hiding a credential carried that way.
   const serialise = (value: unknown): string => {
     if (typeof value === 'string') return value;
-    try { return JSON.stringify(value) ?? String(value); } catch { return String(value); }
+    try { return inspect(value, { depth: 8, showHidden: true, breakLength: Infinity }); }
+    catch { return String(value); }
   };
   const capture = (...args: unknown[]) => { output.push(args.map(serialise).join(' ')); };
   const originalError = console.error;
@@ -317,6 +321,7 @@ test('stateDir: a persisted pause is reported and survives a fresh binding over 
   assert.equal(controls.status().wake?.state, 'paused', 'real wake state must be reported, not null');
   assert.equal(controls.status().wake?.wakeAt, wakeAt, 'the recorded deadline must survive');
   assert.equal(controls.status().wake?.backoffIndex, 1);
+  assert.equal(controls.status().wake?.durable, true, 'a pause recorded with a checkpoint stays durable');
 
   // A fresh binding (fresh coordinator + fresh wake machine) over the same directory reinstates it.
   await resetQuotaGuardStateForTest();
@@ -340,6 +345,48 @@ test('stateDir: a persisted pause is reported and survives a fresh binding over 
   second.freshCheck = async () => true;
   assert.equal(await quotaGuardControls()?.resume(), true);
   assert.equal(binding.fleet.snapshot().state, 'open');
+});
+
+/**
+ * The durability ceiling, from the wiring side. A pause can only be recorded when it names a
+ * checkpoint, and nothing can enumerate them yet, so a *fresh* pause - one with no manifest already
+ * on disk - is not persisted at all. It must stay honest in both directions: nothing written while
+ * the session runs, and nothing reinstated after a restart, rather than a pause that comes back with
+ * a stale reason nobody recorded.
+ */
+test('durability ceiling: a fresh pause records nothing, so a restart comes back open with no stale reason', async () => {
+  const dir = await tmpDir();
+  const host: QuotaGuardHost = { rootId: ROOT_ID, stateDir: dir, hookSource: hookSource(fakeRuntime().prototype) };
+  setQuotaGuardEnabled(true);
+  quotaGuardExtension(host);
+  await flush();
+  await settle(() => host.wake !== undefined);
+
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  controls.pause('threshold');
+  assert.equal(controls.status().state, 'paused', 'the latch pauses whether or not anything is recorded');
+  await flush();
+  assert.deepEqual(
+    await readdir(dir, { recursive: true }),
+    [],
+    'a fresh pause cannot name a checkpoint, so it must not be written at all',
+  );
+  assert.equal(controls.status().wake, null, 'status must not report a durable pause that was never written');
+
+  // Restart: a fresh binding over the same directory has no record of the pause, and must not invent one.
+  await resetQuotaGuardStateForTest();
+  setQuotaGuardEnabled(true);
+  const second: QuotaGuardHost = { rootId: ROOT_ID, stateDir: dir, hookSource: hookSource(fakeRuntime().prototype) };
+  quotaGuardExtension(second);
+  await flush();
+  await settle(() => second.wake !== undefined);
+
+  const status = quotaGuardControls()?.status();
+  assert.ok(status);
+  assert.equal(status.state, 'open', 'a pause that was never recorded must not come back after a restart');
+  assert.equal(status.reason, undefined, 'no stale reason may be reported for an unrecorded pause');
+  assert.equal(status.wake, null, 'nothing durable exists, so nothing durable may be reported');
 });
 
 test('without stateDir wake stays null and gating is unaffected', async () => {
@@ -533,7 +580,8 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
   const dispatch = function (this: unknown, _model: unknown, _ctx: unknown, options: { fetch: typeof fetch }) {
     return options.fetch('https://chatgpt.com/backend-api/wham/usage', {});
   };
-  const runtime = { stream: dispatch, streamSimple: dispatch };
+  // Cast only: the point of this test is the config plumbing, not the fake runtime's shape.
+  const runtime = { stream: dispatch, streamSimple: dispatch } as unknown as QuotaGuardHost['runtime'];
   const host: QuotaGuardHost = { rootId: ROOT_ID, runtime, coordinator };
   const limits = [{ id: 'codex', windows: ['primary_window'] as const }];
   const model = { provider: 'openai-codex', api: 'openai-codex-responses' };
@@ -541,7 +589,8 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
 
   setQuotaGuardEnabled(true);
   quotaGuardExtension(host, { codexLimits: limits });
-  await runtime.stream.call(receiver, model, undefined, {});
+  await (runtime as unknown as { stream: (this: unknown, ...args: unknown[]) => unknown })
+    .stream.call(receiver, model, undefined, {});
 
   assert.equal(gates.length, 1, 'the codex attempt must reach the gate, not be refused for a missing scope');
   assert.equal(gates[0].providerId, 'openai-codex');
@@ -550,10 +599,11 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
   // The contrast: the same host without the configured scope still refuses.
   await resetQuotaGuardStateForTest();
   setQuotaGuardEnabled(true);
-  const bare: QuotaGuardHost = { rootId: ROOT_ID, runtime: { stream: dispatch, streamSimple: dispatch }, coordinator };
+  const bareRuntime = { stream: dispatch, streamSimple: dispatch } as unknown as QuotaGuardHost['runtime'];
+  const bare: QuotaGuardHost = { rootId: ROOT_ID, runtime: bareRuntime, coordinator };
   quotaGuardExtension(bare);
   await assert.rejects(
-    () => (bare.runtime?.stream as (this: unknown, ...args: unknown[]) => unknown).call(receiver, model, undefined, {}),
+    async () => (bare.runtime?.stream as (this: unknown, ...args: unknown[]) => unknown).call(receiver, model, undefined, {}),
     /no verified Codex meter scope configured/,
   );
 });
@@ -625,6 +675,24 @@ test('reserve seed: a malformed seed is dropped whole, so the guard stays closed
   const windows: QuotaWindow[] = [{ id: 'monthly', used: 1, cap: 70, resetAt: iso(Date.now() + 3_600_000) }];
   const observed = binding.estimator.observe('commandcode:provider', windows);
   assert.equal(observed.get('monthly'), null, 'a dropped seed must not register as an observation');
+});
+
+test('reserve seed: a zero seed is refused, because a zero reserve is an unknown cost treated as zero', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  // Zero is the value the guard exists to refuse: no metered dispatch burns nothing, so accepting a
+  // `0` seed would silently remove the protection the reserve provides.
+  const reserveUnits = new Map([['monthly', 60], ['fiveHour', 0], ['weekly', 60]]);
+  await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+
+  const windows: QuotaWindow[] = [{ id: 'monthly', used: 1, cap: 70, resetAt: iso(Date.now() + 3_600_000) }];
+  const observed = binding.estimator.observe('commandcode:provider', windows);
+  assert.equal(observed.get('monthly'), null, 'a refused zero seed must not register as an observation');
 });
 
 test('reserve seed: the seed value is never logged or written to the durable store', async () => {
