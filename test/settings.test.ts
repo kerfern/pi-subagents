@@ -247,6 +247,39 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
+  it("round-trips quotaGuardStateDir; a non-absolute path is dropped", () => {
+    // The guard opens its durable store at this path, so a relative one is not a path it can
+    // honour: dropped rather than resolved against whatever cwd the session happens to have.
+    writeProject({ quotaGuardStateDir: "relative/state" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ quotaGuardStateDir: 42 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+
+    saveSettings({ quotaGuardStateDir: "/var/tmp/quota-guard-state" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardStateDir: "/var/tmp/quota-guard-state" });
+  });
+
+  it("round-trips quotaGuardCodexLimits; a malformed entry drops the whole value", () => {
+    const limits = [{ id: "codex", windows: ["primary_window", "secondary_window"] }];
+    saveSettings({ quotaGuardCodexLimits: limits }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardCodexLimits: limits });
+
+    // Fail closed: a half-configured meter scope would attribute a Codex read to the wrong
+    // window, so one bad entry drops the list rather than the entry.
+    for (const bad of [
+      [{ id: "codex", windows: ["nope"] }],
+      [{ id: "", windows: ["primary_window"] }],
+      [{ windows: ["primary_window"] }],
+      [{ id: "codex", windows: "primary_window" }],
+      [{ id: "codex", windows: ["primary_window"] }, { id: 1, windows: ["primary_window"] }],
+      [],
+      "codex",
+    ]) {
+      writeProject({ quotaGuardCodexLimits: bad } as any);
+      expect(loadSettings(projectDir)).toEqual({});
+    }
+  });
+
   it("sanitize drops non-boolean schedulingEnabled silently", async () => {
     writeProject({ schedulingEnabled: "yes" } as any);
     expect(loadSettings(projectDir)).toEqual({});
@@ -572,6 +605,8 @@ describe("settings persistence", () => {
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
         setQuotaGuardEnabled: vi.fn(),
+        setQuotaGuardStateDir: vi.fn(),
+        setQuotaGuardCodexLimits: vi.fn(),
       };
     });
 
@@ -618,6 +653,17 @@ describe("settings persistence", () => {
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
       expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
+    });
+
+    it("applies quotaGuardStateDir and quotaGuardCodexLimits; skips them when absent", () => {
+      const limits = [{ id: "codex", windows: ["primary_window"] }];
+      applySettings({ quotaGuardStateDir: "/var/tmp/state", quotaGuardCodexLimits: limits }, appliers);
+      expect(appliers.setQuotaGuardStateDir).toHaveBeenCalledWith("/var/tmp/state");
+      expect(appliers.setQuotaGuardCodexLimits).toHaveBeenCalledWith(limits);
+
+      applySettings({}, appliers);
+      expect(appliers.setQuotaGuardStateDir).toHaveBeenCalledTimes(1);
+      expect(appliers.setQuotaGuardCodexLimits).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
     it("applies fallbackSubagent through to the registry", () => {
@@ -824,6 +870,8 @@ describe("settings persistence", () => {
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
         setQuotaGuardEnabled: vi.fn(),
+        setQuotaGuardStateDir: vi.fn(),
+        setQuotaGuardCodexLimits: vi.fn(),
       };
     });
 

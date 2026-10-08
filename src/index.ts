@@ -44,6 +44,7 @@ import {
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import type { CodexLimit } from "./quota-guard/adapters.js";
 import { isQuotaGuardEnabled, quotaGuardExtension, setQuotaGuardEnabled } from "./quota-guard/index.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -1251,6 +1252,14 @@ export default function (pi: ExtensionAPI) {
     workflowsPinned = true;
   }
 
+  // The guard's two remaining inputs. `quotaGuardExtension` reads them off the host object, which
+  // the pi API object is not, so they are held here and handed over as its second argument at the
+  // entry call site. Read once at extension init, like `quotaGuardEnabled`, and inert while it is off.
+  let quotaGuardStateDir: string | undefined;
+  let quotaGuardCodexLimits: CodexLimit[] | undefined;
+  function setQuotaGuardStateDir(dir: string) { quotaGuardStateDir = dir; }
+  function setQuotaGuardCodexLimits(limits: readonly CodexLimit[]) { quotaGuardCodexLimits = [...limits]; }
+
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
   // Plan) are not registered. User-defined agents from project/global custom
@@ -1474,6 +1483,8 @@ export default function (pi: ExtensionAPI) {
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setQuotaGuardEnabled,
+      setQuotaGuardStateDir,
+      setQuotaGuardCodexLimits,
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
@@ -3630,6 +3641,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // unset value must round-trip as unset rather than being materialized as
       // an explicit `false` (same reasoning as `fallbackSubagent` above).
       quotaGuardEnabled: isQuotaGuardEnabled(),
+      // Both undefined unless an operator set them in subagents.json; JSON.stringify then drops
+      // them, so an unset value round-trips as unset rather than being materialized.
+      quotaGuardStateDir,
+      quotaGuardCodexLimits,
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
       viewerMarkdown: getViewerMarkdown(),
@@ -4398,7 +4413,10 @@ Write the file using the write tool. Only write the file, nothing else.`;
   // Quota guard is opt-in: default-off, so this is inert unless an operator
   // set `quotaGuardEnabled`. It registers `/quota-guard` and installs against
   // the runtime handle it is handed; it never forces aborts or patches fetch.
-  quotaGuardExtension(pi);
+  quotaGuardExtension(pi, {
+    ...(quotaGuardStateDir !== undefined ? { stateDir: quotaGuardStateDir } : {}),
+    ...(quotaGuardCodexLimits !== undefined ? { codexLimits: quotaGuardCodexLimits } : {}),
+  });
 
   /**
    * What `/agents → Workflows` and the fleet list's `workflow` rows need from

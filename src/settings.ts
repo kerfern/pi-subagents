@@ -3,9 +3,10 @@
 // - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import type { CodexLimit } from "./quota-guard/adapters.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
@@ -233,6 +234,30 @@ export interface SubagentsSettings {
    */
   quotaGuardEnabled?: boolean;
   /**
+   * Absolute path to the durable state directory the guard's wake machine records into. Created and
+   * owned by the guard; secret-free.
+   *
+   * Only meaningful with `quotaGuardEnabled`. Required for the documented activation path: without
+   * it no wake machine is built, so a pause cannot be persisted or self-recovered. A non-absolute
+   * path is dropped rather than resolved against whatever cwd the session happens to have, because
+   * a relative path is not a directory the guard can honestly own.
+   *
+   * Read once at extension init, like `quotaGuardEnabled`.
+   */
+  quotaGuardStateDir?: string;
+  /**
+   * The verified Codex meter scope: which metered features are real, and which windows each is read
+   * from. Required for Codex only — without it a Codex attempt is refused rather than attributed to
+   * the wrong window.
+   *
+   * Entries must match the guard's own `CodexLimit` shape. A malformed entry drops the whole list
+   * rather than the entry: a half-configured scope would attribute a read to the wrong window, so
+   * the Codex path must stay refusing instead of becoming partly configured.
+   *
+   * Read once at extension init, like `quotaGuardEnabled`.
+   */
+  quotaGuardCodexLimits?: CodexLimit[];
+  /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
    * disables nesting project-wide. Read when a subagent session is built, so a
@@ -341,6 +366,8 @@ export interface SettingsAppliers {
   setWorktreeIsolation: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
   setQuotaGuardEnabled: (b: boolean) => void;
+  setQuotaGuardStateDir: (dir: string) => void;
+  setQuotaGuardCodexLimits: (limits: readonly CodexLimit[]) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
@@ -357,6 +384,8 @@ const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptio
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
+/** The only windows the guard knows how to read; anything else is a scope it cannot attribute. */
+const VALID_CODEX_WINDOWS: ReadonlySet<string> = new Set(["primary_window", "secondary_window"]);
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
@@ -365,6 +394,25 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+
+/**
+ * Validate a persisted `quotaGuardCodexLimits` against the guard's own `CodexLimit` shape.
+ * All-or-nothing on purpose: one bad entry would be a scope the guard cannot attribute a read to,
+ * so the list is dropped rather than half-honoured and the Codex path keeps refusing.
+ */
+function sanitizeCodexLimits(value: unknown): CodexLimit[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const out: CodexLimit[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const { id, windows } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || id.length === 0) return undefined;
+    if (!Array.isArray(windows) || windows.length === 0) return undefined;
+    if (!windows.every((w) => typeof w === "string" && VALID_CODEX_WINDOWS.has(w))) return undefined;
+    out.push({ id, windows: windows as unknown as CodexLimit["windows"] });
+  }
+  return out;
+}
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
@@ -469,6 +517,12 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.quotaGuardEnabled === "boolean") {
     out.quotaGuardEnabled = r.quotaGuardEnabled;
   }
+  if (typeof r.quotaGuardStateDir === "string") {
+    const dir = r.quotaGuardStateDir.trim();
+    if (isAbsolute(dir)) out.quotaGuardStateDir = dir;
+  }
+  const codexLimits = sanitizeCodexLimits(r.quotaGuardCodexLimits);
+  if (codexLimits) out.quotaGuardCodexLimits = codexLimits;
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -556,6 +610,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
   if (typeof s.quotaGuardEnabled === "boolean") appliers.setQuotaGuardEnabled(s.quotaGuardEnabled);
+  if (typeof s.quotaGuardStateDir === "string") appliers.setQuotaGuardStateDir(s.quotaGuardStateDir);
+  if (s.quotaGuardCodexLimits) appliers.setQuotaGuardCodexLimits(s.quotaGuardCodexLimits);
 }
 
 /**

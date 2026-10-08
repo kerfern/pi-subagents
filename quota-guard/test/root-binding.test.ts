@@ -302,3 +302,85 @@ test('without stateDir wake stays null and gating is unaffected', async () => {
   await flush();
   assert.deepEqual(output, [], 'the documented no-stateDir limitation must not log as a failure');
 });
+
+/**
+ * The documented activation path is a settings file, but the guard reads its configuration off the
+ * host object it is handed. These pin the transport: `quotaGuardExtension(host, config)` must make
+ * the configured `stateDir` and `codexLimits` reach the code that consumes them, without changing
+ * the host identity (`registerCommand` must stay bound to it).
+ */
+test('transport: a configured stateDir reaches the wake machine', async () => {
+  const dir = await tmpDir();
+  const wakeAt = iso(Date.now() + 120_000);
+  const seed = await openStore(dir, ROOT_ID);
+  await seed.write({
+    version: 1,
+    rootId: ROOT_ID,
+    generation: 1,
+    state: 'paused',
+    reason: 'threshold',
+    updatedAt: iso(Date.now() - 1_000),
+    wakeAt,
+    backoffIndex: 1,
+    quorum: ['commandcode:provider'],
+    checkpoints: [{ id: 'cp', digest: 'deadbeef', generation: 1 }],
+  }, null);
+  await seed.close();
+
+  const { prototype } = fakeRuntime();
+  const registered: string[] = [];
+  const host: QuotaGuardHost = {
+    rootId: ROOT_ID,
+    hookSource: hookSource(prototype),
+    registerCommand: (name) => { registered.push(name); },
+  };
+
+  setQuotaGuardEnabled(true);
+  quotaGuardExtension(host, { stateDir: dir });
+  await flush();
+  await settle(() => host.wake !== undefined && quotaGuardControls()?.status().wake !== null);
+
+  const wake = quotaGuardControls()?.status().wake;
+  assert.equal(wake?.state, 'paused', 'the configured stateDir must be the one the wake machine reads');
+  assert.equal(wake?.wakeAt, wakeAt, 'the persisted deadline must be reinstated from that directory');
+  assert.deepEqual(registered, ['quota-guard'], 'the command must stay bound to the original host');
+});
+
+test('transport: configured codexLimits reach the codex attempt scope', async () => {
+  const gates: { providerId: string; codexLimits?: unknown }[] = [];
+  const coordinator = {
+    gatedFetch: (scope: { providerId: string; codexLimits?: unknown }) => async () => {
+      gates.push(scope);
+      return new Response('gated', { status: 200 });
+    },
+    pause: () => {},
+  };
+  // The original dispatches through the fetch the guard injected; that is the only moment identity
+  // is resolved and the meter scope is consumed.
+  const dispatch = function (this: unknown, _model: unknown, _ctx: unknown, options: { fetch: typeof fetch }) {
+    return options.fetch('https://chatgpt.com/backend-api/wham/usage', {});
+  };
+  const runtime = { stream: dispatch, streamSimple: dispatch };
+  const host: QuotaGuardHost = { rootId: ROOT_ID, runtime, coordinator };
+  const limits = [{ id: 'codex', windows: ['primary_window'] as const }];
+  const model = { provider: 'openai-codex', api: 'openai-codex-responses' };
+  const receiver = { getAuth: async () => ({ auth: { apiKey: 'k', headers: { 'chatgpt-account-id': 'acct' } } }) };
+
+  setQuotaGuardEnabled(true);
+  quotaGuardExtension(host, { codexLimits: limits });
+  await runtime.stream.call(receiver, model, undefined, {});
+
+  assert.equal(gates.length, 1, 'the codex attempt must reach the gate, not be refused for a missing scope');
+  assert.equal(gates[0].providerId, 'openai-codex');
+  assert.deepEqual(gates[0].codexLimits, limits, 'the configured scope must be what the guard reads');
+
+  // The contrast: the same host without the configured scope still refuses.
+  await resetQuotaGuardStateForTest();
+  setQuotaGuardEnabled(true);
+  const bare: QuotaGuardHost = { rootId: ROOT_ID, runtime: { stream: dispatch, streamSimple: dispatch }, coordinator };
+  quotaGuardExtension(bare);
+  await assert.rejects(
+    () => (bare.runtime?.stream as (this: unknown, ...args: unknown[]) => unknown).call(receiver, model, undefined, {}),
+    /no verified Codex meter scope configured/,
+  );
+});

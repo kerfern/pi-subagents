@@ -148,8 +148,8 @@ In a session:
 /quota-guard enable
 ```
 
-For Codex, a caller must also supply the verified meter scope (`codexLimits`) — without it a Codex
-attempt is refused rather than attributed to the wrong window.
+For Codex, set the verified meter scope (`quotaGuardCodexLimits`) too — without it a Codex attempt
+is refused rather than attributed to the wrong window.
 
 ## First run — what to expect
 
@@ -169,7 +169,7 @@ out of up to five, ignoring refills — a decrease, or a change of scope or rese
 and starts over. Until then, waiting and retrying is the intended path, not a stuck session; each
 retry gives the estimator another observation, and nothing is dispatched unguarded in the meantime.
 
-**Codex needs its meter scope supplied.** `codexLimits` is the set of verified meter ids and windows
+**Codex needs its meter scope supplied.** `quotaGuardCodexLimits` is the set of verified meter ids and windows
 for the account — which metered features are real, and that each is read from `primary_window` and
 `secondary_window`. The meter ids come from the account's own usage response, and the guard
 deliberately does not guess them: without the scope it cannot attribute a read to the right window, so
@@ -197,7 +197,10 @@ The feature is called the **quota guard**. Two names matter:
 ```jsonc
 {
   "quotaGuardEnabled": true,
-  "stateDir": "/absolute/path/to/quota-guard-state"   // optional; see below
+  // Optional, and both are read once at extension load. The keys are the settings names, not the
+  // guard's internal host-field names.
+  "quotaGuardStateDir": "/absolute/path/to/quota-guard-state",
+  "quotaGuardCodexLimits": [{ "id": "codex", "windows": ["primary_window", "secondary_window"] }]
 }
 ```
 
@@ -219,7 +222,7 @@ Check it took effect:
 
 **Two optional keys, and what happens without them:**
 
-- `stateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, checkpoints and backoff survive a restart and `status.wake` is real. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure.
-- `codexLimits` — the verified Codex meter scope. Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
+- `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, checkpoints and backoff survive a restart and `status.wake` is real. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
+- `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
 
 **Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` reopens only if a fresh check passes; `/quota-guard enable` re-asserts the switch in-session.

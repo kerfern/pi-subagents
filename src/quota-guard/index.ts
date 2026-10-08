@@ -162,13 +162,14 @@ function resolveCoordinator(host: QuotaGuardHost): GatedCoordinator | undefined 
   return rootBinding.coordinator;
 }
 
-function install(host: QuotaGuardHost): void {
+function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   const coordinator = resolveCoordinator(host);
   if (!coordinator) return;
   // The hook path has no host-supplied handle, so lend it the root's own latch: state, active
   // counts and manual pause/resume all read from it. Without this the controls report 'unknown'.
   if (!host.fleet && rootBinding) host.fleet = rootBinding.fleet;
-  resolveWake(host);
+  const codexLimits = host.codexLimits ?? config?.codexLimits;
+  resolveWake(host, config);
   const runtime = host.runtime;
   if (runtime && typeof runtime.stream === 'function' && typeof runtime.streamSimple === 'function') {
     if (bindings.has(runtime)) return;
@@ -176,7 +177,7 @@ function install(host: QuotaGuardHost): void {
       runtime,
       rootId: rootIdOf(host),
       coordinator,
-      ...(host.codexLimits ? { codexLimits: host.codexLimits } : {}),
+      ...(codexLimits ? { codexLimits } : {}),
     }));
     return;
   }
@@ -198,7 +199,7 @@ function install(host: QuotaGuardHost): void {
   void installGuardedRuntimeViaHook({
     coordinator,
     rootId: rootIdOf(host),
-    ...(host.codexLimits ? { codexLimits: host.codexLimits } : {}),
+    ...(codexLimits ? { codexLimits } : {}),
     ...(host.hookSource !== undefined ? { source: host.hookSource } : {}),
   }).then(
     (dispose: () => void) => bind(host, hookBindingKey, dispose),
@@ -221,12 +222,12 @@ function rootIdOf(host: QuotaGuardHost): string {
  * Without `stateDir` the guard gates exactly as before and `status.wake` stays `null`: that is a
  * documented limitation - there is nowhere durable to record a deadline - not a silent failure.
  */
-function resolveWake(host: QuotaGuardHost): void {
-  if (rootWake || rootWakeInit || !host.stateDir) return;
+function resolveWake(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
+  const stateDir = host.stateDir ?? config?.stateDir;
+  if (rootWake || rootWakeInit || !stateDir) return;
   const fleet = rootBinding?.fleet;
   // A host-supplied coordinator is not paired with a root latch, so there is nothing to wake.
   if (!fleet) return;
-  const stateDir = host.stateDir;
   const rootId = rootIdOf(host);
   rootWakeInit = (async () => {
     try {
@@ -322,10 +323,27 @@ function registerCommand(host: QuotaGuardHost): void {
 }
 
 /**
+ * Configuration the guard reads off the host, transported from the persisted settings.
+ *
+ * These are the two fields `QuotaGuardHost` declares but the pi API object does not carry, so they
+ * arrive as an explicit second argument rather than by mutating the API object: the host identity
+ * is what `commanded`/`bindings` key on, and rewriting it would lose that identity.
+ */
+export interface QuotaGuardConfig {
+  /** Durable state directory for the wake machine; must be absolute. */
+  stateDir?: string;
+  /** Verified Codex meter scope. Absent means a Codex attempt is refused, never misattributed. */
+  codexLimits?: readonly CodexLimit[];
+}
+
+/**
  * Entry point. Inert unless `quotaGuardEnabled` is true: the enabled check is
  * the very first statement, so a disabled call cannot touch the host at all.
+ *
+ * `config` supplies what the host object cannot (see `QuotaGuardConfig`). A value the host already
+ * carries wins, so an explicit host field is never overwritten by the settings.
  */
-export function quotaGuardExtension(host: unknown): void {
+export function quotaGuardExtension(host: unknown, config?: QuotaGuardConfig): void {
   if (!enabled) return;
   if (!host || typeof host !== 'object') return;
   const h = host as QuotaGuardHost;
@@ -333,7 +351,7 @@ export function quotaGuardExtension(host: unknown): void {
     commanded.add(h);
     registerCommand(h);
   }
-  install(h);
+  install(h, config);
 }
 
 /** Controls for a bound runtime, or the most recent binding when omitted. */
