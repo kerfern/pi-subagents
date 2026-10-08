@@ -23,6 +23,13 @@ export interface RootBinding {
   coordinator: GuardCoordinator;
   fleet: FleetLatch;
   estimator: ReserveEstimator;
+  /**
+   * The check a manual resume must pass. It reads quota through the coordinator's own `readQuota` and
+   * estimator, so calibration progresses while the fleet is paused instead of deadlocking in `admit`.
+   * Only the scopes the guard has actually seen can be re-checked - the estimator is keyed by lane and
+   * `AccountFifo.lanes` is private, so an arbitrary known scope cannot be enumerated from here.
+   */
+  freshCheck: () => Promise<boolean>;
 }
 
 export function createQuotaGuardCoordinator(options: RootBindingOptions): RootBinding {
@@ -44,5 +51,5 @@ export function createQuotaGuardCoordinator(options: RootBindingOptions): RootBi
     now: options.now ?? Date.now,
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
   });
-  return { coordinator, fleet, estimator };
+  return { coordinator, fleet, estimator, freshCheck: () => coordinator.freshCheck() };
 }

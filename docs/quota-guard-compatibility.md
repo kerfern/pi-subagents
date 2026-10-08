@@ -77,6 +77,12 @@ function of a host descriptor — it makes no request and reads no credentials.
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
+- A fresh check can only re-read scopes the guard has **actually seen**. The reserve estimator is
+  keyed by lane and the account FIFO's lane set is private, so the guard retains the last scope it was
+  handed (credential included, in memory only) and re-reads *that* one on a manual resume. It cannot
+  enumerate every scope that might exist, and it never guesses one: a resume before any attempt has
+  reached `admit` finds no retained scope and refuses, which is the honest answer rather than a check
+  against a scope nobody verified.
 
 ## Certifying against live quotas (operator-authorised)
 
@@ -225,4 +231,4 @@ Check it took effect:
 - `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, checkpoints and backoff survive a restart and `status.wake` is real. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
 
-**Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` reopens only if a fresh check passes; `/quota-guard enable` re-asserts the switch in-session.
+**Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` re-reads quota for the last scope the guard saw with the same reader and estimator it gates with, so a paused guard can calibrate and reopen; `/quota-guard enable` re-asserts the switch in-session. The check runs *outside* dispatch, which is what breaks the old deadlock where the only observation happened inside `admit` and `admit` itself blocked on the pause. It reopens only on a verified, in-policy read for every window the guard has seen; an unreadable read, an uncalibrated reserve, or no retained scope keeps it closed. Because only observed scopes can be re-checked, a resume before any attempt has reached `admit` is refused.

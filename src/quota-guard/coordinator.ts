@@ -147,10 +147,52 @@ function terminalStream(body: ReadableStream<Uint8Array>, release: Release): Rea
 
 export class GuardCoordinator {
   private readonly deps: CoordinatorDeps;
+  /**
+   * The most recently resolved attempt scope, with its credential. Retained so a manual or wake resume
+   * can read quota OUTSIDE dispatch: the observation that calibrates a reserve otherwise only ever
+   * happened inside `admit`, which blocks on the very pause it would have to lift (deadlock).
+   *
+   * Enumeration limit: the estimator is keyed by lane and `AccountFifo.lanes` is private, so only a
+   * scope the guard has actually seen can be re-checked - not every scope that might exist.
+   *
+   * Never persisted, logged or exposed through `status()`: the credential lives here and nowhere else.
+   */
+  private held?: { attempt: AttemptScope; lane: string };
   constructor(deps: CoordinatorDeps) { this.deps = deps; }
 
   /** Public fail-closed latch: pauses the shared fleet for a given reason without exposing it. */
   pause(reason: PauseReason): void { this.deps.fleet.pause(reason); }
+
+  /**
+   * The real `freshCheck` behind `resume()`: re-reads quota for the retained scope with the SAME
+   * `readQuota` and the same estimator instance the coordinator gates with, so a paused guard can
+   * advance calibration and reopen only on a verified, in-policy read.
+   *
+   * Fail closed: no retained scope, an unreadable read, or any window whose reserve is still unknown
+   * (the estimator returns null) keeps the guard closed. Never true on an unverified read.
+   */
+  async freshCheck(): Promise<boolean> {
+    const held = this.held;
+    if (!held) return false;
+    const { readQuota: read, policy, mode, reserve, now, fetchImpl } = this.deps;
+    const { attempt, lane } = held;
+    const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
+      ...(attempt.accountId && { accountId: attempt.accountId }), apiKey: attempt.credential,
+      ...(attempt.codexLimits && { codexLimits: attempt.codexLimits }) };
+    const options: ReadOptions = { ...(fetchImpl && { fetchImpl }), now,
+      ...(attempt.codexBase && { codexBase: attempt.codexBase }) };
+    let snapshot: QuotaSnapshot;
+    try {
+      snapshot = await read(auth, options);
+    } catch {
+      return false;
+    }
+    try {
+      return ['open', 'warn'].includes(assess(snapshot, policy, mode(), reserve(lane, snapshot), now()).state);
+    } catch {
+      return false;
+    }
+  }
 
   async admit(scope: AttemptScope, signal?: AbortSignal): Promise<Release> {
     const { fifo, fleet, readQuota: read, policy, mode, reserve, now, fetchImpl } = this.deps;
@@ -164,6 +206,8 @@ export class GuardCoordinator {
       fleet.pause('identity');
       throw error instanceof QuotaError ? error : new QuotaError('auth');
     }
+    // Retained before the pause wait: a check must be runnable while dispatch is blocked.
+    this.held = { attempt, lane };
     await fleet.wait(signal);
     const releaseLane = await fifo.enter(lane, signal);
     // Decided again whenever the fleet generation moved under the decision. Waiting before every

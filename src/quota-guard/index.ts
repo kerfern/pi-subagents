@@ -168,6 +168,10 @@ function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   // The hook path has no host-supplied handle, so lend it the root's own latch: state, active
   // counts and manual pause/resume all read from it. Without this the controls report 'unknown'.
   if (!host.fleet && rootBinding) host.fleet = rootBinding.fleet;
+  // The real check a manual resume needs. Only lent when this root is the one that built the
+  // coordinator: a host-supplied coordinator keeps its own check, and reading quota through a
+  // different coordinator's estimator would calibrate the wrong lane.
+  if (rootBinding && coordinator === rootBinding.coordinator) host.freshCheck ??= rootBinding.freshCheck;
   const codexLimits = host.codexLimits ?? config?.codexLimits;
   resolveWake(host, config);
   const runtime = host.runtime;

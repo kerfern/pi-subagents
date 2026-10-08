@@ -11,7 +11,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -52,6 +52,56 @@ function fakeRuntime() {
   const originalSimple = async () => 'simple';
   const prototype: Record<string, unknown> = { stream: originalStream, streamSimple: originalSimple };
   return { prototype, originalStream, originalSimple };
+}
+
+/** The credential the retained scope carries; no durable artifact, log or status may ever show it. */
+const CREDENTIAL = 'cc-credential-secret-xyz';
+
+/** An attempt scope the guard retains; CommandCode is provider-wide, so no account id is needed. */
+const commandcodeAttempt = () => ({ providerId: 'commandcode', scope: 'provider', credential: CREDENTIAL } as const);
+
+/**
+ * One CommandCode billing level: monthly credits plus the rolling windows, all in the payload shapes
+ * `readQuota` accepts. Mutating the object between reads is how a test moves real usage.
+ */
+function commandcodeFetch(level: { monthly: number; rolling: number }): typeof fetch {
+  // One reset epoch for the whole level: a real quota window's reset does not move between reads, and
+  // the estimator resets its samples on any resetAt change, so a per-request timestamp would hide
+  // every delta.
+  const resetAt = iso(Date.now() + 3_600_000);
+  return (async (input: string | URL | Request) => {
+    const json = (payload: unknown) => new Response(JSON.stringify(payload), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+    if (String(input).endsWith('/alpha/billing/credits')) {
+      return json({
+        credits: { monthlyCredits: 70 - level.monthly },
+        windowLimits: {
+          fiveHour: { used: level.rolling, cap: 100, exceeded: false, resetAt },
+          weekly: { used: level.rolling, cap: 100, exceeded: false, resetAt },
+        },
+      });
+    }
+    return json({ data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: resetAt } });
+  }) as unknown as typeof fetch;
+}
+
+/** Enabled guard over a hook, with the given transport, so the real production wiring is exercised. */
+async function enabledHost(fetchImpl: typeof fetch, extra: Partial<QuotaGuardHost> = {}): Promise<QuotaGuardHost> {
+  const host: QuotaGuardHost = { rootId: ROOT_ID, fetchImpl, hookSource: hookSource(fakeRuntime().prototype), ...extra };
+  setQuotaGuardEnabled(true);
+  quotaGuardExtension(host);
+  await flush();
+  return host;
+}
+
+/** Every durable byte under a store directory, so a secret cannot hide in a manifest or sidecar. */
+async function durableText(dir: string): Promise<string> {
+  let text = '';
+  for (const name of await readdir(dir, { recursive: true })) {
+    text += await readFile(join(dir, name), 'utf8').catch(() => '');
+  }
+  return text;
 }
 
 /** A published harness hook handing over `prototype`, recording each install call. */
@@ -301,6 +351,121 @@ test('without stateDir wake stays null and gating is unaffected', async () => {
   assert.equal(controls.status().state, 'paused', 'pause must still drive the shared latch');
   await flush();
   assert.deepEqual(output, [], 'the documented no-stateDir limitation must not log as a failure');
+});
+
+/**
+ * Manual resume was dead: `freshCheck` was never assigned in production, so `resume()` returned false
+ * unconditionally, and a paused guard could neither be resumed nor calibrate its own reserve (the
+ * observation only ever happened inside `admit`, which blocks on the pause). These pin the real check.
+ */
+test('resume: unchanged usage leaves the reserve unknown, so the fleet stays paused', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  const host = await enabledHost(commandcodeFetch(level));
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding, 'the install must build a root binding');
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().reason, 'reserve', 'an unknown reserve must pause the fleet');
+
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), false, 'an unmoved usage counter must never calibrate a reserve');
+  assert.equal(binding.fleet.snapshot().state, 'paused', 'the fleet must stay closed');
+  assert.equal(host.freshCheck !== undefined, true, 'the binding must publish a real fresh check');
+});
+
+test('resume: genuine usage movement calibrates the reserve and reopens the fleet', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  await enabledHost(commandcodeFetch(level));
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+
+  level.monthly = 5; level.rolling = 5;
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), true, 'a moved window must yield a verified, in-policy reserve');
+  assert.equal(binding.fleet.snapshot().state, 'open', 'a passing check must reopen the fleet');
+});
+
+test('resume: one unmoved window keeps the reserve unknown, so resume stays false', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  await enabledHost(commandcodeFetch(level));
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+
+  // Only one of the three tracked windows moves; the other two must still refuse the resume.
+  level.monthly = 5;
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), false, 'every window must pass, not just the moved one');
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+});
+
+test('resume: an unreadable retained scope fails closed', async () => {
+  const level = { monthly: 1, rolling: 1 };
+  const good = commandcodeFetch(level);
+  let healthy = true;
+  const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => (healthy
+    ? good(input, init)
+    : Promise.resolve(new Response('nope', { status: 503 })))) as unknown as typeof fetch;
+  await enabledHost(fetchImpl);
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+
+  healthy = false;
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), false, 'an unreadable quota must never reopen the guard');
+  assert.equal(binding.fleet.snapshot().state, 'paused');
+});
+
+test('secrets: the retained scope never reaches a durable manifest, the log or status()', async () => {
+  const dir = await tmpDir();
+  const wakeAt = iso(Date.now() + 90_000);
+  const seed = await openStore(dir, ROOT_ID);
+  await seed.write({
+    version: 1,
+    rootId: ROOT_ID,
+    generation: 1,
+    state: 'paused',
+    reason: 'reserve',
+    updatedAt: iso(Date.now() - 1_000),
+    wakeAt,
+    backoffIndex: 1,
+    quorum: ['commandcode:provider'],
+    checkpoints: [{ id: 'cp', digest: 'deadbeef', generation: 1 }],
+  }, null);
+  await seed.close();
+
+  const level = { monthly: 1, rolling: 1 };
+  const host = await enabledHost(commandcodeFetch(level), { stateDir: dir });
+  await settle(() => host.wake !== undefined && quotaGuardControls()?.status().wake !== null);
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  // The scope is retained before the paused wait, so a check can run outside dispatch.
+  const admitted = binding.coordinator.admit(commandcodeAttempt());
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(await controls.resume(), false, 'the first observation cannot calibrate a reserve');
+  level.monthly = 5; level.rolling = 5;
+  assert.equal(await controls.resume(), true, 'the second, moved observation must calibrate and reopen');
+  const release = await admitted;
+  release();
+
+  const raw = await durableText(dir);
+  assert.ok(raw.includes('commandcode:provider'), 'the scanned manifest must be the real durable record');
+  assert.equal(raw.includes(CREDENTIAL), false, 'no durable file may carry the credential');
+  assert.equal(JSON.stringify(controls.status()).includes(CREDENTIAL), false, 'status() must stay secret-free');
+  assert.equal(output.join('\n').includes(CREDENTIAL), false, 'the credential must never be logged');
 });
 
 /**
