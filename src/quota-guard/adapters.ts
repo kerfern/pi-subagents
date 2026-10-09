@@ -62,8 +62,13 @@ function instant(value: unknown): string {
 }
 // Verified first-party Codex origin; anything else is rejected before any request.
 const CODEX_ORIGINS: ReadonlySet<string> = new Set(['https://chatgpt.com']);
-const CODEX_USAGE_BASE = 'https://chatgpt.com/backend-api';
+export const CODEX_USAGE_BASE = 'https://chatgpt.com/backend-api';
 const COMMANDCODE_ORIGIN = 'https://api.commandcode.ai';
+/** The two CommandCode billing endpoints, spelled out once: the adapter requests them, the plan reuses them. */
+export const COMMANDCODE_ENDPOINTS = Object.freeze({
+  credits: `${COMMANDCODE_ORIGIN}/alpha/billing/credits`,
+  subscriptions: `${COMMANDCODE_ORIGIN}/alpha/billing/subscriptions`,
+});
 /** Pinned first-party inference destinations; the request gate rejects every other origin. */
 export const FIRST_PARTY_ORIGINS: Readonly<Record<GuardedProvider, ReadonlySet<string>>> = Object.freeze({
   'openai-codex': CODEX_ORIGINS,
@@ -218,7 +223,7 @@ export async function readQuota(auth: QuotaAuth, options: ReadOptions = {}): Pro
     return normalizeCodex(payload, auth, auth.codexLimits, now());
   }
   if (auth.providerId !== 'commandcode') throw new QuotaError('auth');
-  const credits = await getJSON(`${COMMANDCODE_ORIGIN}/alpha/billing/credits`, auth, options);
-  const subscriptions = await getJSON(`${COMMANDCODE_ORIGIN}/alpha/billing/subscriptions`, auth, options);
+  const credits = await getJSON(COMMANDCODE_ENDPOINTS.credits, auth, options);
+  const subscriptions = await getJSON(COMMANDCODE_ENDPOINTS.subscriptions, auth, options);
   return normalizeCommandCode(credits, subscriptions, auth, now());
 }

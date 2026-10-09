@@ -13,11 +13,16 @@
 // reads auth.json, settings.json, the keychain, or anything under ~/.pi. See
 // docs/quota-guard-compatibility.md.
 import { pathToFileURL } from 'node:url';
-import { codexUsageUrl, FIRST_PARTY_ORIGINS, QuotaError, readQuota } from '../src/quota-guard/adapters.ts';
+import {
+	codexUsageUrl,
+	CODEX_USAGE_BASE,
+	COMMANDCODE_ENDPOINTS,
+	FIRST_PARTY_ORIGINS,
+	QuotaError,
+	readQuota,
+} from '../src/quota-guard/adapters.ts';
 import { laneKey } from '../src/quota-guard/coordinator.ts';
 import { assess, DEFAULT_POLICY, ReserveEstimator } from '../src/quota-guard/policy.ts';
-
-const CODEX_BASE = 'https://chatgpt.com/backend-api';
 
 /** Today's pin is exactly one first-party origin per provider; more than one means the pin moved. */
 function pinnedOrigin(provider) {
@@ -34,10 +39,7 @@ const PROVIDERS = {
 	commandcode: {
 		identity: { providerId: 'commandcode', scope: 'provider' },
 		variables: [['COMMANDCODE_API_KEY', 'the CommandCode API key, sent as a bearer token']],
-		endpoints: [
-			`${pinnedOrigin('commandcode')}/alpha/billing/credits`,
-			`${pinnedOrigin('commandcode')}/alpha/billing/subscriptions`,
-		],
+		endpoints: [COMMANDCODE_ENDPOINTS.credits, COMMANDCODE_ENDPOINTS.subscriptions],
 	},
 	codex: {
 		identity: { providerId: 'openai-codex', scope: 'account' },
@@ -49,14 +51,28 @@ const PROVIDERS = {
 				'the verified meter scope, JSON: [{"id":"codex","windows":["primary_window","secondary_window"]}]',
 			],
 		],
-		endpoints: [codexUsageUrl(CODEX_BASE)],
+		endpoints: [codexUsageUrl(CODEX_USAGE_BASE)],
 	},
 };
 
+// The endpoint literals live in the adapter, so the plan cannot drift from what the adapter requests.
+// The pin is still checked here: a moved first-party origin must fail the plan, not the first GET.
+for (const spec of Object.values(PROVIDERS)) pinnedOrigin(spec.identity.providerId);
+
 const USAGE = [
 	'usage: node quota-guard/certify-live.mjs [--dry-run] <commandcode|codex>',
-	'  --dry-run  validate the environment and print the pinned origins and paths, sending nothing',
+	'  --dry-run  check the environment is ready and print the pinned origins and paths, sending nothing',
+	'  the credential comes from the environment (export it), never from an argument',
 ];
+
+// Long, high-entropy, or known-prefix operands are key material: detect the shape so it is reported,
+// never echoed. An operator who passes the key positionally instead of exporting it must not have it
+// land in scrollback, CI logs, or a pasted bug report.
+const CREDENTIAL_PREFIX = /^(?:sk-|sk_live_|sk_test_|xox[baprs]-|gh[pousr]_|github_pat_|AIza[0-9A-Za-z_-]{10}|ya29\.|AKIA[0-9A-Z]{16}|npm_[0-9A-Za-z]{20})/;
+function looksLikeCredential(value) {
+	if (CREDENTIAL_PREFIX.test(value)) return true;
+	return value.length >= 20 && new Set(value).size >= 8 && /^[\u0021-\u007e]+$/.test(value);
+}
 
 /**
  * Shape-checks CODEX_LIMITS before any request. The adapter re-validates the scope after the response,
@@ -135,11 +151,15 @@ export async function main({
 	const flags = argv.filter((argument) => argument.startsWith('-') && argument !== '--dry-run');
 	const provider = operands.length === 1 && !flags.length ? operands[0] : undefined;
 	if (!provider || !Object.hasOwn(PROVIDERS, provider)) {
-		const reason = provider
-			? `unknown provider "${provider}"`
-			: flags.length
-				? `unrecognised flag "${flags[0]}"`
-				: 'no provider given';
+		const reason = [...operands, ...flags].some(looksLikeCredential)
+			? 'the operand looks like a credential, not a provider name - the key belongs in the environment variable (export it), not on the command line'
+			: provider
+				? 'unknown provider (the single operand is not one of the pinned providers)'
+				: operands.length > 1
+					? 'expected exactly one provider operand'
+					: flags.length
+						? 'unrecognised flag (only --dry-run is accepted)'
+						: 'no provider given';
 		fail(`refused: ${reason}; refusing to guess which quota to certify`);
 		for (const line of USAGE) fail(line);
 		return 2;
@@ -148,7 +168,11 @@ export async function main({
 	const spec = PROVIDERS[provider];
 	const { auth, problems } = environment(provider, env);
 	log(`Quota guard live certification - ${provider} (read-only, operator-authorised)`);
-	log(`identity: provider=${auth.providerId} scope=${auth.scope}${auth.scope === 'account' ? ' account=present' : ''}`);
+	// The scope shape, not a resolved identity: an account-scoped read still has to send the accountId,
+	// and nothing here proves the account exists.
+	log(
+		`identity: provider=${auth.providerId} scope=${auth.scope} (${auth.scope} scope shape: the scope the guard will ask with, not an identity it resolved or verified here)`,
+	);
 	log(`${spec.endpoints.length} pinned endpoint(s), one GET each:`);
 	for (const endpoint of spec.endpoints) {
 		const url = new URL(endpoint);
@@ -176,7 +200,7 @@ export async function main({
 	try {
 		snapshot = await readQuota(auth, {
 			fetchImpl: counted,
-			...(provider === 'codex' ? { codexBase: CODEX_BASE } : {}),
+			...(provider === 'codex' ? { codexBase: CODEX_USAGE_BASE } : {}),
 		});
 	} catch (error) {
 		// A QuotaError carries a fixed code and a sanitised message. Anything else is reported by name
@@ -215,7 +239,13 @@ export async function main({
 		return 1;
 	}
 
-	log('certified: yes - the windows and caps above are as the provider reported them');
+	// Provider accuracy matters here: only the plan, remaining credits, rolling windows and resets come
+	// from a CommandCode response. The monthly cap is looked up in the guard's own pool table by planId.
+	log(
+		provider === 'commandcode'
+			? "certified: yes - the provider reported the plan, the rolling windows and resets, and the remaining monthly credits above; the monthly cap did not come from the response - it came from the guard's own COMMANDCODE_MONTHLY_POOLS table, keyed by that plan"
+			: "certified: yes - the provider reported the windows above; the 100% cap is the guard's percent scale, not a provider-supplied number",
+	);
 	return 0;
 }
 

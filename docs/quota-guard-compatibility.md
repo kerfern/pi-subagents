@@ -125,12 +125,13 @@ how many requests it made.
   injects a fake transport and asserts that nothing is sent — not by CI, and not by `prepublishOnly`.
 - **Refuses rather than guesses.** No provider, an unknown provider, or a missing credential is a
   refusal that names the variable, never a fallback, and a malformed meter scope is refused before any
-  request, so a typo cannot spend one.
+  request, so a typo cannot spend one. A refused argument is reported by shape and never echoed: a key
+  passed positionally instead of exported cannot land in scrollback, CI logs, or a pasted bug report.
 
 Run it from the repository root, with the credential exported in that shell only:
 
 ```bash
-node quota-guard/certify-live.mjs --dry-run commandcode   # validate only: prints origins/paths, sends nothing
+node quota-guard/certify-live.mjs --dry-run commandcode   # readiness only: prints origins/paths, sends nothing
 node quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
 node quota-guard/certify-live.mjs codex
 ```
@@ -144,13 +145,27 @@ node quota-guard/certify-live.mjs codex
 meter ids come from the account's own usage response and the guard does not guess them, so a
 certification that supplied none could not attribute a read to a window.
 
-`--dry-run` prints that plan and exits non-zero when a variable is missing, so it doubles as a
-readiness check. The live run exits non-zero on any refusal, which is what makes it usable as a check
-rather than an observation. Exit codes: `0` certified, `1` refused or failed, `2` usage.
+Certification proves exactly one thing: that the adapters' pinned origins, headers, deadline and
+parsing still agree with the provider's live schema, so the numbers it prints are the ones the provider
+returned. It proves nothing beyond that.
+
+- **Not reserve calibration.** The run builds a fresh estimator, so every window comes back
+  `unknown (one read)`; a certification says nothing about how much headroom the guard will hold back.
+- **Not dispatch coverage.** It reads quota directly. No `admit`, no dispatch, no wake, and no host
+  binding is exercised.
+
+For CommandCode the monthly cap is not one of the provider-reported fields. The provider reports the
+plan, the remaining monthly credits, the rolling windows and their resets; the cap is looked up in the
+guard's own `COMMANDCODE_MONTHLY_POOLS` table by that plan, and the success line says so.
+
+`--dry-run` sends nothing, so it verifies nothing: it prints the plan and exits non-zero when a
+variable is missing, and is a readiness check only. The live run exits non-zero on any refusal, which
+is what makes it usable as a check rather than an observation. Exit codes: `0` certified, `1` refused
+or failed, `2` usage.
 
 | Outcome | What it means | What to do |
 | --- | --- | --- |
-| The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows and caps as real: the reserve estimator and the thresholds become meaningful against them. Certify again after a provider or host upgrade. |
+| The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows as real. For CommandCode the monthly cap is the guard's own table entry for the reported plan, not a provider number. The reserve stays uncalibrated: one read cannot size it. Certify again after a provider or host upgrade. |
 | A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. Report the code and the provider, never the credential. |
 
 ## Enabling the guard

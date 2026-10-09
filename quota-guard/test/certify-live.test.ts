@@ -2,6 +2,7 @@
 // the credential is a synthetic string, and the assertions include that nothing was sent.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { codexUsageUrl, CODEX_USAGE_BASE, COMMANDCODE_ENDPOINTS } from '../../src/quota-guard/adapters.ts';
 import { main } from '../certify-live.mjs';
 
 const SECRET = 'fixture-secret-key';
@@ -65,7 +66,8 @@ test('refuses instead of guessing which quota to certify', async () => {
   const unknown = harness(route);
   assert.equal(await unknown.run(['openai'], credentials), 2);
   assert.equal(unknown.urls.length, 0);
-  assert.match(output(unknown), /unknown provider "openai"/);
+  assert.match(output(unknown), /unknown provider/);
+  assert.ok(!output(unknown).includes('openai'));
   const unparsed = harness(route);
   assert.equal(await unparsed.run(['--dry-run'], credentials), 2);
   assert.match(output(unparsed), /no provider given/);
@@ -87,10 +89,8 @@ test('names the environment variable each provider needs when the credential is 
 test('dry run prints the pinned origins and paths, and transports nothing', async () => {
   const ready = harness(route);
   assert.equal(await ready.run(['--dry-run', 'commandcode'], credentials), 0);
-  assert.deepEqual(planned(ready), [
-    'https://api.commandcode.ai/alpha/billing/credits',
-    'https://api.commandcode.ai/alpha/billing/subscriptions',
-  ]);
+  // Imported from the adapter, not re-typed: the plan and the adapter's own requests cannot drift.
+  assert.deepEqual(planned(ready), [COMMANDCODE_ENDPOINTS.credits, COMMANDCODE_ENDPOINTS.subscriptions]);
   assert.match(output(ready), /dry run: nothing sent/);
   assert.equal(ready.urls.length, 0);
   // The dry run doubles as a readiness check: the plan prints, and a missing variable is non-zero.
@@ -101,7 +101,7 @@ test('dry run prints the pinned origins and paths, and transports nothing', asyn
   assert.match(output(unready), /COMMANDCODE_API_KEY/);
   const codex = harness(route);
   assert.equal(await codex.run(['--dry-run', 'codex'], credentials), 0);
-  assert.deepEqual(planned(codex), ['https://chatgpt.com/backend-api/wham/usage']);
+  assert.deepEqual(planned(codex), [codexUsageUrl(CODEX_USAGE_BASE)]);
   assert.equal(codex.urls.length, 0);
 });
 
@@ -157,6 +157,54 @@ test('a certified read prints the windows, reserve state and request count', asy
   assert.ok(!output(codex).includes('acct'));
   assert.ok(!output(commandcode).includes(SECRET));
   assert.ok(!output(codex).includes(SECRET));
+});
+
+test('never echoes a credential-shaped operand or flag', async () => {
+  const key = 'sk-live-0123456789abcdef0123456789';
+  const cases: string[][] = [[key], [`--token=${key}`], ['commandcode', key]];
+  for (const argv of cases) {
+    const run = harness(route);
+    assert.equal(await run.run(argv, credentials), 2);
+    assert.equal(run.urls.length, 0);
+    assert.ok(!output(run).includes(key));
+    assert.match(output(run), /looks like a credential/);
+    assert.match(output(run), /environment variable/);
+  }
+  // A non-credential operand or flag is reported by shape too, never by value.
+  const unknown = harness(route);
+  assert.equal(await unknown.run(['not-a-provider'], credentials), 2);
+  assert.ok(!output(unknown).includes('not-a-provider'));
+  assert.match(output(unknown), /unknown provider/);
+  const flag = harness(route);
+  assert.equal(await flag.run(['codex', '--nope'], credentials), 2);
+  assert.ok(!output(flag).includes('--nope'));
+  assert.match(output(flag), /unrecognised flag/);
+  assert.equal(flag.urls.length, 0);
+});
+
+test('the identity line reports the scope shape, not a resolved identity', async () => {
+  const codex = harness(route);
+  assert.equal(await codex.run(['--dry-run', 'codex'], credentials), 0);
+  assert.match(output(codex), /scope=account/);
+  assert.match(output(codex), /scope shape/);
+  assert.ok(!output(codex).includes('account=present'));
+  const commandcode = harness(route);
+  assert.equal(await commandcode.run(['--dry-run', 'commandcode'], credentials), 0);
+  assert.match(output(commandcode), /scope=provider/);
+  assert.ok(!output(commandcode).includes('account=present'));
+});
+
+test('the certified line separates provider-reported fields from the guard tables', async () => {
+  const commandcode = harness(route);
+  assert.equal(await commandcode.run(['commandcode'], credentials), 0);
+  const line = output(commandcode).split('\n').find((row) => row.startsWith('certified:')) ?? '';
+  assert.match(line, /COMMANDCODE_MONTHLY_POOLS/);
+  assert.match(line, /did not come from the response/);
+  assert.ok(!/windows and caps above are as the provider reported them/.test(line));
+  const codex = harness(route);
+  assert.equal(await codex.run(['codex'], credentials), 0);
+  const codexLine = output(codex).split('\n').find((row) => row.startsWith('certified:')) ?? '';
+  assert.match(codexLine, /100% cap is the guard's percent scale/);
 });
 
 test('a malformed CODEX_LIMITS is refused before any request', async () => {
