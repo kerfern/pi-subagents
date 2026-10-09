@@ -80,6 +80,12 @@ export interface QuotaGuardStatus {
   active: number;
   inferences: number;
   coding: number;
+  /**
+   * Providers the guard refuses because it cannot read their quota surface here (HTTP 404 on a quota
+   * route). A diagnostic, not a latch: the fleet stays open for every other provider. Present only
+   * when at least one provider is in that state, so it can never be confused with `state: paused`.
+   */
+  unsupported?: readonly string[];
   wake: { state: string; backoffIndex?: number; wakeAt?: string; durable?: boolean } | null;
 }
 
@@ -116,9 +122,25 @@ const bindings = new WeakMap<object, Binding>();
 const commanded = new WeakSet<object>();
 let lastBinding: Binding | undefined;
 
+/**
+ * Providers the coordinator has refused as unsupported, read through its public accessor.
+ *
+ * A host-supplied coordinator and the root's own are both possible owners; the root's is consulted
+ * when the host carries none, which is the normal case. Read structurally and defensively: this is a
+ * diagnostic on top of a working guard, so an object without the accessor simply reports nothing -
+ * it must never throw out of `status()` and leave an operator with no status at all.
+ */
+function unsupportedOf(host: QuotaGuardHost): readonly string[] {
+  const coordinator: unknown = host.coordinator ?? rootBinding?.coordinator;
+  const read = (coordinator as { unsupportedProviders?: () => readonly string[] } | undefined)?.unsupportedProviders;
+  if (typeof read !== 'function') return [];
+  try { return read.call(coordinator); } catch { return []; }
+}
+
 function statusOf(host: QuotaGuardHost, installed: boolean): QuotaGuardStatus {
   const snap = host.fleet?.snapshot();
   const wake = host.wake?.status() ?? null;
+  const unsupported = unsupportedOf(host);
   return {
     enabled,
     installed,
@@ -127,6 +149,7 @@ function statusOf(host: QuotaGuardHost, installed: boolean): QuotaGuardStatus {
     active: snap?.active ?? 0,
     inferences: snap?.inferences ?? 0,
     coding: snap?.coding ?? 0,
+    ...(unsupported.length ? { unsupported } : {}),
     wake: wake && {
       state: wake.state,
       ...(wake.backoffIndex !== undefined && { backoffIndex: wake.backoffIndex }),
@@ -310,6 +333,8 @@ function describe(status: QuotaGuardStatus): string {
     `state ${status.state}${status.reason ? ` (${status.reason})` : ''}`,
     `active ${status.active} (inference ${status.inferences}, coding ${status.coding})`,
   ];
+  // Reported as its own thing: a provider the guard cannot read is not the same as a paused fleet.
+  if (status.unsupported?.length) parts.push(`unsupported ${status.unsupported.join(', ')}`);
   if (status.wake) {
     parts.push(`wake ${status.wake.state}${status.wake.backoffIndex !== undefined ? ` backoff#${status.wake.backoffIndex}` : ''}${status.wake.wakeAt ? ` @${status.wake.wakeAt}` : ''}${status.wake.durable === false ? ' (not durable)' : ''}`);
   }

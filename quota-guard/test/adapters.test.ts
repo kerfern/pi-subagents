@@ -175,3 +175,42 @@ test('redirects, foreign response URLs, content type, malformed or oversized JSO
   for (const response of responses) await assert.rejects(readQuota(auth('openai-codex'), { now: () => now, fetchImpl: fake(() => response) }),
     (error: unknown) => error instanceof QuotaError && !error.message.includes('evil.example'));
 });
+
+test('a quota route that is not served (404) is its own provider-scoped code, never "unavailable"', async () => {
+  for (const providerId of ['commandcode', 'openai-codex'] as const) {
+    const route = providerId === 'openai-codex' ? 'https://chatgpt.com/backend-api/wham/usage'
+      : 'https://api.commandcode.ai/alpha/billing/credits';
+    const calls: string[] = [];
+    const fetchImpl = fake(url => { calls.push(url); return url === route ? json({}, 404) : json(url.endsWith('credits') ? credits() : subscription()); });
+    const error = await readQuota(auth(providerId), { now: () => now, fetchImpl })
+      .then(() => null, (thrown: unknown) => thrown as QuotaError);
+    assert.equal(error?.code, 'unsupported', `${providerId} 404 must be reported as its own code`);
+    const message = error?.message ?? '';
+    assert.match(message, new RegExp(providerId), 'the refusal must name the provider');
+    assert.ok(message.includes(route), 'the refusal must name the route');
+    assert.match(message, /HTTP 404/, 'the refusal must name the status');
+    assert.match(message, /not served/, 'the routes are not served - never "no API exists"');
+    assert.match(message, /cannot read this provider's quota/, 'the refusal must say why');
+    assert.match(message, /refused while the guard is enabled/, 'the refusal must say dispatch is refused');
+    assert.equal(message.includes('fixture-secret-key'), false);
+    assert.equal(calls.length, 1, 'a 404 on the first quota route must stop the read');
+  }
+  // Either billing route may be the one that is missing: the second is checked too.
+  const error = await readQuota(auth('commandcode'), { now: () => now,
+    fetchImpl: fake(url => (url.endsWith('credits') ? json(credits()) : json({}, 404))) })
+    .then(() => null, (thrown: unknown) => thrown as QuotaError);
+  assert.equal(error?.code, 'unsupported');
+  assert.ok((error?.message ?? '').includes('https://api.commandcode.ai/alpha/billing/subscriptions'));
+});
+
+test('quota status mapping stays exact: 401/403 auth, 429 rate-limited, 5xx and transport errors unavailable', async () => {
+  for (const status of [401, 403]) {
+    await assert.rejects(readQuota(auth('commandcode'), { now: () => now, fetchImpl: fake(() => json({}, status)) }), fail('auth'));
+  }
+  await assert.rejects(readQuota(auth('commandcode'), { now: () => now, fetchImpl: fake(() => json({}, 429)) }), fail('rate-limited'));
+  for (const status of [500, 503]) {
+    await assert.rejects(readQuota(auth('commandcode'), { now: () => now, fetchImpl: fake(() => json({}, status)) }), fail('unavailable'));
+  }
+  await assert.rejects(readQuota(auth('commandcode'), { now: () => now,
+    fetchImpl: fake(() => { throw new TypeError('network down'); }) }), fail('unavailable'));
+});

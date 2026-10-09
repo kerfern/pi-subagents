@@ -158,7 +158,17 @@ export class GuardCoordinator {
    * Never persisted, logged or exposed through `status()`: the credential lives here and nowhere else.
    */
   private held?: { attempt: AttemptScope; lane: string };
+  /**
+   * Providers refused for a reason scoped to THEM rather than to the root: today, a quota surface
+   * that is not served here (HTTP 404). Recorded only so `status()` can say "unsupported" instead of
+   * the far more wrong "unavailable" - it never gates and never pauses anything. Session-scoped, like
+   * every other in-memory record here, and never a licence to dispatch unguarded.
+   */
+  private readonly unsupported = new Set<GuardedProvider>();
   constructor(deps: CoordinatorDeps) { this.deps = deps; }
+
+  /** Providers refused as unsupported (their quota surface is not served here). Sorted, for `status()`. */
+  unsupportedProviders(): readonly GuardedProvider[] { return [...this.unsupported].sort(); }
 
   /** Public fail-closed latch: pauses the shared fleet for a given reason without exposing it. */
   pause(reason: PauseReason): void { this.deps.fleet.pause(reason); }
@@ -231,8 +241,20 @@ export class GuardCoordinator {
       try {
         snapshot = await read(auth, options);
       } catch (error) {
+        const failure = error instanceof QuotaError ? error : new QuotaError('unavailable');
+        // The fleet latch is root-wide, but an `unsupported` read failure is provider-scoped: a
+        // provider whose quota surface is not served here must not lock out every other provider. So
+        // refuse just this attempt - the latch's state, reason and generation stay untouched - and
+        // record the provider for `status()`. Every other failure keeps today's behaviour, including
+        // the fleet pause for `unavailable`, which stays correct for systemic problems (network down,
+        // 5xx). Dispatch is still refused: this is never an unguarded pass-through.
+        if (failure.code === 'unsupported') {
+          this.unsupported.add(attempt.providerId);
+          releaseLane();
+          throw failure;
+        }
         fleet.pause('unavailable'); releaseLane();
-        throw error instanceof QuotaError ? error : new QuotaError('unavailable');
+        throw failure;
       }
       let assessment: Assessment;
       try {

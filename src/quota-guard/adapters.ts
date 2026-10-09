@@ -20,14 +20,32 @@ export interface ReadOptions {
   now?: () => number;
   codexBase?: string;
 }
-export type QuotaErrorCode = 'auth' | 'schema' | 'unavailable' | 'rate-limited' | 'timeout' | 'aborted';
+/**
+ * `unsupported` is the one provider-scoped failure: this provider's quota surface is not served here
+ * (a 404 on a quota route), so the guard cannot read its quota at all. Deliberately NOT `unavailable`,
+ * which is the systemic code (network down, 5xx) that pauses the whole fleet.
+ */
+export type QuotaErrorCode = 'auth' | 'schema' | 'unavailable' | 'rate-limited' | 'timeout' | 'aborted' | 'unsupported';
 export class QuotaError extends Error {
   readonly code: QuotaErrorCode;
   readonly retryAt?: string;
-  constructor(code: QuotaErrorCode, retryAt?: string) {
-    super(`Quota check unavailable: ${code}`);
+  constructor(code: QuotaErrorCode, retryAt?: string, detail?: string) {
+    super(detail ?? `Quota check unavailable: ${code}`);
     this.name = 'QuotaError'; this.code = code; this.retryAt = retryAt;
   }
+}
+
+/**
+ * The refusal an operator reads when a provider's quota surface is not served here. It names the
+ * provider, the route and the status, says plainly that the guard cannot read this provider's quota so
+ * dispatch is refused while the guard is enabled, and does NOT claim the vendor has no API: the quota
+ * routes are not served, while model serving is unaffected. Never a silent pass-through.
+ */
+function unsupportedMessage(providerId: GuardedProvider, url: string, status: number): string {
+  return `Quota guard: dispatch refused for ${providerId} - its quota surface is not served here `
+    + `(GET ${url} returned HTTP ${status}). The guard cannot read this provider's quota, so dispatch `
+    + 'is refused while the guard is enabled. The quota routes are not served; this does not say the '
+    + 'provider has no API - model serving is unaffected.';
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -185,6 +203,12 @@ async function getJSON(url: string, auth: QuotaAuth, options: ReadOptions): Prom
         }
         throw new QuotaError('rate-limited', retryAt);
       }
+      // A 404 on a quota route means this provider's quota surface is not served here. That is scoped
+      // to the provider, not to the root, so it gets its own code: the coordinator refuses this
+      // provider's attempt and leaves the shared fleet open. It must never be reclassified as
+      // `unavailable` (which pauses every provider) and never become an unguarded pass-through while
+      // the guard is enabled. See docs/quota-guard-compatibility.md.
+      if (response.status === 404) throw new QuotaError('unsupported', undefined, unsupportedMessage(auth.providerId, url, response.status));
       if (!response.ok) throw new QuotaError('unavailable');
       const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
       if (contentType !== 'application/json' || !response.body) throw new QuotaError('schema');

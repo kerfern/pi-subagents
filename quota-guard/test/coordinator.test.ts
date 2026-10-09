@@ -3,6 +3,10 @@ import { test } from 'node:test';
 import { QuotaError, readQuota, type ReadOptions } from '../../src/quota-guard/adapters.ts';
 import { classifyFinalRequest, GuardCoordinator, laneKey, type AttemptScope } from '../../src/quota-guard/coordinator.ts';
 import { FleetLatch, type Release } from '../../src/quota-guard/controller.ts';
+import {
+  quotaGuardControls, quotaGuardExtension, quotaGuardRootBinding, resetQuotaGuardStateForTest,
+  setQuotaGuardEnabled,
+} from '../../src/quota-guard/index.ts';
 import { NOW, commandcodeScope, deps, openSnapshot, streamOf } from './guard-fixtures.ts';
 
 /** Counts guard releases; the underlying FleetLatch release is already idempotent. */
@@ -605,4 +609,72 @@ test('a pause landing as the inference lease is acquired re-checks instead of re
   release();
   assert.equal(reads, 2, 'the resumed attempt is re-checked under the new generation');
   assert.equal(d.fleet.snapshot().inferences, 0, 'no lease is left behind');
+});
+
+test('a provider-scoped 404 quota surface refuses that attempt and leaves the fleet open for another provider', async () => {
+  const read = (async (auth: { providerId: string }) => {
+    if (auth.providerId === 'commandcode') {
+      throw new QuotaError('unsupported', undefined,
+        "Quota guard: dispatch refused for commandcode - its quota surface is not served here (GET https://api.commandcode.ai/alpha/billing/credits returned HTTP 404).");
+    }
+    return openSnapshot('provider');
+  }) as unknown as typeof readQuota;
+  const { deps: d } = deps({ readQuota: read });
+  const coordinator = new GuardCoordinator(d);
+  const before = d.fleet.snapshot();
+  await assert.rejects(() => coordinator.admit(commandcodeScope),
+    (error: unknown) => error instanceof QuotaError && error.code === 'unsupported');
+  const after = d.fleet.snapshot();
+  assert.equal(after.state, 'open', 'a provider-scoped refusal must not pause the shared fleet');
+  assert.equal(after.reason, undefined);
+  assert.equal(after.generation, before.generation, 'the latch must not even move generation');
+  assert.equal(after.active, 0, 'the lane must be released');
+  assert.deepEqual(coordinator.unsupportedProviders(), ['commandcode'], 'status() must be able to name it');
+  // The regression the blocker is about: the other provider must still be admitted.
+  const release = await settlesWithin(coordinator.admit({
+    providerId: 'openai-codex', scope: 'account', accountId: 'acct-1', credential: 'k1' }), 1_000);
+  release();
+  assert.equal(d.fleet.snapshot().active, 0);
+  assert.equal(d.fleet.snapshot().state, 'open');
+});
+
+test('systemic failures still pause the shared fleet: a 5xx or a transport error is not provider-scoped', async () => {
+  for (const failure of [new QuotaError('unavailable'), new TypeError('network down')]) {
+    const { deps: d } = deps({ readQuota: (async () => { throw failure; }) as unknown as typeof readQuota });
+    await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
+    assert.equal(d.fleet.snapshot().state, 'paused', `${String(failure)} must still pause`);
+    assert.equal(d.fleet.snapshot().reason, 'unavailable');
+    assert.deepEqual(new GuardCoordinator(d).unsupportedProviders(), []);
+  }
+});
+
+test('an unreadable quota surface refuses dispatch - never an unguarded pass-through', async () => {
+  const inner: string[] = [];
+  const { deps: d } = deps({ readQuota: (async () => { throw new QuotaError('unsupported'); }) as unknown as typeof readQuota });
+  const guarded = new GuardCoordinator(d).gatedFetch(commandcodeScope,
+    (async (input: string | URL | Request) => { inner.push(String(input)); return new Response('unguarded'); }) as unknown as typeof fetch);
+  await assert.rejects(() => guarded('https://api.commandcode.ai/provider/v1/chat/completions',
+    { method: 'POST', headers: { authorization: 'Bearer k1' } }),
+    (error: unknown) => error instanceof QuotaError && error.code === 'unsupported');
+  assert.deepEqual(inner, [], 'nothing may reach the network when the quota surface cannot be read');
+});
+
+test('status() reports an unsupported provider instead of a merely unavailable one', async () => {
+  setQuotaGuardEnabled(true);
+  try {
+    const runtime = { stream: () => {}, streamSimple: () => {} };
+    const fetchImpl = (async () => new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+    quotaGuardExtension({ runtime, fetchImpl });
+    const binding = quotaGuardRootBinding();
+    assert.ok(binding, 'the enabled extension must expose its real root binding');
+    await assert.rejects(() => binding.coordinator.admit(commandcodeScope),
+      (error: unknown) => (error as { code?: string }).code === 'unsupported');
+    const status = quotaGuardControls(runtime)?.status();
+    assert.deepEqual(status?.unsupported, ['commandcode']);
+    assert.equal(status?.state, 'open', 'the refused provider must not have paused the fleet');
+    assert.equal(status?.reason, undefined);
+  } finally {
+    await resetQuotaGuardStateForTest();
+    setQuotaGuardEnabled(false);
+  }
 });
