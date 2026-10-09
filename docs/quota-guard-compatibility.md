@@ -123,6 +123,9 @@ first, and CommandCode's quota routes are **not currently served**, so the guard
 all. It therefore **refuses CommandCode dispatch** while it is enabled — and that refusal *is* the
 intended behaviour, not a gap. CommandCode is never forwarded ungated.
 
+Full probe evidence — environment, every route probed with its status, the load-bearing user-agent
+header, and third-party corroboration: [CommandCode quota is unsupported here](./quota-guard-commandcode-unsupported.md).
+
 Verified live on **2026-10-09** against the pinned origin `https://api.commandcode.ai`, one
 bearer-authenticated `GET` per route, with the same credential that serves models:
 
