@@ -25,6 +25,7 @@ Thumbs.db
 *~
 
 # Temporary files
+.worktrees/
 *.tmp
 .temp/
 .pi/readcache
