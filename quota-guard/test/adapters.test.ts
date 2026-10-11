@@ -96,6 +96,8 @@ test('GET origins, paths, redirect policy and per-provider headers pinned', asyn
   await readQuota(auth('openai-codex'), { now: () => now, fetchImpl });
   assert.equal(calls[0]?.url, 'https://chatgpt.com/backend-api/wham/usage');
   assert.equal(new Headers(calls[0]?.init?.headers).get('chatgpt-account-id'), 'acct');
+  assert.equal(new Headers(calls[0]?.init?.headers).get('user-agent'), 'codex-cli',
+    'the Codex usage route is the CLI route and wants the CLI user-agent');
   calls.length = 0;
   assert.equal((await readQuota(auth('commandcode'), { now: () => now, fetchImpl })).windows.length, 3);
   assert.deepEqual(calls.map(c => c.url), ['https://api.commandcode.ai/alpha/billing/credits', 'https://api.commandcode.ai/alpha/billing/subscriptions']);
@@ -104,6 +106,8 @@ test('GET origins, paths, redirect policy and per-provider headers pinned', asyn
     assert.equal(call.init?.method, 'GET'); assert.equal(call.init?.redirect, 'error');
     assert.equal(headers.get('authorization'), 'Bearer fixture-secret-key'); assert.equal(headers.get('accept'), 'application/json');
     assert.equal(headers.get('x-command-code-version'), '1.0.0'); assert.equal(headers.get('x-cli-environment'), 'production');
+    assert.notEqual(headers.get('user-agent'), 'codex-cli', 'the CLI user-agent belongs to Codex only');
+    assert.ok(headers.get('user-agent'), 'an explicit UA is required: Cloudflare 403s a request without one');
   }
 });
 

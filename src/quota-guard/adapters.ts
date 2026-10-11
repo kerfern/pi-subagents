@@ -173,6 +173,11 @@ async function getJSON(url: string, auth: QuotaAuth, options: ReadOptions): Prom
   try {
     headers = new Headers({ authorization: `Bearer ${auth.apiKey}`, accept: 'application/json', 'user-agent': 'pi-quota-guard/1.0.0' });
     if (auth.providerId === 'openai-codex') {
+      // The usage route is the Codex CLI's, and the authoritative reference prescribes
+      // `User-Agent: codex-cli` for it. A home-made UA is refused there and on Cloudflare-fronted
+      // hosts generally - CommandCode answers 403 to a request with NO explicit UA at all - so this
+      // header is load-bearing rather than cosmetic.
+      headers.set('user-agent', 'codex-cli');
       const account = text(auth.accountId);
       if (!/^[\u0021-\u007e]+$/.test(account)) throw new QuotaError('auth');
       headers.set('chatgpt-account-id', account);
