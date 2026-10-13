@@ -97,6 +97,19 @@ test('persistent on/off command works while both providers are OFF without insta
   assert.match(await invoke(command!, 'on codex unexpected'), /invalid target or arguments/i);
 });
 
+test('command-only mode refuses runtime controls instead of claiming they succeeded', async () => {
+  const { runtime, command } = setup({
+    guardedProviders: [],
+    persistProviderEnabled: () => ({ persisted: true }),
+  }, false);
+  const handler = command();
+  assert.equal(typeof handler, 'function');
+  assert.equal(quotaGuardControls(runtime), undefined);
+  for (const args of ['pause codex', 'resume codex', 'enable']) {
+    assert.match(await invoke(handler!, args), /^Quota guard: not installed/);
+  }
+});
+
 test('commands target all, Codex, and CommandCode; omitted target aliases all and invalid targets refuse', async () => {
   const { runtime, command } = setup({ guardedProviders: ['openai-codex'] }, true);
   const handler = command();

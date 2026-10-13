@@ -96,6 +96,72 @@ describe("production settings snapshot wiring", () => {
       env.restore();
     }
   });
+
+  it("preserves quota-guard changes from another stale instance after an unrelated settings save", async () => {
+    const env = hermeticDir({ settings: {
+      quotaGuardEnabled: false,
+      quotaGuardCodexEnabled: false,
+      quotaGuardCommandCodeEnabled: false,
+    } });
+    try {
+      initTheme(undefined, false);
+      const first = makePi();
+      const second = makePi();
+      subagentsExtension(first.pi);
+      subagentsExtension(second.pi);
+      let settingsSelected = false;
+      let built: any;
+      const ui = {
+        notify: vi.fn(),
+        select: vi.fn(async (_title: string, options: string[]) => {
+          if (settingsSelected) return undefined;
+          settingsSelected = true;
+          return options.find(option => option === "Settings");
+        }),
+        custom: vi.fn(async (factory: any) => {
+          built = factory({ requestRender: () => {} }, {}, {}, () => {});
+          built.handleInput(" ");
+          return undefined;
+        }),
+        input: vi.fn(async () => undefined),
+      };
+      const ctx = extensionContext({ cwd: env.dir, ui });
+
+      await first.commands.get("quota-guard").handler("on codex", ctx);
+      await second.commands.get("quota-guard").handler("on commandcode", ctx);
+      await second.commands.get("agents").handler("", ctx);
+
+      const saved = loadSettings(env.dir);
+      expect(saved.quotaGuardCodexEnabled).toBe(true);
+      expect(saved.quotaGuardCommandCodeEnabled).toBe(true);
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("does not overwrite malformed project settings when changing a provider", async () => {
+    const env = hermeticDir({ settings: {
+      quotaGuardEnabled: false,
+      quotaGuardCodexEnabled: false,
+      quotaGuardCommandCodeEnabled: false,
+    } });
+    const settingsPath = join(env.dir, ".pi", "subagents.json");
+    const malformed = "{ invalid";
+    try {
+      initTheme(undefined, false);
+      const boot = makePi();
+      subagentsExtension(boot.pi);
+      writeFileSync(settingsPath, malformed, "utf8");
+      const ui = { notify: vi.fn() };
+
+      await boot.commands.get("quota-guard").handler("on codex", extensionContext({ cwd: env.dir, ui }));
+
+      expect(readFileSync(settingsPath, "utf8")).toBe(malformed);
+      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/malformed|not saved|repair/i), "info");
+    } finally {
+      env.restore();
+    }
+  });
 });
 
 describe("settings persistence", () => {

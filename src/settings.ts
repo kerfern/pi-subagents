@@ -595,13 +595,14 @@ function projectPath(cwd: string): string {
  * exists but can't be parsed emits a warning to stderr so users aren't
  * silently reverted to defaults — and still returns `{}` so startup proceeds.
  */
-function readSettingsFile(path: string): SubagentsSettings {
+function readSettingsFile(path: string, onReadFailure?: (reason: string) => void): SubagentsSettings {
   if (!existsSync(path)) return {};
   try {
     return sanitize(JSON.parse(readFileSync(path, "utf-8")));
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
+    onReadFailure?.(reason);
     return {};
   }
 }
@@ -721,4 +722,33 @@ export function saveAndEmitChanged(
   const persisted = saveSettings(snapshot, cwd);
   emit("subagents:settings_changed", { settings: snapshot, persisted });
   return persistToastFor(successMsg, persisted);
+}
+
+/** Persist provider toggles against the latest project file, not a session-start snapshot. */
+export function saveQuotaGuardProviderSetting(
+  target: "all" | "openai-codex" | "commandcode",
+  enabled: boolean,
+  emit: SettingsEmit,
+  cwd: string = process.cwd(),
+): { message: string; level: "info" | "warning"; settings: SubagentsSettings } {
+  // ponytail: reread prevents stale sequential writes; add file locking if simultaneous sessions need serialization.
+  const path = projectPath(cwd);
+  let readFailed = false;
+  const projectSettings = readSettingsFile(path, () => { readFailed = true; });
+  if (readFailed) {
+    const settings = readSettingsFile(globalPath());
+    const message = `Quota guard settings not saved: ${path} is malformed or unreadable; repair it and retry.`;
+    emit("subagents:settings_changed", { settings, persisted: false });
+    return { message, level: "warning", settings };
+  }
+  const updates: Pick<SubagentsSettings, "quotaGuardCodexEnabled" | "quotaGuardCommandCodeEnabled"> = {};
+  if (target === "all" || target === "openai-codex") updates.quotaGuardCodexEnabled = enabled;
+  if (target === "all" || target === "commandcode") updates.quotaGuardCommandCodeEnabled = enabled;
+  const persisted = saveSettings({ ...projectSettings, ...updates }, cwd);
+  const settings = loadSettings(cwd);
+  emit("subagents:settings_changed", {
+    settings: persisted ? settings : { ...settings, ...updates },
+    persisted,
+  });
+  return { ...persistToastFor(`Quota guard ${enabled ? "on" : "off"} ${target}`, persisted), settings };
 }

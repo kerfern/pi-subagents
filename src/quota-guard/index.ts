@@ -462,6 +462,7 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
       const invalidTarget = (sub === 'pause' || sub === 'resume' || sub === 'on' || sub === 'off')
         && (tokens.length > 2 || (targetToken !== undefined && !validTargets.includes(targetToken)));
       const controls = quotaGuardControls();
+      const runtimeUnavailable = 'Quota guard: not installed; run /quota-guard on [all|codex|commandcode] and restart pi.';
       let message: string;
       if (invalidTarget || (sub === 'enable' && tokens.length > 1)
         || (sub === 'status' && tokens.length > 1)) {
@@ -485,15 +486,27 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
             break;
           }
           case 'enable':
-            controls?.enable();
+            if (!controls) {
+              message = runtimeUnavailable;
+              break;
+            }
+            controls.enable();
             message = 'Quota guard enabled (applies on the next pi session).';
             break;
           case 'pause':
-            controls?.pause(publicTarget);
+            if (!controls) {
+              message = runtimeUnavailable;
+              break;
+            }
+            controls.pause(publicTarget);
             message = `Quota guard paused (${targetLabel}).`;
             break;
           case 'resume':
-            message = (await controls?.resume(publicTarget))
+            if (!controls) {
+              message = runtimeUnavailable;
+              break;
+            }
+            message = (await controls.resume(publicTarget))
               ? `Quota guard resumed (${targetLabel}).`
               : `Quota guard resume refused (${targetLabel}): the applicable holds could not be safely cleared.`;
             break;

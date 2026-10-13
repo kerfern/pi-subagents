@@ -48,7 +48,7 @@ import type { CodexLimit } from "./quota-guard/adapters.js";
 import { isQuotaGuardEnabled, quotaGuardExtension, setQuotaGuardEnabled } from "./quota-guard/index.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, snapshotQuotaGuardSettings, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, saveQuotaGuardProviderSetting, snapshotQuotaGuardSettings, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -4440,21 +4440,17 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ...(quotaGuardCodexLimits !== undefined ? { codexLimits: quotaGuardCodexLimits } : {}),
     ...(quotaGuardReserveUnits !== undefined ? { reserveUnits: new Map(Object.entries(quotaGuardReserveUnits)) } : {}),
     persistProviderEnabled: (target, enabled) => {
-      const previousCodex = quotaGuardCodexSetting;
-      const previousCommandCode = quotaGuardCommandCodeSetting;
-      if (target === 'all' || target === 'openai-codex') quotaGuardCodexSetting = enabled;
-      if (target === 'all' || target === 'commandcode') quotaGuardCommandCodeSetting = enabled;
-      const { message, level } = saveAndEmitChanged(
-        snapshotSettings(),
-        `Quota guard ${enabled ? 'on' : 'off'} ${target}`,
+      const result = saveQuotaGuardProviderSetting(
+        target,
+        enabled,
         (event, payload) => pi.events.emit(event, payload),
       );
-      const persisted = level === 'info';
-      if (!persisted) {
-        quotaGuardCodexSetting = previousCodex;
-        quotaGuardCommandCodeSetting = previousCommandCode;
+      const persisted = result.level === 'info';
+      if (persisted) {
+        quotaGuardCodexSetting = result.settings.quotaGuardCodexEnabled;
+        quotaGuardCommandCodeSetting = result.settings.quotaGuardCommandCodeEnabled;
       }
-      return { persisted, ...(!persisted && { message }) };
+      return { persisted, ...(!persisted && { message: result.message }) };
     },
   });
 
