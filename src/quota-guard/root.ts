@@ -17,7 +17,9 @@ export interface GuardRuntime {
 export interface GatedCoordinator {
   gatedFetch(scope: AttemptScope, inner?: typeof fetch): typeof fetch;
   /** Mandatory fail-closed latch; the gate refuses to admit when this is unavailable. */
-  pause(reason: PauseReason): void;
+  pause(reason: PauseReason, providerId?: GuardedProvider): void;
+  /** Manual-only boundary used by explicitly unguarded providers before any custom client dispatch. */
+  assertManualAllowed?(providerId: GuardedProvider): void;
 }
 
 interface GuardOptions { fetch?: typeof fetch; client?: unknown; [key: string]: unknown }
@@ -60,17 +62,37 @@ function guardedProvider(model: GuardModel | undefined): GuardedProvider | undef
   return provider === 'openai-codex' || provider === 'commandcode' ? provider : undefined;
 }
 
+/** Pins provider/api values so accessors cannot change the dispatch route after admission. */
+function pinPassthroughModel(model: GuardModel, api: GuardModel['api'], provider: GuardModel['provider']): GuardModel {
+  const prototype = Object.getPrototypeOf(model);
+  if (prototype === Object.prototype || prototype === null) return { ...model, api, provider };
+  return new Proxy(model as object, {
+    get(target, key, receiver): unknown {
+      if (key === 'provider') return provider;
+      if (key === 'api') return api;
+      return Reflect.get(target, key, receiver);
+    },
+  }) as GuardModel;
+}
+
+function assertManualAllowed(coordinator: GatedCoordinator, providerId: GuardedProvider): void {
+  if (typeof coordinator.assertManualAllowed !== 'function') {
+    throw new Error(`Quota guard: manual-hold state unavailable for ${providerId}; refusing unguarded dispatch`);
+  }
+  coordinator.assertManualAllowed(providerId);
+}
+
 /**
  * Fail closed: pause the shared latch for an unidentifiable attempt via the coordinator's public
  * contract, then reject. A coordinator that cannot pause throws a clear error rather than silently
  * skipping the mandatory pause.
  */
-function failIdentity(coordinator: GatedCoordinator): never {
+function failIdentity(coordinator: GatedCoordinator, providerId: GuardedProvider): never {
   if (typeof coordinator?.pause !== 'function') {
     throw new Error('Quota guard: coordinator cannot pause the fleet; refusing an unidentifiable attempt');
   }
   try {
-    coordinator.pause('identity');
+    coordinator.pause('identity', providerId);
   } catch {
     throw new Error('Quota guard: the coordinator pause failed; refusing an unidentifiable attempt');
   }
@@ -78,15 +100,15 @@ function failIdentity(coordinator: GatedCoordinator): never {
 }
 
 /**
- * Fail closed for an attempt that cannot be routed through the guard: pause the shared latch,
- * then reject with an error naming the configuration to fix.
+ * Fail closed for an attempt that cannot be routed through the guard: pause its known provider, or
+ * the root latch when identity is unassignable, then reject with an actionable error.
  */
-function pauseAndThrow(coordinator: GatedCoordinator, message: string): never {
+function pauseAndThrow(coordinator: GatedCoordinator, message: string, providerId?: GuardedProvider): never {
   if (typeof coordinator?.pause !== 'function') {
     throw new Error('Quota guard: coordinator cannot pause the fleet; refusing an unguardable attempt');
   }
   try {
-    coordinator.pause('identity');
+    coordinator.pause('identity', providerId);
   } catch {
     throw new Error('Quota guard: the coordinator pause failed; refusing an unguardable attempt');
   }
@@ -134,22 +156,22 @@ async function resolveScope(runtime: GuardRuntime, coordinator: GatedCoordinator
   provider: GuardedProvider, model: GuardModel,
   codexLimits?: readonly CodexLimit[]): Promise<AttemptScope> {
   let auth: unknown;
-  try { auth = await runtime.getAuth?.(model); } catch { return failIdentity(coordinator); }
+  try { auth = await runtime.getAuth?.(model); } catch { return failIdentity(coordinator, provider); }
   const credential = credentialOf(auth);
   if (provider === 'commandcode') {
-    if (!credential) return failIdentity(coordinator);
+    if (!credential) return failIdentity(coordinator, provider);
     return { providerId: 'commandcode', scope: 'provider', credential };
   }
   // Identity comes from the credential the transport will actually send. A caller-supplied
   // `chatgpt-account-id` header is deliberately ignored: the transport overrides it from the token,
   // so trusting it would let a caller aim the gate at another account's quota lane.
   const accountId = credential ? codexAccountId(credential) : undefined;
-  if (!credential || !accountId) return failIdentity(coordinator);
+  if (!credential || !accountId) return failIdentity(coordinator, provider);
   if (!codexLimits?.length) {
     // Without the verified meter scope the read cannot be attributed to a quota window, so refuse
     // with an actionable error instead of failing later as a generic schema error.
     return pauseAndThrow(coordinator,
-      'Quota guard: no verified Codex meter scope configured; pass codexLimits to installQuotaGuard');
+      'Quota guard: no verified Codex meter scope configured; pass codexLimits to installQuotaGuard', provider);
   }
   return { providerId: 'openai-codex', scope: 'account', accountId, credential, codexLimits };
 }
@@ -180,8 +202,11 @@ export function installQuotaGuard(options: {
   fetchImpl?: typeof fetch;
   /** Verified Codex meter scope; without it a Codex attempt is refused rather than misattributed. */
   codexLimits?: readonly CodexLimit[];
+  /** Providers whose automatic quota gate is enabled; omitted preserves legacy both-on behavior. */
+  guardedProviders?: readonly GuardedProvider[];
 }): () => void {
   const { runtime, rootId, coordinator, fetchImpl, codexLimits } = options;
+  const guarded = new Set(options.guardedProviders ?? ['openai-codex', 'commandcode']);
   if (!rootId) throw new Error('Quota guard: root identity required');
   const originalStream = runtime?.stream;
   const originalSimple = runtime?.streamSimple;
@@ -224,25 +249,25 @@ export function installQuotaGuard(options: {
           return pauseAndThrow(coordinator,
             'Quota guard: model is not a plain object; refusing to dispatch');
         }
-        const prototype = Object.getPrototypeOf(model);
-        const plain = prototype === Object.prototype || prototype === null;
-        // Read the pinned value once, before wrapping, so a later `get` cannot re-litigate it.
+        // Read the pinned value before wrapping so a later `get` cannot re-litigate it.
         const pinnedProvider = model.provider;
-        const forwarded: GuardModel = plain
-          ? { ...model, api, provider: pinnedProvider }
-          : new Proxy(model as object, {
-              get(target, key, receiver): unknown {
-                if (key === 'provider') return pinnedProvider;
-                if (key === 'api') return api;
-                // Reflect with the receiver so prototype members and accessors keep working.
-                return Reflect.get(target, key, receiver);
-              },
-            }) as GuardModel;
-        if (guardedProvider(forwarded)) {
+        const forwarded = pinPassthroughModel(model, api, pinnedProvider);
+        const changedProvider = guardedProvider(forwarded);
+        if (changedProvider) {
           return pauseAndThrow(coordinator,
-            'Quota guard: model provider changed after the guard check; refusing to dispatch');
+            'Quota guard: model provider changed after the guard check; refusing to dispatch', changedProvider);
         }
         return original.call(this, forwarded, contextOrHandle, maybeOptions);
+      }
+      if (!guarded.has(provider)) {
+        // OFF means no quota/auth work, but the manual hold remains authoritative. Check it before
+        // forwarding even a supplied client, which could bypass any injected-fetch-only gate.
+        assertManualAllowed(coordinator, provider);
+        if (!model || typeof model !== 'object') {
+          return pauseAndThrow(coordinator, 'Quota guard: invalid model; refusing unguarded dispatch', provider);
+        }
+        const pinned = pinPassthroughModel(model, api, provider);
+        return original.call(this, pinned, contextOrHandle, maybeOptions);
       }
       // One own copy, made before anything is validated: a spread invokes each getter once, so a
       // `client` accessor cannot read as undefined while we validate and as a real client when the
@@ -252,11 +277,11 @@ export function installQuotaGuard(options: {
         const why = callerOptions.client !== undefined
           ? ' with a supplied client, which bypasses the injected fetch' : '';
         return pauseAndThrow(coordinator,
-          `Quota guard: ${provider} on api "${String(api)}" cannot be guarded${why}; refusing to dispatch`);
+          `Quota guard: ${provider} on api "${String(api)}" cannot be guarded${why}; refusing to dispatch`, provider);
       }
       if (!owner) {
         return pauseAndThrow(coordinator,
-          'Quota guard: no live runtime receiver; refusing to resolve identity');
+          'Quota guard: no live runtime receiver; refusing to resolve identity', provider);
       }
       const inner = callerOptions.fetch ?? fetchImpl ?? globalThis.fetch;
       const next: Record<string, unknown> = {
@@ -269,7 +294,7 @@ export function installQuotaGuard(options: {
       const prototype = Object.getPrototypeOf(model);
       if (prototype !== Object.prototype && prototype !== null) {
         return pauseAndThrow(coordinator,
-          `Quota guard: ${provider} model is not a plain object; refusing to dispatch`);
+          `Quota guard: ${provider} model is not a plain object; refusing to dispatch`, provider);
       }
       const pinned: GuardModel = { ...model, api, provider };
       const forwarded = provider === 'openai-codex' ? forceSse(next) : next;

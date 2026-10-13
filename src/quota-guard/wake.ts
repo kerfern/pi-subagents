@@ -168,6 +168,63 @@ export class RootWake {
     }
   }
 
+  /** Persist all-resume before committing its generation-fenced manual-latch clear. */
+  async resumeManual(commitManual?: () => boolean): Promise<boolean> {
+    if (this.disposed || this.running) return false;
+    this.running = true;
+    try {
+      let loaded: Manifest | null;
+      try {
+        loaded = this.manifest ?? await this.deps.store.read();
+      } catch (error) {
+        this.deps.onError?.(error);
+        return false;
+      }
+      this.manifest = loaded;
+      const snapshot = this.deps.fleet.snapshot();
+      if (!commitManual && snapshot.state !== 'open') return false;
+      const commit = commitManual ?? (() => true);
+      if (!loaded || loaded.state === 'open') return commit();
+      if (snapshot.state !== 'open' && snapshot.reason !== 'manual') return false;
+      this.#cancelTimer();
+      const record: Omit<Manifest, 'digest'> = {
+        version: 1,
+        rootId: loaded.rootId,
+        generation: loaded.generation + 1,
+        state: 'open',
+        updatedAt: new Date(this.deps.now()).toISOString(),
+        backoffIndex: 0,
+        quorum: loaded.quorum,
+        checkpoints: loaded.checkpoints,
+      };
+      try {
+        await this.deps.store.write(record, loaded.generation);
+        this.manifest = await this.deps.store.read();
+      } catch (error) {
+        // A failed write/read-back may still have committed `open`; recover must withdraw it while the latch remains held.
+        this.pendingWithdrawal = {
+          checkpoints: loaded.checkpoints.map(({ id, digest }) => ({ id, digest })),
+          reason: snapshot.reason ?? loaded.reason,
+        };
+        this.deps.onError?.(error);
+        await this.#recover();
+        return false;
+      }
+      const current = this.deps.fleet.snapshot();
+      if (current.generation !== snapshot.generation
+        || (current.state !== 'open' && current.reason !== 'manual')) {
+        return await this.#withdraw(loaded.checkpoints.map(({ id, digest }) => ({ id, digest })));
+      }
+      if (!commit()) {
+        return await this.#withdraw(loaded.checkpoints.map(({ id, digest }) => ({ id, digest })));
+      }
+      this.pendingWithdrawal = null;
+      return true;
+    } finally {
+      this.running = false;
+    }
+  }
+
   status(): WakeStatus | null {
     return this.manifest === null ? null : { ...this.manifest, durable: !this.unrecorded };
   }
@@ -187,6 +244,9 @@ export class RootWake {
     const loaded = this.manifest ?? (await this.deps.store.read());
     this.manifest = loaded;
     if (!loaded || loaded.state === 'open') return false;
+    // Pre-provider-control manifests used a root-wide `manual` reason. It is operator-owned, not an
+    // automatic recovery candidate; reopening it here would erase a manual hold without a command.
+    if (loaded.reason === 'manual') return false;
     const generation = loaded.generation;
     await this.#drain();
     if (this.disposed) return false;
@@ -473,6 +533,7 @@ export class RootWake {
       return false;
     }
     this.manifest = current;
+    if (this.pendingWithdrawal) return await this.#commitWithdrawal();
     if (!current || current.state === 'open') return false;
     const now = this.deps.now();
     const wakeAt = current.wakeAt === undefined ? undefined : Date.parse(current.wakeAt);

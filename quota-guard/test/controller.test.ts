@@ -67,6 +67,136 @@ test('100 account tickets cancel half queued; survivors stay FIFO and other acco
   assert.equal(maxActive, 1); assert.equal(fifo.activeAccounts, 0);
 });
 
+test('provider-local automatic holds drain only their provider and leave the peer open', async () => {
+  const fleet = new FleetLatch('root');
+  const admittedCommandCode = await fleet.enter('commandcode', 'inference');
+  fleet.pauseAutomatic('commandcode', 'unavailable');
+  assert.equal(fleet.snapshot('commandcode').state, 'draining');
+  assert.equal(fleet.snapshot('openai-codex').state, 'open');
+
+  let commandCodeEntered = false;
+  const blocked = fleet.enter('commandcode', 'inference').then((release) => {
+    commandCodeEntered = true;
+    return release;
+  });
+  const peer = await fleet.enter('openai-codex', 'inference');
+  peer();
+  assert.equal(commandCodeEntered, false);
+  admittedCommandCode();
+  assert.equal(fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(commandCodeEntered, false);
+
+  assert.equal(await fleet.resumeAutomatic('commandcode', async () => true), true);
+  (await blocked)();
+  assert.equal(fleet.snapshot('commandcode').state, 'open');
+});
+
+test('a repeated provider failure fences an in-flight automatic resume', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  let finish: (ready: boolean) => void = () => {};
+  const pending = fleet.resumeAutomatic('commandcode', () => new Promise<boolean>(resolve => { finish = resolve; }));
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  finish(true);
+  assert.equal(await pending, false);
+  assert.equal(fleet.snapshot('commandcode').reason, 'reserve');
+  assert.equal(fleet.snapshot('commandcode').state, 'paused');
+});
+
+test('manual all and provider holds compose without clearing automatic provider state', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.pauseManual('openai-codex');
+  let codexEntered = false;
+  const codex = fleet.enter('openai-codex', 'inference').then((release) => {
+    codexEntered = true;
+    return release;
+  });
+  const commandcode = await fleet.enter('commandcode', 'inference');
+  commandcode();
+  await flush();
+  assert.equal(codexEntered, false);
+
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  fleet.pauseManual('all');
+  let commandcodeEntered = false;
+  const blockedCommandCode = fleet.enter('commandcode', 'inference').then((release) => {
+    commandcodeEntered = true;
+    return release;
+  });
+  await flush();
+  assert.equal(commandcodeEntered, false);
+  fleet.clearManual('all');
+  (await codex)();
+  await flush();
+  assert.equal(commandcodeEntered, false, 'clearing manual holds must not clear the automatic hold');
+  assert.equal(fleet.snapshot('commandcode').automaticReason, 'reserve');
+  assert.equal(fleet.snapshot().state, 'open', 'the automatic provider hold must not become root-wide');
+  assert.equal(await fleet.resumeAutomatic('commandcode', async () => true), true);
+  (await blockedCommandCode)();
+});
+
+test('a repeated manual pause during durable resume fences the latch clear', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.pauseManual('all');
+  let cleared = true;
+
+  const resumed = await fleet.resume('all', undefined, async (commitManual) => {
+    fleet.pauseManual('all');
+    cleared = commitManual();
+    return cleared;
+  });
+
+  assert.equal(resumed, false);
+  assert.equal(cleared, false);
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal(fleet.snapshot('openai-codex').manual, true);
+  assert.equal(fleet.snapshot('commandcode').manual, true);
+});
+
+test('manual pause during an automatic check invalidates all-resume', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  let startCheck!: () => void;
+  let finishCheck!: (ready: boolean) => void;
+  const checkStarted = new Promise<void>((resolve) => { startCheck = resolve; });
+  const checkResult = new Promise<boolean>((resolve) => { finishCheck = resolve; });
+
+  const resumed = fleet.resume('all', async () => {
+    startCheck();
+    return checkResult;
+  });
+  await checkStarted;
+  fleet.pauseManual('openai-codex');
+  finishCheck(true);
+
+  assert.equal(await resumed, false);
+  assert.equal(fleet.snapshot('openai-codex').manual, true);
+  assert.equal(fleet.snapshot('commandcode').automaticReason, undefined);
+});
+
+test('manual pause during resume preparation refuses before quota reads', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  let startPrepare!: () => void;
+  let finishPrepare!: (ready: boolean) => void;
+  let checks = 0;
+  const prepareStarted = new Promise<void>((resolve) => { startPrepare = resolve; });
+  const prepareResult = new Promise<boolean>((resolve) => { finishPrepare = resolve; });
+
+  const resumed = fleet.resume('all', async () => { checks++; return true; }, undefined, async () => {
+    startPrepare();
+    return prepareResult;
+  });
+  await prepareStarted;
+  fleet.pauseManual('openai-codex');
+  finishPrepare(true);
+
+  assert.equal(await resumed, false);
+  assert.equal(checks, 0);
+  assert.equal(fleet.snapshot('openai-codex').manual, true);
+  assert.equal(fleet.snapshot('commandcode').automaticReason, 'reserve');
+});
+
 test('one blocker latches whole fleet; admitted inference and coding finish without forced abort', async () => {
   const fleet = new FleetLatch('root');
   const inference = await fleet.enter('inference'); const coding = await fleet.enter('coding');
@@ -192,6 +322,16 @@ test('restoration reinstates a persisted pause and refuses regressive or active 
   release();
   busy.restorePaused(1, 'manual');
   assert.equal(busy.snapshot().state, 'paused');
+});
+
+test('restored legacy manual pause is cleared only by operator all-resume without quota read', async () => {
+  const fleet = new FleetLatch('root');
+  fleet.restorePaused(4, 'manual');
+  let checks = 0;
+
+  assert.equal(await fleet.resume('all', async () => { checks++; return true; }), true);
+  assert.equal(checks, 0, 'manual hold clearing must not read quota');
+  assert.equal(fleet.snapshot().state, 'open');
 });
 
 test('a restored pause still requires a fresh check before it reopens', async () => {

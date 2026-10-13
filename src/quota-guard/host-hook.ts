@@ -32,6 +32,7 @@ export interface HookInstallOptions {
   coordinator: GatedCoordinator;
   rootId: string;
   codexLimits?: readonly CodexLimit[];
+  guardedProviders?: readonly GuardedProvider[];
   fetchImpl?: typeof fetch;
   source?: object;
   /** Catalogue api ids when the caller can see them; omitted means that contract is unverified. */
@@ -72,6 +73,7 @@ export async function installGuardedRuntimeViaHook(options: HookInstallOptions):
       rootId: options.rootId,
       coordinator: options.coordinator,
       ...(options.codexLimits ? { codexLimits: options.codexLimits } : {}),
+      ...(options.guardedProviders ? { guardedProviders: options.guardedProviders } : {}),
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     });
   });

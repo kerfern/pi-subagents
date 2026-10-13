@@ -242,7 +242,7 @@ test('stability: a second enabled call reuses the one coordinator instead of reb
 
   const first = quotaGuardRootBinding();
   assert.ok(first, 'the first call must build the root binding');
-  quotaGuardControls()?.pause('manual');
+  quotaGuardControls()?.pause('all');
   assert.equal(first.fleet.snapshot().state, 'paused');
 
   const other: QuotaGuardHost = { rootId: ROOT_ID, hookSource: hookSource(fakeRuntime().prototype) };
@@ -287,6 +287,40 @@ test('mode and reserve: the installed latch drives mode and an unseen lane stays
   );
   assert.equal(assessment.state, 'wait', 'an unknown reserve must keep the guard closed');
   assert.equal(assessment.reason, 'unknown-reserve');
+});
+
+test('stateDir: legacy manual pause waits for operator resume and clears its manifest', async () => {
+  const dir = await tmpDir();
+  const seed = await openStore(dir, ROOT_ID);
+  await seed.write({
+    version: 1,
+    rootId: ROOT_ID,
+    generation: 1,
+    state: 'paused',
+    reason: 'manual',
+    updatedAt: iso(Date.now() - 1_000),
+    wakeAt: iso(Date.now() + 90_000),
+    backoffIndex: 1,
+    quorum: ['commandcode:provider'],
+    checkpoints: [{ id: 'cp', digest: 'deadbeef', generation: 1 }],
+  }, null);
+  await seed.close();
+
+  setQuotaGuardEnabled(true);
+  const host: QuotaGuardHost = { rootId: ROOT_ID, stateDir: dir, hookSource: hookSource(fakeRuntime().prototype) };
+  quotaGuardExtension(host);
+  await flush();
+  await settle(() => host.wake !== undefined && quotaGuardControls()?.status().wake !== null);
+
+  const controls = quotaGuardControls();
+  assert.ok(controls);
+  assert.equal(controls.status().reason, 'manual');
+  assert.equal(await controls.resume('all'), true, 'operator all-resume clears legacy manual state without a quota check');
+  assert.equal(controls.status().state, 'open');
+  assert.equal(controls.status().wake?.state, 'open');
+  const reopened = await openStore(dir, ROOT_ID);
+  assert.equal((await reopened.read())?.state, 'open', 'restart must not resurrect a manually resumed hold');
+  await reopened.close();
 });
 
 test('stateDir: a persisted pause is reported and survives a fresh binding over the same directory', async () => {
@@ -340,8 +374,8 @@ test('stateDir: a persisted pause is reported and survives a fresh binding over 
   // pause/resume drive the shared latch the wake machine reinstated.
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
-  quotaGuardControls()?.pause('manual');
-  assert.equal(binding.fleet.snapshot().reason, 'manual');
+  quotaGuardControls()?.pause('all');
+  assert.equal(binding.fleet.snapshot().reason, 'threshold');
   second.freshCheck = async () => true;
   assert.equal(await quotaGuardControls()?.resume(), true);
   assert.equal(binding.fleet.snapshot().state, 'open');
@@ -364,7 +398,9 @@ test('durability ceiling: a fresh pause records nothing, so a restart comes back
 
   const controls = quotaGuardControls();
   assert.ok(controls);
-  controls.pause('threshold');
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  binding.fleet.pause('threshold');
   assert.equal(controls.status().state, 'paused', 'the latch pauses whether or not anything is recorded');
   await flush();
   assert.deepEqual(
@@ -402,7 +438,7 @@ test('without stateDir wake stays null and gating is unaffected', async () => {
   assert.equal(controls.status().wake, null, 'wake must be reported as null, never fabricated');
   assert.equal(controls.status().state, 'open', 'gating must be unaffected');
 
-  controls.pause('manual');
+  controls.pause('all');
   assert.equal(controls.status().state, 'paused', 'pause must still drive the shared latch');
   await flush();
   assert.deepEqual(output, [], 'the documented no-stateDir limitation must not log as a failure');
@@ -413,36 +449,35 @@ test('without stateDir wake stays null and gating is unaffected', async () => {
  * unconditionally, and a paused guard could neither be resumed nor calibrate its own reserve (the
  * observation only ever happened inside `admit`, which blocks on the pause). These pin the real check.
  */
-test('resume: unchanged usage leaves the reserve unknown, so the fleet stays paused', async () => {
+test('resume: unchanged usage leaves the reserve unknown, so the provider stays paused', async () => {
   const level = { monthly: 1, rolling: 1 };
-  const host = await enabledHost(commandcodeFetch(level));
+  await enabledHost(commandcodeFetch(level));
 
   const binding = quotaGuardRootBinding();
   assert.ok(binding, 'the install must build a root binding');
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().reason, 'reserve', 'an unknown reserve must pause the fleet');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 
-  const controls = quotaGuardControls();
-  assert.ok(controls);
-  assert.equal(await controls.resume(), false, 'an unmoved usage counter must never calibrate a reserve');
-  assert.equal(binding.fleet.snapshot().state, 'paused', 'the fleet must stay closed');
-  assert.equal(host.freshCheck !== undefined, true, 'the binding must publish a real fresh check');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), false,
+    'an unmoved usage counter must never calibrate a reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot().state, 'open', 'a provider-local pause must not close the root fleet');
 });
 
-test('resume: genuine usage movement calibrates the reserve and reopens the fleet', async () => {
+test('resume: genuine usage movement calibrates the reserve and reopens only that provider', async () => {
   const level = { monthly: 1, rolling: 1 };
   await enabledHost(commandcodeFetch(level));
 
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
 
   level.monthly = 5; level.rolling = 5;
-  const controls = quotaGuardControls();
-  assert.ok(controls);
-  assert.equal(await controls.resume(), true, 'a moved window must yield a verified, in-policy reserve');
-  assert.equal(binding.fleet.snapshot().state, 'open', 'a passing check must reopen the fleet');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), true,
+    'a moved window must yield a verified, in-policy reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'open');
+  assert.equal(binding.fleet.snapshot().state, 'open');
 });
 
 test('resume: one unmoved window keeps the reserve unknown, so resume stays false', async () => {
@@ -452,16 +487,13 @@ test('resume: one unmoved window keeps the reserve unknown, so resume stays fals
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-
-  // Only one of the three tracked windows moves; the other two must still refuse the resume.
   level.monthly = 5;
-  const controls = quotaGuardControls();
-  assert.ok(controls);
-  assert.equal(await controls.resume(), false, 'every window must pass, not just the moved one');
-  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), false,
+    'every window must pass, not just the moved one');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
 });
 
-test('resume: an unreadable retained scope fails closed', async () => {
+test('resume: an unreadable retained provider scope fails closed', async () => {
   const level = { monthly: 1, rolling: 1 };
   const good = commandcodeFetch(level);
   let healthy = true;
@@ -473,13 +505,12 @@ test('resume: an unreadable retained scope fails closed', async () => {
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
 
   healthy = false;
-  const controls = quotaGuardControls();
-  assert.ok(controls);
-  assert.equal(await controls.resume(), false, 'an unreadable quota must never reopen the guard');
-  assert.equal(binding.fleet.snapshot().state, 'paused');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), false,
+    'an unreadable quota must never reopen the guard');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
 });
 
 test('secrets: the retained scope never reaches a durable manifest, the log or status()', async () => {
@@ -619,7 +650,7 @@ test('reserve seed: a valid operator seed opens a lane whose counters never move
   // Headroom is 69/99/99 against caps 70/100/100; a seed below the headroom opens, and the pause
   // threshold (10%) passes, so nothing but the seed is deciding this.
   const reserveUnits = new Map([['monthly', 60], ['fiveHour', 60], ['weekly', 60]]);
-  const host = await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
+  await enabledHost(commandcodeFetch(level), {}, { reserveUnits });
 
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
@@ -635,8 +666,8 @@ test('reserve seed: no seed leaves a flat lane unknown, so the guard stays close
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().state, 'paused');
-  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 });
 
 test('reserve seed: an observed reserve wins over the seed', async () => {
@@ -648,14 +679,14 @@ test('reserve seed: an observed reserve wins over the seed', async () => {
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 
   // A real movement (delta 10) yields an observed monthly reserve of 20, below the 69 headroom. If
   // the seed still won, 69 <= 100 would keep it closed.
   level.monthly = 11;
-  const controls = quotaGuardControls();
-  assert.ok(controls);
-  assert.equal(await controls.resume(), true, 'the observed reserve must replace the seed');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), true,
+    'the observed reserve must replace the seed');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'open');
   assert.equal(binding.fleet.snapshot().state, 'open');
 });
 
@@ -669,8 +700,8 @@ test('reserve seed: a malformed seed is dropped whole, so the guard stays closed
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().state, 'paused');
-  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 
   const windows: QuotaWindow[] = [{ id: 'monthly', used: 1, cap: 70, resetAt: iso(Date.now() + 3_600_000) }];
   const observed = binding.estimator.observe('commandcode:provider', windows);
@@ -687,8 +718,8 @@ test('reserve seed: a zero seed is refused, because a zero reserve is an unknown
   const binding = quotaGuardRootBinding();
   assert.ok(binding);
   await assert.rejects(() => binding.coordinator.admit(commandcodeAttempt()));
-  assert.equal(binding.fleet.snapshot().state, 'paused');
-  assert.equal(binding.fleet.snapshot().reason, 'reserve');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 
   const windows: QuotaWindow[] = [{ id: 'monthly', used: 1, cap: 70, resetAt: iso(Date.now() + 3_600_000) }];
   const observed = binding.estimator.observe('commandcode:provider', windows);

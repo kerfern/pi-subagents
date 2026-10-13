@@ -1,7 +1,8 @@
 # CommandCode quota is unsupported here — live evidence
 
-**Status: CommandCode quota cannot be read.** With the guard enabled, CommandCode dispatch is
-**refused**, not passed through unguarded. Codex is unaffected.
+**Status: CommandCode quota cannot be read.** With `quotaGuardCommandCodeEnabled: true`,
+CommandCode dispatch is **refused**, not passed through unguarded. When its automatic guard is OFF,
+dispatch is intentionally unguarded unless manually paused. Codex is unaffected.
 
 **Scope of this claim.** These probes establish that the routes *tested* are not served from *this*
 host with *this* credential. They do **not** establish that no CommandCode quota API exists anywhere,
@@ -66,8 +67,8 @@ admission decision, so they could not gate it.
 Dropping CommandCode from the guard would leave it running with **no** quota protection while looking
 like a fix. The guard therefore refuses CommandCode dispatch with a message naming the provider, the
 route and the status. A 404 on a quota route is classified `unsupported`, which is scoped to that
-provider: it refuses the attempt and leaves the shared fleet untouched, so CommandCode cannot take
-Codex down with it. Systemic failures (network, 5xx) still pause the fleet.
+provider: it refuses the CommandCode attempt and leaves Codex unaffected. Network and 5xx
+automatic holds are provider-local too.
 
 ## Re-enabling
 

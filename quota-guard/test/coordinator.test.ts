@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { QuotaError, readQuota, type ReadOptions } from '../../src/quota-guard/adapters.ts';
 import { classifyFinalRequest, GuardCoordinator, laneKey, type AttemptScope } from '../../src/quota-guard/coordinator.ts';
 import { FleetLatch, type Release } from '../../src/quota-guard/controller.ts';
+import type { GuardedProvider } from '../../src/quota-guard/types.ts';
 import {
   quotaGuardControls, quotaGuardExtension, quotaGuardRootBinding, resetQuotaGuardStateForTest,
   setQuotaGuardEnabled,
@@ -12,8 +13,13 @@ import { NOW, commandcodeScope, deps, openSnapshot, streamOf } from './guard-fix
 /** Counts guard releases; the underlying FleetLatch release is already idempotent. */
 class CountingFleet extends FleetLatch {
   releases = 0;
-  async enter(kind: 'inference' | 'coding', signal?: AbortSignal): Promise<Release> {
-    const release = await super.enter(kind, signal);
+  async enter(kind: 'inference' | 'coding', signal?: AbortSignal): Promise<Release>;
+  async enter(providerId: GuardedProvider, kind: 'inference' | 'coding', signal?: AbortSignal): Promise<Release>;
+  async enter(first: GuardedProvider | 'inference' | 'coding',
+    second?: 'inference' | 'coding' | AbortSignal, third?: AbortSignal): Promise<Release> {
+    const release = first === 'openai-codex' || first === 'commandcode'
+      ? await super.enter(first, second as 'inference' | 'coding', third)
+      : await super.enter(first, second as AbortSignal | undefined);
     return () => { this.releases++; release(); };
   }
 }
@@ -33,18 +39,31 @@ test('final-request classification binds the credential and Codex account id', (
   assert.throws(() => classifyFinalRequest({ url, headers: new Headers({ authorization: 'Bearer k1' }) }, codex), (e: unknown) => e instanceof QuotaError);
 });
 
-test('admit performs a fresh quota read and rejects when the check fails', async () => {
-  const d = deps({ readQuota: (async () => { throw new QuotaError('unavailable'); }) as unknown as typeof readQuota }).deps;
-  await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
-  assert.equal(d.fleet.snapshot().state, 'paused');
-  assert.equal(d.fleet.snapshot().reason, 'unavailable');
+test('manual assertion refuses only held provider and ignores automatic holds', () => {
+  const { deps: d } = deps();
+  const coordinator = new GuardCoordinator(d);
+  d.fleet.pauseManual('commandcode');
+
+  assert.throws(() => coordinator.assertManualAllowed('commandcode'), /commandcode is manually paused/);
+  assert.doesNotThrow(() => coordinator.assertManualAllowed('openai-codex'));
+  d.fleet.pauseAutomatic('openai-codex', 'threshold');
+  assert.doesNotThrow(() => coordinator.assertManualAllowed('openai-codex'));
 });
 
-test('an unknown reserve keeps the guard closed and pauses as a reserve blocker', async () => {
+test('admit performs a fresh quota read and pauses only the failing provider', async () => {
+  const d = deps({ readQuota: (async () => { throw new QuotaError('unavailable'); }) as unknown as typeof readQuota }).deps;
+  await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'unavailable');
+});
+
+test('an unknown reserve pauses only its provider as a reserve blocker', async () => {
   const d = deps({ reserve: () => new Map<string, number | null>([['monthly', null]]) }).deps;
   await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
-  assert.equal(d.fleet.snapshot().state, 'paused');
-  assert.equal(d.fleet.snapshot().reason, 'reserve');
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'reserve');
 });
 
 test('a paused fleet admits nothing — zero reads and zero leases — until a strict fresh true reopens it', async () => {
@@ -63,11 +82,12 @@ test('a paused fleet admits nothing — zero reads and zero leases — until a s
   assert.equal(admitted, true);
 });
 
-test('a throwing assessment releases the lane and fails closed', async () => {
+test('a throwing assessment releases the lane and pauses only its provider', async () => {
   const d = deps({ reserve: () => { throw new Error('reserve exploded'); } }).deps;
   await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
-  assert.equal(d.fleet.snapshot().state, 'paused');
-  assert.equal(d.fleet.snapshot().reason, 'unavailable');
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'unavailable');
   assert.equal(d.fifo.activeAccounts, 0);
 });
 
@@ -145,7 +165,8 @@ test('the gate never forwards on missing identity or origin drift', async () => 
   await assert.rejects(() => settlesWithin(coordinator.gatedFetch(commandcodeScope, inner)('https://evil.example/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer k1' } }), 1_000), isAuthRefusal);
   await assert.rejects(() => settlesWithin(coordinator.gatedFetch({ ...commandcodeScope, credential: 'k9' }, inner)('https://api.commandcode.ai/provider/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer k1' } }), 1_000), isAuthRefusal);
   assert.equal(calls, 0);
-  assert.equal(d.fleet.snapshot().reason, 'identity');
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'identity');
 });
 
 test('release happens exactly once on stream error', async () => {
@@ -308,8 +329,9 @@ test('a malformed authorization header fails closed and pauses identity', async 
     (error: unknown) => error instanceof QuotaError && error.code === 'auth',
   );
   assert.equal(calls, 0);
-  assert.equal(d.fleet.snapshot().reason, 'identity');
-  assert.equal(d.fleet.snapshot().state, 'paused');
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'identity');
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
 });
 
 test('aborting mid-stream releases the lease before the consumer observes the abort', async () => {
@@ -425,7 +447,8 @@ test('a Request whose url differs at construction fails closed without retaining
   await assert.rejects(() => new GuardCoordinator(d).gatedFetch(commandcodeScope, inner)(hostile),
     (error: unknown) => error instanceof QuotaError && error.code === 'auth');
   assert.equal(calls, 0);
-  assert.equal(d.fleet.snapshot().reason, 'identity');
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'identity');
   assert.equal(d.fleet.snapshot().inferences, 0);
   assert.equal(d.fleet.snapshot().active, 0);
   assert.equal(d.fifo.activeAccounts, 0);
@@ -547,9 +570,10 @@ test('a threshold pause is reported as a threshold blocker, not a bad identity',
   const { deps: d } = deps({ readQuota: (async () => exhausted) as unknown as typeof readQuota });
   await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope),
     (error: unknown) => error instanceof QuotaError);
-  const after = d.fleet.snapshot();
+  const after = d.fleet.snapshot('commandcode');
   assert.equal(after.state, 'paused');
   assert.equal(after.reason, 'threshold');
+  assert.equal(d.fleet.snapshot().state, 'open');
 });
 
 test('identity is read once, so an accessor cannot swap the credential behind the check', async () => {
@@ -573,19 +597,16 @@ test('identity is read once, so an accessor cannot swap the credential behind th
   assert.equal(reads, 1, 'the caller accessor must be read exactly once');
 });
 
-test('a throwing scope accessor fails closed and leaves the lane free', async () => {
+test('a throwing scope accessor fails closed, pauses only its provider, and leaves the lane free', async () => {
   const { deps: d } = deps();
   const coordinator = new GuardCoordinator(d);
   const hostile: AttemptScope = { providerId: 'commandcode', scope: 'provider',
     get credential(): string { throw new Error('hostile accessor'); } };
   await assert.rejects(() => coordinator.admit(hostile),
     (error: unknown) => error instanceof QuotaError && error.code === 'auth');
-  assert.equal(d.fleet.snapshot().reason, 'identity');
-  // Fail-closed pauses the fleet, so reopening it is what makes a leaked lane observable:
-  // the bound below turns a leaked lane into a failure instead of a hang.
-  await d.fleet.tryResume(async () => true);
-  const release = await settlesWithin(coordinator.admit(commandcodeScope), 1_000);
-  release();
+  assert.equal(d.fleet.snapshot().state, 'open');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'identity');
+  assert.equal(d.fifo.activeAccounts, 0);
 });
 
 test('a pause landing as the inference lease is acquired re-checks instead of rejecting the attempt', async () => {
@@ -638,13 +659,83 @@ test('a provider-scoped 404 quota surface refuses that attempt and leaves the fl
   assert.equal(d.fleet.snapshot().state, 'open');
 });
 
-test('systemic failures still pause the shared fleet: a 5xx or a transport error is not provider-scoped', async () => {
-  for (const failure of [new QuotaError('unavailable'), new TypeError('network down')]) {
-    const { deps: d } = deps({ readQuota: (async () => { throw failure; }) as unknown as typeof readQuota });
-    await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
-    assert.equal(d.fleet.snapshot().state, 'paused', `${String(failure)} must still pause`);
-    assert.equal(d.fleet.snapshot().reason, 'unavailable');
-    assert.deepEqual(new GuardCoordinator(d).unsupportedProviders(), []);
+test('provider fresh check verifies every retained Codex account before clearing its hold', async () => {
+  const account = (accountId: string): AttemptScope => ({ providerId: 'openai-codex', scope: 'account', accountId, credential: 'k1' });
+  const { deps: d } = deps({
+    readQuota: (async (auth: { providerId: GuardedProvider; accountId?: string }) => {
+      if (auth.accountId === 'acct-a') throw new QuotaError('unavailable');
+      return { ...openSnapshot('account'), providerId: auth.providerId, accountId: auth.accountId };
+    }) as unknown as typeof readQuota,
+  });
+  const coordinator = new GuardCoordinator(d);
+  await assert.rejects(() => coordinator.admit(account('acct-a')));
+
+  const abort = new AbortController();
+  const waiting = coordinator.admit(account('acct-b'), abort.signal).then((release) => { release(); return 'admitted'; });
+  const resumed = await d.fleet.resumeAutomatic('openai-codex', () => coordinator.freshCheck('openai-codex'));
+  abort.abort();
+  assert.equal(resumed, false, 'a healthy peer account cannot stand in for the failed account');
+  await assert.rejects(waiting, { name: 'AbortError' });
+  assert.equal(d.fleet.snapshot('openai-codex').reason, 'unavailable');
+});
+
+test('a new account scope arriving during a provider resume check invalidates that check', async () => {
+  const account = (accountId: string): AttemptScope => ({ providerId: 'openai-codex', scope: 'account', accountId, credential: 'k1' });
+  let accountAReads = 0;
+  let finishAccountA: (() => void) | undefined;
+  const { deps: d } = deps({
+    readQuota: (async (auth: { providerId: GuardedProvider; accountId?: string }) => {
+      if (auth.accountId === 'acct-a' && ++accountAReads === 1) throw new QuotaError('unavailable');
+      if (auth.accountId === 'acct-a') {
+        return new Promise<import('../../src/quota-guard/types.ts').QuotaSnapshot>((resolve) => {
+          finishAccountA = () => resolve({ ...openSnapshot('account'), providerId: auth.providerId, accountId: auth.accountId });
+        });
+      }
+      return { ...openSnapshot('account'), providerId: auth.providerId, accountId: auth.accountId };
+    }) as unknown as typeof readQuota,
+  });
+  const coordinator = new GuardCoordinator(d);
+  await assert.rejects(() => coordinator.admit(account('acct-a')));
+
+  const resuming = d.fleet.resumeAutomatic('openai-codex', () => coordinator.freshCheck('openai-codex'));
+  assert.ok(finishAccountA, 'fresh check must have started the deferred account read');
+  const abort = new AbortController();
+  const waiting = coordinator.admit(account('acct-b'), abort.signal).then((release) => { release(); return 'admitted'; });
+  finishAccountA();
+  const resumed = await resuming;
+  abort.abort();
+  assert.equal(resumed, false, 'a newly retained account must invalidate the in-flight scope snapshot');
+  await assert.rejects(waiting, { name: 'AbortError' });
+  assert.equal(d.fleet.snapshot('openai-codex').reason, 'unavailable');
+});
+
+test('automatic quota failures block only their provider in both directions', async () => {
+  const codexScope: AttemptScope = { providerId: 'openai-codex', scope: 'account', accountId: 'acct-1', credential: 'k1' };
+  const scopes = [commandcodeScope, codexScope] as const;
+  const failures = [
+    new QuotaError('unavailable'),
+    new QuotaError('auth'),
+    new QuotaError('schema'),
+    new TypeError('network down'),
+  ];
+  for (const scope of scopes) for (const failure of failures) {
+    const peer = scopes.find((candidate) => candidate.providerId !== scope.providerId)!;
+    const readQuotaForScope = (async (auth: { providerId: string }) => {
+      if (auth.providerId === scope.providerId) throw failure;
+      const quotaScope = auth.providerId === 'openai-codex' ? 'account' : 'provider';
+      return { ...openSnapshot(quotaScope), providerId: auth.providerId };
+    }) as unknown as typeof readQuota;
+    const { deps: d } = deps({ readQuota: readQuotaForScope });
+    const coordinator = new GuardCoordinator(d);
+    await assert.rejects(() => coordinator.admit(scope));
+    assert.equal(d.fleet.snapshot().state, 'open', 'provider failure must not pause the root fleet');
+    assert.equal(d.fleet.snapshot(scope.providerId).state, 'paused', 'failing provider must latch locally');
+    const expectedReason = failure instanceof QuotaError
+      ? failure.code === 'auth' || failure.code === 'schema' ? 'identity' : 'unavailable'
+      : 'unavailable';
+    assert.equal(d.fleet.snapshot(scope.providerId).reason, expectedReason);
+    const release = await d.fleet.enter(peer.providerId, 'inference');
+    release();
   }
 });
 
@@ -671,6 +762,8 @@ test('status() reports an unsupported provider instead of a merely unavailable o
       (error: unknown) => (error as { code?: string }).code === 'unsupported');
     const status = quotaGuardControls(runtime)?.status();
     assert.deepEqual(status?.unsupported, ['commandcode']);
+    assert.equal(status?.providers.commandcode.unsupported, true);
+    assert.equal(status?.providers.commandcode.guard, 'guarded');
     assert.equal(status?.state, 'open', 'the refused provider must not have paused the fleet');
     assert.equal(status?.reason, undefined);
   } finally {

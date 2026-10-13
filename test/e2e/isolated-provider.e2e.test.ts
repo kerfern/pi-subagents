@@ -16,8 +16,8 @@
  *
  * This test closes exactly that gap and nothing else: it asserts the real facade
  * exposes a runtime-reachable `.runtime` that IS the runtime it wraps. It is not a
- * guard for the forwarding itself (that's the unit test's job) — a fuller e2e that
- * drives real `runAgent` end-to-end is tracked as a follow-up.
+ * guard for the forwarding itself (that's the unit test's job). Real child `runAgent`/
+ * `resumeAgent` dispatch is covered by `test/quota-subagent-runtime.test.ts`.
  *
  * VERSION GATE: `.runtime` only exists in the post-migration facade world (Pi >=
  * 0.80.8, where `ModelRuntime` is first exported). The repo's dev dependency is

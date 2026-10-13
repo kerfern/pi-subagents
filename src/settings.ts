@@ -223,16 +223,17 @@ export interface SubagentsSettings {
    * Master switch for the quota guard. Defaults to `false`: enabling it is an
    * operator action, never something a session turns on for itself.
    *
-   * When `false` (or absent) the extension is inert - `quotaGuardExtension`
-   * returns before resolving credentials, reading files or decorating a
-   * runtime, and `/quota-guard` is not registered. When `true` the guard
-   * installs against the runtime handle it is handed and the
-   * `/quota-guard enable|pause|resume|status` subcommands become available.
+   * When `false` (or absent), the guard does not resolve credentials or decorate
+   * a runtime; the persistent `/quota-guard on|off` command remains available in
+   * command-only mode. When `true`, the guard installs against the runtime handle
+   * it is handed and runtime controls such as `pause|resume|status` are available.
    *
    * Read once at extension init, before registration, so flipping it takes
    * effect on the next pi session - the same contract `schedulingEnabled` has.
    */
   quotaGuardEnabled?: boolean;
+  quotaGuardCodexEnabled?: boolean;
+  quotaGuardCommandCodeEnabled?: boolean;
   /**
    * Absolute path to the durable state directory the guard's wake machine records into. Created and
    * owned by the guard; secret-free.
@@ -387,6 +388,8 @@ export interface SettingsAppliers {
   setWorktreeIsolation: (b: boolean) => void;
   setWorkflowsEnabled: (b: boolean) => void;
   setQuotaGuardEnabled: (b: boolean) => void;
+  setQuotaGuardCodexEnabled: (b: boolean) => void;
+  setQuotaGuardCommandCodeEnabled: (b: boolean) => void;
   setQuotaGuardStateDir: (dir: string) => void;
   setQuotaGuardCodexLimits: (limits: readonly CodexLimit[]) => void;
   setQuotaGuardReserveUnits: (units: Record<string, number>) => void;
@@ -556,6 +559,8 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.quotaGuardEnabled === "boolean") {
     out.quotaGuardEnabled = r.quotaGuardEnabled;
   }
+  if (typeof r.quotaGuardCodexEnabled === "boolean") out.quotaGuardCodexEnabled = r.quotaGuardCodexEnabled;
+  if (typeof r.quotaGuardCommandCodeEnabled === "boolean") out.quotaGuardCommandCodeEnabled = r.quotaGuardCommandCodeEnabled;
   if (typeof r.quotaGuardStateDir === "string") {
     const dir = r.quotaGuardStateDir.trim();
     if (isAbsolute(dir)) out.quotaGuardStateDir = dir;
@@ -622,6 +627,19 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
   }
 }
 
+/** Preserve the user's original quota-guard choices in settings snapshots. */
+export function snapshotQuotaGuardSettings(
+  enabled: boolean,
+  codexEnabled?: boolean,
+  commandCodeEnabled?: boolean,
+): Pick<SubagentsSettings, "quotaGuardEnabled" | "quotaGuardCodexEnabled" | "quotaGuardCommandCodeEnabled"> {
+  return {
+    quotaGuardEnabled: enabled,
+    quotaGuardCodexEnabled: codexEnabled,
+    quotaGuardCommandCodeEnabled: commandCodeEnabled,
+  };
+}
+
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
@@ -651,6 +669,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
   if (typeof s.quotaGuardEnabled === "boolean") appliers.setQuotaGuardEnabled(s.quotaGuardEnabled);
+  appliers.setQuotaGuardCodexEnabled(s.quotaGuardCodexEnabled ?? s.quotaGuardEnabled ?? false);
+  appliers.setQuotaGuardCommandCodeEnabled(s.quotaGuardCommandCodeEnabled ?? s.quotaGuardEnabled ?? false);
   if (typeof s.quotaGuardStateDir === "string") appliers.setQuotaGuardStateDir(s.quotaGuardStateDir);
   if (s.quotaGuardCodexLimits) appliers.setQuotaGuardCodexLimits(s.quotaGuardCodexLimits);
   if (s.quotaGuardReserveUnits) appliers.setQuotaGuardReserveUnits(s.quotaGuardReserveUnits);

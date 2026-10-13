@@ -86,17 +86,17 @@ test('status after pause reports the pause and active counts', () => {
 
   const controls = quotaGuardControls(runtime);
   assert.ok(controls);
-  controls.pause('threshold');
+  controls.pause('all');
 
   const status = controls.status();
   assert.equal(status.enabled, true);
   assert.equal(status.installed, true);
   assert.equal(status.state, 'paused');
-  assert.equal(status.reason, 'threshold');
+  assert.equal(status.reason, 'manual');
   assert.equal(status.active, 0);
   assert.equal(status.inferences, 0);
   assert.equal(status.coding, 0);
-  assert.equal(fleet.snapshot().reason, 'threshold');
+  assert.equal(fleet.snapshot().reason, 'manual');
 });
 
 test('disposal restores a runtime whose methods were replaced', () => {

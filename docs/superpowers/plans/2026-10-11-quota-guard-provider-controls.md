@@ -49,24 +49,41 @@
 - [ ] Run `npx vitest run test/settings.test.ts`; confirm green.
 - [ ] Run `npx tsc --noEmit`; commit settings and tests.
 
-### Task 2: Isolate automatic quota state per provider
+### Task 2A: Build provider-local admission and pause state
 
 **Files:**
-- Modify: `src/quota-guard/coordinator.ts` — `GuardCoordinator.admit`, `freshCheck`, provider pause state.
-- Modify: `src/quota-guard/controller.ts` — compose provider automatic latches with the existing manual all/provider holds while preserving lane FIFO and in-flight draining.
-- Test: `quota-guard/test/coordinator.test.ts` and `quota-guard/test/controller.test.ts`.
+- Modify: `src/quota-guard/controller.ts`, `src/quota-guard/coordinator.ts`, `src/quota-guard/root-binding.ts`, and `src/quota-guard/root.ts` (`failIdentity`, `pauseAndThrow`, `resolveScope`).
+- Test: `quota-guard/test/controller.test.ts`, `coordinator.test.ts`, `root-binding.test.ts`, and `root.test.ts`.
 
 **Interfaces:**
-- Keep `GuardedProvider` identity values `openai-codex` and `commandcode`.
-- Add an internal provider-local automatic pause/state keyed by `GuardedProvider`; keep a separate manual `all` hold and per-provider manual holds.
-- Every `admit` decision receives a resolved `providerId`; an enabled provider checks its own automatic state plus applicable manual holds.
+- Keep provider identities restricted to `openai-codex` and `commandcode`.
+- Use one composite `FleetLatch`, not nested latches: track separate manual-all, provider-manual, and provider-automatic holds; provider epochs/counts; and atomically validate relevant epochs plus acquire one lease.
+- Preserve account-lane FIFO and in-flight draining. `GuardCoordinator.admit` and fresh checks use the attempt's provider identity; provider failures never become root-wide automatic pauses.
+- Preserve existing root `snapshot()`/legacy pause-resume compatibility for Task 2B consumers; expose provider-aware wait/admission/fresh-check operations from the root binding without wiring `index.ts` or `wake.ts` yet.
 
-- [ ] Add failing paired-provider tests: low reserve/threshold, `unsupported` 404, auth/schema, network/5xx, and unknown reserve on Codex block Codex only; CommandCode remains admissible, and reverse direction is also tested. Add an unknown-identity/malformed-scope case proving refusal occurs before quota or model transport.
-- [ ] Add failing pause-composition tests: automatic provider pause is independent; manual `all` blocks both; manual provider pause blocks only its target; in-flight leases drain.
-- [ ] Run `npx vitest run quota-guard/test/coordinator.test.ts quota-guard/test/controller.test.ts`; confirm new tests fail.
-- [ ] Implement provider-local automatic state and manual target state. Route all automatic failures through the attempt's provider state, never the shared all-provider manual latch. Keep unknown/unattributable identity fail-closed before quota transport.
-- [ ] Implement targeted fresh-check/resume behavior: all resumes check every enabled paused provider; a targeted resume checks only that provider; an OFF provider becomes dispatchable after its manual hold clears without a quota read.
-- [ ] Run the two focused tests; confirm green, then commit.
+- [ ] Add failing paired-provider tests: low reserve/threshold, unsupported 404, auth/schema, network/5xx, and unknown reserve on one provider block that provider only; test the reverse direction. For a known provider with malformed account/credential scope, refuse and pause only that provider before transport; truly unassignable attempts refuse without silently passing through as OFF.
+- [ ] Add failing hold-composition tests: automatic provider pause is independent; manual `all` blocks both; provider manual pause blocks only its target; in-flight leases drain.
+- [ ] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/root-binding.test.ts test/root.test.ts`; confirm red.
+- [ ] Implement the composite gate's target-aware waits and atomic lease admission. Route every automatic failure to the provider's automatic hold, fence stale fresh checks by provider epoch, and refuse unattributable identity before transport.
+- [ ] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/root-binding.test.ts test/root.test.ts`; confirm green, then commit Task 2A.
+
+### Task 2B: Wire targeted runtime controls and legacy wake safely
+
+**Files:**
+- Modify: `src/quota-guard/root.ts`, `index.ts`, `wake.ts`, `host-hook.ts`, `coordinator.ts`, and `controller.ts`.
+- Test: `quota-guard/test/root.test.ts`, `wake.test.ts`, `host-hook.test.ts`, `production-wiring.test.ts`, `root-binding.test.ts`, `loader.test.mjs`, `coordinator.test.ts`, and `controller.test.ts`.
+- Scope correction: `guardedProviders` must travel through the hook so Task 3 can select OFF providers without changing runtime interception; coordinator exposes synchronous manual-hold refusal for that OFF path. Legacy persisted `manual` is operator-owned, not an automatic wake candidate; explicit `resume all` may clear it and must atomically converge its stored manifest to open.
+
+**Interfaces:**
+- Expose the targeted pause/resume API needed by Task 3 without adding command parsing or presentation here.
+- When the guard hook is installed, enforce manual holds for either known provider, including the provider whose automatic guard is OFF; otherwise preserve normal unguarded pass-through.
+- Targeted resume checks only the target; all-resume checks every enabled provider automatic pause. Clearing an OFF provider's manual hold performs no quota read.
+- Legacy root wake/recovery must never clear manual holds or promote a provider-local failure into a global pause. Do not introduce a durable per-provider schema; refuse an unattributable legacy state safely.
+
+- [ ] Add failing runtime/control tests for provider identity routing, OFF-provider manual holds, target-specific and all-target resume checks, and legacy wake safety.
+- [ ] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/root.test.ts test/wake.test.ts test/host-hook.test.ts test/production-wiring.test.ts`; confirm red.
+- [ ] Implement only runtime control and wake integration. Do not add Task 3 command syntax or status formatting.
+- [ ] Run those focused tests and `node quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 2B.
 
 ### Task 3: Wire provider controls, commands, and truthful status
 
@@ -80,12 +97,12 @@
 - Command syntax: `/quota-guard pause [all|codex|commandcode]`, `/quota-guard resume [all|codex|commandcode]`; omitted target aliases `all`.
 - Keep `/quota-guard status`; show each provider as guarded or explicitly unguarded, plus manual/automatic pause, unsupported status, reserve provenance, and installation status.
 
-- [ ] Add failing command tests for all three targets, bare-command alias, invalid target refusal, and matching resume targets.
-- [ ] Add failing status tests proving OFF is labeled `unguarded` and provider-local automatic failures do not appear as a global pause.
-- [ ] Run the focused host-hook and production-wiring tests; confirm red.
-- [ ] Wire resolved settings into `quotaGuardExtension`. Register the command and runtime seam whenever at least one provider is guarded; while installed, apply manual holds to either known provider, including one whose automatic guard is OFF. If both providers resolve OFF, preserve inert default-OFF behavior and register no command or hook.
-- [ ] Implement target parsing, targeted pause/resume, and per-provider status; do not make unsupported CommandCode look admitted when its guard is ON.
-- [ ] Run focused tests and `node quota-guard/check-host.mjs`; confirm green, then commit.
+- [x] Add failing command tests for all three targets, bare-command alias, invalid target refusal, and matching resume targets.
+- [x] Add failing status tests proving OFF is labeled `unguarded` and provider-local automatic failures do not appear as a global pause.
+- [x] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/command-status.test.ts`; confirm the new command/status regressions fail before implementation.
+- [x] Wire resolved settings into `quotaGuardExtension`. Register the command and runtime seam whenever at least one provider is guarded; while installed, apply manual holds to either known provider, including one whose automatic guard is OFF. If both providers resolve OFF, preserve inert default-OFF behavior and register no command or hook.
+- [x] Implement target parsing, targeted pause/resume, and per-provider status; do not make unsupported CommandCode look admitted when its guard is ON.
+- [x] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/host-hook.test.ts test/production-wiring.test.ts test/command-status.test.ts`; run `node quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 3.
 
 ### Task 4: Prove real main and subagent dispatch coverage
 
@@ -118,7 +135,8 @@
 
 ### Task 6: Full acceptance and independent review
 
-- [ ] Run `npx vitest run test/settings.test.ts test/quota-subagent-runtime.test.ts quota-guard/test/coordinator.test.ts quota-guard/test/controller.test.ts quota-guard/test/host-hook.test.ts quota-guard/test/production-wiring.test.ts`.
+- [ ] Run `npx vitest run test/settings.test.ts test/quota-subagent-runtime.test.ts` in `pi-subagents`.
+- [ ] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/host-hook.test.ts test/production-wiring.test.ts`.
 - [ ] Run `npm run typecheck:quota`, `npx tsc --noEmit`, `node quota-guard/check-host.mjs`, and `npm run check` in `pi-subagents`.
 - [ ] Run `npm test` in `pi-harness`.
 - [ ] Run `git diff --check`; confirm `git status --short` contains only intended files and report commits for each repo.

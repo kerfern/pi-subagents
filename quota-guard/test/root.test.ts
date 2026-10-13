@@ -21,6 +21,7 @@ const CODEX_CREDENTIAL = codexCredential('acct-1');
 /** Stub coordinator: records the scope/inner it is handed and the pauses it observes. */
 function stubCoordinator() {
   const pauses: string[] = [];
+  const pauseTargets: (string | undefined)[] = [];
   const gates: { scope: AttemptScope; inner: typeof fetch | undefined }[] = [];
   const innerCalls: string[] = [];
   // Never invokes the inner transport: the suite must make no network request.
@@ -33,9 +34,9 @@ function stubCoordinator() {
   return {
     coordinator: {
       gatedFetch,
-      pause: (reason: string) => { pauses.push(reason); },
+      pause: (reason: string, providerId?: string) => { pauses.push(reason); pauseTargets.push(providerId); },
     },
-    pauses, gates, innerCalls,
+    pauses, pauseTargets, gates, innerCalls,
   };
 }
 
@@ -79,6 +80,46 @@ test('unguarded providers pass through untouched, including their own fetch and 
     assert.equal(forwardedOptions(seen).transport, 'websocket');
     assert.equal(forwardedOptions(seen).fetch, callerFetch);
     assert.equal(gates.length, 0);
+  } finally { dispose(); }
+});
+
+test('an OFF provider passes through without quota reads but refuses a matching manual hold', () => {
+  const { runtime, dispatch, seen } = makeRuntime();
+  const { coordinator: base, gates } = stubCoordinator();
+  let manuallyPaused = false;
+  const checks: string[] = [];
+  const coordinator = {
+    ...base,
+    assertManualAllowed(providerId: string) {
+      checks.push(providerId);
+      if (manuallyPaused) throw new Error(`Quota guard: ${providerId} is manually paused`);
+    },
+  };
+  const options = { transport: 'websocket', fetch: callerFetch };
+  const dispose = installQuotaGuard({
+    runtime, rootId: 'root-1', coordinator, codexLimits, guardedProviders: ['openai-codex'],
+  });
+  try {
+    assert.equal(dispatch.stream({ provider: 'commandcode', id: 'm', api: 'openai-completions' }, 'ctx', options), 'stream-result');
+    assert.equal(seen[0].args[2], options, 'OFF dispatch must keep the original options untouched');
+    assert.equal(gates.length, 0, 'OFF dispatch must not read quota or install a gated fetch');
+    let providerReads = 0;
+    const flipping = {
+      get provider() { return ++providerReads === 1 ? 'commandcode' : 'openai-codex'; },
+      id: 'm', api: 'openai-completions',
+    };
+    dispatch.stream(flipping, 'ctx', options);
+    assert.equal((seen[1].args[0] as { provider: string }).provider, 'commandcode',
+      'OFF provider routing must stay pinned even if a getter later claims an enabled provider');
+    assert.deepEqual(checks, ['commandcode', 'commandcode']);
+    assert.equal(gates.length, 0);
+
+    manuallyPaused = true;
+    assert.throws(
+      () => dispatch.stream({ provider: 'commandcode', id: 'm', api: 'openai-completions' }, 'ctx', options),
+      /commandcode is manually paused/,
+    );
+    assert.equal(seen.length, 2, 'a manual hold must refuse before the provider runtime is called');
   } finally { dispose(); }
 });
 
@@ -303,16 +344,17 @@ test('a coordinator without a public pause fails closed instead of silently skip
   } finally { dispose(); }
 });
 
-test('the mandatory identity pause reaches the coordinator public pause', async () => {
+test('the mandatory identity pause reaches the coordinator public pause with its provider', async () => {
   const { runtime, dispatch, seen } = makeRuntime();
   runtime.getAuth = async () => ({ auth: { apiKey: jwt({}), headers: {} } });
-  const { coordinator, pauses, gates } = stubCoordinator();
+  const { coordinator, pauses, pauseTargets, gates } = stubCoordinator();
   const dispose = installQuotaGuard({ runtime, rootId: 'root-1', coordinator, codexLimits });
   try {
     dispatch.stream({ provider: 'openai-codex', id: 'm', api: 'openai-codex-responses' }, 'ctx', {});
     const gated = forwardedOptions(seen).fetch as typeof fetch;
     await assert.rejects(gated('https://chatgpt.com/backend-api/codex/responses', {}));
     assert.deepEqual(pauses, ['identity']);
+    assert.deepEqual(pauseTargets, ['openai-codex']);
     assert.equal(gates.length, 0);
   } finally { dispose(); }
 });

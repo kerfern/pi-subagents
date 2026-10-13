@@ -159,6 +159,109 @@ function instanceOf(prototype: Record<string, unknown>, credential: string, call
 beforeEach(async () => { await resetQuotaGuardStateForTest(); setQuotaGuardEnabled(false); });
 afterEach(async () => { await resetQuotaGuardStateForTest(); setQuotaGuardEnabled(false); });
 
+test('an OFF provider respects manual hold over the real prototype hook without quota reads', async () => {
+  const quotaCalls: string[] = [];
+  const quotaFetch = (async (input: string | URL | Request) => {
+    quotaCalls.push(String(input));
+    return new Response('{}', { status: 200 });
+  }) as unknown as typeof fetch;
+  const { prototype, seen, host } = await enabledHost(quotaFetch, { guardedProviders: ['openai-codex'] });
+  const binding = quotaGuardRootBinding();
+  const controls = quotaGuardControls();
+  assert.ok(binding);
+  assert.ok(controls);
+  binding.fleet.pauseAutomatic('commandcode', 'unavailable');
+  const instance = instanceOf(prototype, codexCredential('acct-1'));
+  assert.equal(await instance.stream({ provider: 'commandcode', id: 'm', api: 'openai-completions' }, {}, { client: {} }),
+    'no-fetch-issued', 'OFF provider automatic hold must not prevent unguarded dispatch');
+  assert.equal(seen.length, 1);
+
+  binding.fleet.pauseManual('commandcode');
+  assert.throws(
+    () => instance.stream({ provider: 'commandcode', id: 'm', api: 'openai-completions' }, {}, { client: {} }),
+    /commandcode is manually paused/,
+  );
+  assert.equal(seen.length, 1, 'manual hold refuses before provider runtime and custom transport');
+  assert.deepEqual(quotaCalls, []);
+
+  const checks: string[] = [];
+  host.freshCheck = async (providerId) => { checks.push(providerId ?? 'all'); return true; };
+  assert.equal(await controls.resume('commandcode'), true);
+  assert.deepEqual(checks, [], 'resuming OFF provider manual hold must not read quota');
+  assert.equal(binding.fleet.snapshot('commandcode').automaticReason, undefined);
+});
+
+test('failed durable all-resume leaves manual holds active', async () => {
+  const { host } = await enabledHost(async () => new Response('{}', { status: 200 }));
+  const controls = quotaGuardControls();
+  const binding = quotaGuardRootBinding();
+  assert.ok(controls);
+  assert.ok(binding);
+  controls.pause('all');
+  let attempts = 0;
+  host.wake = {
+    status: () => null,
+    resumeManual: async () => { attempts++; return false; },
+  };
+
+  assert.equal(await controls.resume('all'), false);
+  assert.equal(attempts, 1);
+  assert.equal(binding.fleet.snapshot('openai-codex').manual, true,
+    'failed persistence must not release Codex dispatch');
+  assert.equal(binding.fleet.snapshot('commandcode').manual, true,
+    'failed persistence must not release CommandCode dispatch');
+});
+
+test('manual pause during legacy root recovery remains held', async () => {
+  const { host } = await enabledHost(async () => new Response('{}', { status: 200 }));
+  const controls = quotaGuardControls();
+  const binding = quotaGuardRootBinding();
+  assert.ok(controls);
+  assert.ok(binding);
+  binding.fleet.pause('threshold');
+  let startCheck!: () => void;
+  let finishCheck!: (ready: boolean) => void;
+  const checkStarted = new Promise<void>((resolve) => { startCheck = resolve; });
+  const checkResult = new Promise<boolean>((resolve) => { finishCheck = resolve; });
+  host.freshCheck = async () => { startCheck(); return checkResult; };
+
+  const resumed = controls.resume('all');
+  await checkStarted;
+  controls.pause('codex');
+  finishCheck(true);
+
+  assert.equal(await resumed, false);
+  assert.equal(binding.fleet.snapshot('openai-codex').manual, true);
+});
+
+test('targeted controls isolate manual holds and resume checks only selected provider', async () => {
+  const { host } = await enabledHost(async () => new Response('{}', { status: 200 }));
+  const controls = quotaGuardControls();
+  const binding = quotaGuardRootBinding();
+  assert.ok(controls);
+  assert.ok(binding);
+  binding.fleet.pauseAutomatic('openai-codex', 'threshold');
+  binding.fleet.pauseAutomatic('commandcode', 'unavailable');
+  const checks: string[] = [];
+  host.freshCheck = async (providerId) => { checks.push(providerId ?? 'all'); return true; };
+
+  controls.pause('codex');
+  controls.pause('commandcode');
+  assert.equal(binding.fleet.snapshot('openai-codex').manual, true);
+  assert.equal(binding.fleet.snapshot('commandcode').manual, true);
+  assert.equal(await controls.resume('codex'), true);
+  assert.deepEqual(checks, ['openai-codex']);
+  assert.equal(binding.fleet.snapshot('openai-codex').manual, false);
+  assert.equal(binding.fleet.snapshot('commandcode').manual, true);
+  assert.equal(binding.fleet.snapshot('commandcode').automaticReason, 'unavailable');
+
+  binding.fleet.pauseAutomatic('openai-codex', 'threshold');
+  assert.equal(await controls.resume('all'), true);
+  assert.deepEqual(checks, ['openai-codex', 'openai-codex', 'commandcode']);
+  assert.equal(binding.fleet.snapshot('commandcode').manual, false);
+  assert.equal(binding.fleet.snapshot('commandcode').automaticReason, undefined);
+});
+
 test('flag off: the entry is inert on the real wiring path', async () => {
   const quotaCalls: string[] = [];
   const quotaFetch = (async (input: string | URL | Request) => {
@@ -232,7 +335,11 @@ test('identity resolves from the dispatching instance and the credential, not th
   // ...and the prototype itself cannot answer, because the identity lives on the instance.
   assert.throws(() => (prototype.stream as AnyFn).call(prototype, model, 'ctx', {}),
     /no live runtime receiver/);
-  assert.equal(controls.status().reason, 'identity', 'the prototype receiver must latch identity');
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  assert.equal(binding.fleet.snapshot('openai-codex').reason, 'identity',
+    'the prototype receiver must latch identity only for Codex');
+  assert.equal(binding.fleet.snapshot().state, 'open');
 });
 
 test('a window over threshold refuses the dispatch and never reaches the inner transport', async () => {
@@ -246,9 +353,12 @@ test('a window over threshold refuses the dispatch and never reaches the inner t
     () => instance.stream(model, 'ctx', { fetch: inner.fetchImpl }),
     (error: unknown) => (error as { code?: string }).code === 'unavailable');
   assert.deepEqual(inner.calls, [], 'a refused dispatch must never reach the inner transport');
-  const status = quotaGuardControls()?.status();
-  assert.equal(status?.state, 'paused');
-  assert.equal(status?.reason, 'threshold', 'an exhausted window must not be reported as identity');
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  assert.equal(binding.fleet.snapshot().state, 'open');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'threshold',
+    'an exhausted window must not be reported as identity');
 });
 
 test('a paused fleet reopens through the real freshCheck and is then admitted for real', async () => {
@@ -260,20 +370,23 @@ test('a paused fleet reopens through the real freshCheck and is then admitted fo
   const controls = quotaGuardControls();
   assert.ok(controls, 'the hook install must expose the real controls');
 
-  // Healthy window, but no observation yet: the reserve is unknown, so the guard stays closed.
+  // Healthy window, but no observation yet: the reserve is unknown, so the provider stays closed.
   await assert.rejects(
     () => instance.stream(model, 'ctx', { fetch: inner.fetchImpl }),
     (error: unknown) => (error as { code?: string }).code === 'unavailable');
   assert.deepEqual(inner.calls, [], 'an unknown reserve must not reach the inner transport');
-  assert.equal(controls.status().state, 'paused');
-  assert.equal(controls.status().reason, 'reserve');
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  assert.equal(binding.fleet.snapshot().state, 'open');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(binding.fleet.snapshot('commandcode').reason, 'reserve');
 
-  // Genuine usage movement calibrates the reserve through resume's OWN freshCheck. Nothing here
-  // assigns `host.freshCheck` or `binding.freshCheck`: a dead production check leaves this red.
   level.monthly = 6;
   level.rolling = 6;
-  assert.equal(await controls.resume(), true, 'the real freshCheck must reopen the fleet');
-  assert.equal(controls.status().state, 'open');
+  assert.equal(await binding.fleet.resumeAutomatic('commandcode', () => binding.freshCheck('commandcode')), true,
+    'the real freshCheck must reopen the provider');
+  assert.equal(binding.fleet.snapshot('commandcode').state, 'open');
+  assert.equal(binding.fleet.snapshot().state, 'open');
 
   assert.equal(await instance.stream(model, 'ctx', { fetch: inner.fetchImpl }), 'inner-ok',
     'a reopened fleet must admit the next dispatch');

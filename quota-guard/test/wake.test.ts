@@ -108,6 +108,179 @@ function memoryStore(seed: Value | null) {
   return { store };
 }
 
+test('legacy manual root pause is not auto-cleared and remains resumable by operator', async () => {
+  const fleet = new FleetLatch('root-a');
+  const { store } = memoryStore(paused({ reason: 'manual', wakeAt: iso(T) }));
+  let checks = 0;
+  const wake = new RootWake(deps({
+    fleet, store,
+    check: async () => { checks++; return healthy(); },
+  }));
+
+  await wake.start();
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal(fleet.snapshot().reason, 'manual');
+  assert.equal(checks, 0, 'legacy manual pause must not enter automatic quota recovery');
+  assert.equal((await store.read())?.state, 'paused', 'wake must not write an open record over manual pause');
+
+  const resumed = await fleet.resume('all', undefined, (commitManual) => wake.resumeManual(commitManual));
+  assert.equal(resumed, true,
+    `operator resume must persist before clear; wake=${JSON.stringify(wake.status())}, fleet=${JSON.stringify(fleet.snapshot())}`);
+  assert.equal(fleet.snapshot().state, 'open');
+  assert.equal((await store.read())?.state, 'open');
+  assert.equal(await wake.resumeManual(), true, 'legacy no-argument call remains harmless after resume');
+  assert.equal(checks, 0);
+  await wake.dispose();
+});
+
+test('root automatic recovery proceeds when both provider manual holds are active', async () => {
+  const fleet = new FleetLatch('root-a');
+  fleet.pauseManual('openai-codex');
+  fleet.pauseManual('commandcode');
+  const { store } = memoryStore(paused({ reason: 'threshold', wakeAt: iso(T) }));
+  let checks = 0;
+  const wake = new RootWake(deps({
+    fleet, store,
+    check: async () => { checks++; return healthy(); },
+  }));
+
+  await wake.start();
+  assert.equal(checks, 1, 'provider manual holds must not strand unrelated root recovery');
+  assert.equal(fleet.snapshot().state, 'open');
+  assert.equal(fleet.snapshot('openai-codex').manual, true);
+  assert.equal(fleet.snapshot('commandcode').manual, true);
+  assert.equal((await store.read())?.state, 'open');
+  await wake.dispose();
+});
+
+test('failed legacy-manual manifest write does not release the latch', async () => {
+  const fleet = new FleetLatch('root-a');
+  const base = memoryStore(paused({ reason: 'manual', wakeAt: iso(T + 90_000) }));
+  let writes = 0;
+  const store: QuotaStore = {
+    read: () => base.store.read(),
+    write: async () => { writes++; throw new Error('disk full'); },
+    close: () => base.store.close(),
+  };
+  const wake = new RootWake(deps({ fleet, store }));
+  await wake.start();
+  let clears = 0;
+
+  assert.equal(await wake.resumeManual(() => { clears++; fleet.clearManual('all'); return true; }), false);
+  assert.equal(writes, 1, 'wake must persist open state before invoking latch clear');
+  assert.equal(clears, 0);
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal(fleet.snapshot().reason, 'manual');
+  await wake.dispose();
+});
+
+test('committed-but-threw legacy reopen withdraws its open manifest', async () => {
+  const fleet = new FleetLatch('root-a');
+  const base = memoryStore(paused({ reason: 'manual', wakeAt: iso(T + 90_000) }));
+  let throwOpen = true;
+  const store: QuotaStore = {
+    read: () => base.store.read(),
+    write: async (record, generation) => {
+      await base.store.write(record, generation);
+      if (record.state === 'open' && throwOpen) {
+        throwOpen = false;
+        throw new Error('write committed then threw');
+      }
+    },
+    close: () => base.store.close(),
+  };
+  const wake = new RootWake(deps({ fleet, store }));
+  await wake.start();
+
+  assert.equal(await fleet.resume('all', undefined, (commitManual) => wake.resumeManual(commitManual)), false);
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal((await store.read())?.state, 'paused');
+  assert.equal((await store.read())?.reason, 'manual');
+  await wake.dispose();
+});
+
+test('legacy reopen read-back failure withdraws the committed open manifest', async () => {
+  const fleet = new FleetLatch('root-a');
+  const base = memoryStore(paused({ reason: 'manual', wakeAt: iso(T + 90_000) }));
+  let failNextRead = false;
+  const store: QuotaStore = {
+    read: async () => {
+      if (failNextRead) {
+        failNextRead = false;
+        throw new Error('read-back failed');
+      }
+      return base.store.read();
+    },
+    write: async (record, generation) => {
+      await base.store.write(record, generation);
+      if (record.state === 'open') failNextRead = true;
+    },
+    close: () => base.store.close(),
+  };
+  const wake = new RootWake(deps({ fleet, store }));
+  await wake.start();
+
+  assert.equal(await fleet.resume('all', undefined, (commitManual) => wake.resumeManual(commitManual)), false);
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal((await store.read())?.state, 'paused');
+  assert.equal((await store.read())?.reason, 'manual');
+  await wake.dispose();
+});
+
+test('a manual pause landing during legacy reopen withdraws the open manifest', async () => {
+  const fleet = new FleetLatch('root-a');
+  const base = memoryStore(paused({ reason: 'manual', wakeAt: iso(T + 90_000) }));
+  const store: QuotaStore = {
+    read: () => base.store.read(),
+    write: async (record, generation) => {
+      if (record.state === 'open') fleet.pauseManual('all');
+      await base.store.write(record, generation);
+    },
+    close: () => base.store.close(),
+  };
+  const wake = new RootWake(deps({ fleet, store }));
+  await wake.start();
+
+  const resumed = await fleet.resume('all', undefined, (commitManual) => wake.resumeManual(commitManual));
+  assert.equal(resumed, false);
+  assert.equal(fleet.snapshot().state, 'paused');
+  assert.equal((await store.read())?.state, 'paused');
+  assert.equal((await store.read())?.reason, 'manual');
+  await wake.dispose();
+});
+
+test('root wake recovery preserves a provider-only manual hold', async () => {
+  const fleet = new FleetLatch('root-a');
+  fleet.pauseManual('commandcode');
+  const { store } = memoryStore(paused({ reason: 'threshold', wakeAt: iso(T) }));
+  const wake = new RootWake(deps({ fleet, store }));
+
+  await wake.start();
+  assert.equal(fleet.snapshot().state, 'open', 'the old root-wide automatic hold may recover');
+  assert.equal(fleet.snapshot('openai-codex').state, 'open');
+  assert.equal(fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(fleet.snapshot('commandcode').manual, true, 'wake must not clear target manual hold');
+  await wake.dispose();
+});
+
+test('provider-local automatic hold is not promoted into a root wake pause', async () => {
+  const fleet = new FleetLatch('root-a');
+  fleet.pauseAutomatic('commandcode', 'unavailable');
+  const { store } = memoryStore(null);
+  let checks = 0;
+  const wake = new RootWake(deps({
+    fleet, store,
+    check: async () => { checks++; return healthy(); },
+  }));
+
+  await wake.start();
+  assert.equal(fleet.snapshot().state, 'open');
+  assert.equal(fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(await store.read(), null, 'provider-local pause must not create a root manifest');
+  assert.equal(checks, 0);
+  await wake.dispose();
+});
+
 test('start reinstates a persisted pause and arms the recorded wake without an early check', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'wake-'));
   try {

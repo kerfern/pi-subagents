@@ -23,8 +23,9 @@ interface Outbound { destination: string | Request; init: RequestInit }
  * no longer change the credential a lane was opened for; a throwing accessor fires before any lane
  * or lease exists, so it cannot leak one.
  */
-function snapshotScope(scope: AttemptScope): AttemptScope {
+function snapshotScope(scope: AttemptScope, onProviderId?: (value: unknown) => void): AttemptScope {
   const providerId = scope.providerId;
+  onProviderId?.(providerId);
   const kind = scope.scope;
   const accountId = scope.accountId;
   const credential = scope.credential;
@@ -69,13 +70,13 @@ export interface CoordinatorDeps {
   fleet: FleetLatch;
   readQuota: typeof readQuota;
   policy: Policy;
-  mode: () => GuardMode;
+  mode: (providerId: GuardedProvider) => GuardMode;
   reserve: (lane: string, snapshot: QuotaSnapshot) => ReadonlyMap<string, number | null>;
   now: () => number;
   fetchImpl?: typeof fetch;
 }
 
-function pauseReasonFor(reason: Assessment['reason']): PauseReason {
+function pauseReasonFor(reason: Assessment['reason']): Exclude<PauseReason, 'manual'> {
   // 'threshold' is a real PauseReason; falling through to 'identity' misreported an exhausted
   // window as a bad identity, which is the one reason an operator must not be told by mistake.
   if (reason === 'threshold') return 'threshold';
@@ -148,16 +149,14 @@ function terminalStream(body: ReadableStream<Uint8Array>, release: Release): Rea
 export class GuardCoordinator {
   private readonly deps: CoordinatorDeps;
   /**
-   * The most recently resolved attempt scope, with its credential. Retained so a manual or wake resume
-   * can read quota OUTSIDE dispatch: the observation that calibrates a reserve otherwise only ever
-   * happened inside `admit`, which blocks on the very pause it would have to lift (deadlock).
-   *
-   * Enumeration limit: the estimator is keyed by lane and `AccountFifo.lanes` is private, so only a
-   * scope the guard has actually seen can be re-checked - not every scope that might exist.
-   *
-   * Never persisted, logged or exposed through `status()`: the credential lives here and nowhere else.
+   * Verified attempt scopes retained by provider/lane so resume can re-read quota OUTSIDE dispatch;
+   * reserve calibration otherwise only happens inside `admit`, which waits on the hold it must lift.
+   * Only scopes actually seen by the guard can be re-checked. Credentials stay in memory here and are
+   * never persisted, logged or exposed through `status()`.
    */
-  private held?: { attempt: AttemptScope; lane: string };
+  // A provider hold can cover multiple Codex accounts; retain one verified scope per lane so a
+  // resume checks every account the guard has actually observed.
+  private readonly held = new Map<GuardedProvider, Map<string, { attempt: AttemptScope; lane: string }>>();
   /**
    * Providers refused for a reason scoped to THEM rather than to the root: today, a quota surface
    * that is not served here (HTTP 404). Recorded only so `status()` can say "unsupported" instead of
@@ -170,68 +169,84 @@ export class GuardCoordinator {
   /** Providers refused as unsupported (their quota surface is not served here). Sorted, for `status()`. */
   unsupportedProviders(): readonly GuardedProvider[] { return [...this.unsupported].sort(); }
 
-  /** Public fail-closed latch: pauses the shared fleet for a given reason without exposing it. */
-  pause(reason: PauseReason): void { this.deps.fleet.pause(reason); }
+  /** Provider-attributed failures stay local; unattributed callers retain the root fail-closed latch. */
+  pause(reason: PauseReason, providerId?: GuardedProvider): void {
+    if (providerId && reason !== 'manual') this.deps.fleet.pauseAutomatic(providerId, reason);
+    else this.deps.fleet.pause(reason);
+  }
+
+  /** Synchronous manual-only boundary for providers whose automatic guard is explicitly OFF. */
+  assertManualAllowed(providerId: GuardedProvider): void {
+    if (this.deps.fleet.snapshot(providerId).manual) {
+      throw new Error(`Quota guard: ${providerId} is manually paused; refusing dispatch`);
+    }
+  }
 
   /**
    * The real `freshCheck` behind `resume()`: re-reads quota for the retained scope with the SAME
    * `readQuota` and the same estimator instance the coordinator gates with, so a paused guard can
    * advance calibration and reopen only on a verified, in-policy read.
    *
-   * Fail closed: no retained scope, an unreadable read, or any window whose reserve is still unknown
-   * (the estimator returns null) keeps the guard closed. Never true on an unverified read.
+   * Re-checks every retained lane for the selected provider (or every provider for the legacy no-arg
+   * surface). No retained scope, unreadable read, or unknown reserve keeps the guard closed.
    */
-  async freshCheck(): Promise<boolean> {
-    const held = this.held;
-    if (!held) return false;
+  async freshCheck(providerId?: GuardedProvider): Promise<boolean> {
+    const retained = providerId
+      ? [...(this.held.get(providerId)?.values() ?? [])]
+      : [...this.held.values()].flatMap(scopes => [...scopes.values()]);
+    if (!retained.length) return false;
     const { readQuota: read, policy, mode, reserve, now, fetchImpl } = this.deps;
-    const { attempt, lane } = held;
-    const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
-      ...(attempt.accountId && { accountId: attempt.accountId }), apiKey: attempt.credential,
-      ...(attempt.codexLimits && { codexLimits: attempt.codexLimits }) };
-    const options: ReadOptions = { ...(fetchImpl && { fetchImpl }), now,
-      ...(attempt.codexBase && { codexBase: attempt.codexBase }) };
-    let snapshot: QuotaSnapshot;
-    try {
-      snapshot = await read(auth, options);
-    } catch {
-      return false;
+    for (const { attempt, lane } of retained) {
+      const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
+        ...(attempt.accountId && { accountId: attempt.accountId }), apiKey: attempt.credential,
+        ...(attempt.codexLimits && { codexLimits: attempt.codexLimits }) };
+      const options: ReadOptions = { ...(fetchImpl && { fetchImpl }), now,
+        ...(attempt.codexBase && { codexBase: attempt.codexBase }) };
+      let snapshot: QuotaSnapshot;
+      try {
+        snapshot = await read(auth, options);
+        if (!['open', 'warn'].includes(assess(snapshot, policy, mode(attempt.providerId), reserve(lane, snapshot), now()).state)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
     }
-    try {
-      return ['open', 'warn'].includes(assess(snapshot, policy, mode(), reserve(lane, snapshot), now()).state);
-    } catch {
-      return false;
-    }
+    return true;
   }
 
   async admit(scope: AttemptScope, signal?: AbortSignal): Promise<Release> {
     const { fifo, fleet, readQuota: read, policy, mode, reserve, now, fetchImpl } = this.deps;
     let attempt: AttemptScope;
     let lane: string;
+    let providerHint: GuardedProvider | undefined;
     try {
-      attempt = snapshotScope(scope);
-      lane = laneKey(attempt);
+      attempt = snapshotScope(scope, (value) => {
+        if (value === 'openai-codex' || value === 'commandcode') providerHint = value;
+      });
     } catch (error) {
-      // No lane or lease is held yet, so this fail-closed rejection cannot leak either.
-      fleet.pause('identity');
+      if (providerHint) fleet.pauseAutomatic(providerHint, 'identity');
       throw error instanceof QuotaError ? error : new QuotaError('auth');
     }
-    // Retained before the pause wait: a check must be runnable while dispatch is blocked.
-    this.held = { attempt, lane };
-    await fleet.wait(signal);
+    try {
+      lane = laneKey(attempt);
+    } catch (error) {
+      if (providerHint) fleet.pauseAutomatic(providerHint, 'identity');
+      throw error instanceof QuotaError ? error : new QuotaError('auth');
+    }
+    const scopes = this.held.get(attempt.providerId) ?? new Map<string, { attempt: AttemptScope; lane: string }>();
+    if (!scopes.has(lane)) fleet.noteScope(attempt.providerId);
+    scopes.set(lane, { attempt, lane });
+    this.held.set(attempt.providerId, scopes);
+    await fleet.wait(attempt.providerId, signal);
     const releaseLane = await fifo.enter(lane, signal);
-    // Decided again whenever the fleet generation moved under the decision. Waiting before every
-    // read is what keeps the approval fresh: a read taken while paused would otherwise be replayed
-    // after the resume, since resuming does not itself move the generation. A stale approval is
-    // re-decided rather than dispatched - and re-decided rather than rejected, because an attempt
-    // that already holds a lease is admitted work that must drain, not fail.
     for (;;) {
-      await fleet.wait(signal);
-      // Re-checked synchronously after the wait: a pause queued before this continuation can have
-      // landed as the wait resolved, and a read taken then would be replayed after the resume
-      // because resuming does not move the generation.
-      if (fleet.snapshot().state !== 'open') continue;
-      const generation = fleet.snapshot().generation;
+      await fleet.wait(attempt.providerId, signal);
+      const rootBefore = fleet.snapshot();
+      const providerBefore = fleet.snapshot(attempt.providerId);
+      if (rootBefore.state !== 'open' || providerBefore.state !== 'open') continue;
+      const rootGeneration = rootBefore.generation;
+      const providerGeneration = providerBefore.generation;
       const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
         ...(attempt.accountId && { accountId: attempt.accountId }), apiKey: attempt.credential,
         ...(attempt.codexLimits && { codexLimits: attempt.codexLimits }) };
@@ -242,41 +257,45 @@ export class GuardCoordinator {
         snapshot = await read(auth, options);
       } catch (error) {
         const failure = error instanceof QuotaError ? error : new QuotaError('unavailable');
-        // The fleet latch is root-wide, but an `unsupported` read failure is provider-scoped: a
-        // provider whose quota surface is not served here must not lock out every other provider. So
-        // refuse just this attempt - the latch's state, reason and generation stay untouched - and
-        // record the provider for `status()`. Every other failure keeps today's behaviour, including
-        // the fleet pause for `unavailable`, which stays correct for systemic problems (network down,
-        // 5xx). Dispatch is still refused: this is never an unguarded pass-through.
-        if (failure.code === 'unsupported') {
-          this.unsupported.add(attempt.providerId);
-          releaseLane();
-          throw failure;
+        if (failure.code === 'unsupported') this.unsupported.add(attempt.providerId);
+        if (failure.code !== 'aborted') {
+          fleet.pauseAutomatic(attempt.providerId,
+            failure.code === 'auth' || failure.code === 'schema' ? 'identity' : 'unavailable');
         }
-        fleet.pause('unavailable'); releaseLane();
+        releaseLane();
         throw failure;
       }
       let assessment: Assessment;
       try {
-        assessment = assess(snapshot, policy, mode(), reserve(lane, snapshot), now());
+        assessment = assess(snapshot, policy, mode(attempt.providerId), reserve(lane, snapshot), now());
       } catch (error) {
-        fleet.pause('unavailable'); releaseLane();
+        fleet.pauseAutomatic(attempt.providerId, 'unavailable');
+        releaseLane();
         throw error;
       }
       if (assessment.state !== 'open' && assessment.state !== 'warn') {
-        fleet.pause(pauseReasonFor(assessment.reason)); releaseLane();
+        fleet.pauseAutomatic(attempt.providerId, pauseReasonFor(assessment.reason));
+        releaseLane();
         throw new QuotaError('unavailable');
       }
-      let releaseFleet: Release;
+      let release: Release;
       try {
-        releaseFleet = await fleet.enter('inference', signal);
+        release = await fleet.enter(attempt.providerId, 'inference', signal);
       } catch (error) {
-        releaseLane(); throw error;
+        releaseLane();
+        throw error;
       }
-      if (fleet.snapshot().generation === generation) {
-        return () => { releaseFleet(); releaseLane(); };
+      if (fleet.snapshot().generation === rootGeneration
+        && fleet.snapshot(attempt.providerId).generation === providerGeneration) {
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          release();
+          releaseLane();
+        };
       }
-      releaseFleet();
+      release();
     }
   }
 
@@ -284,27 +303,39 @@ export class GuardCoordinator {
   gatedFetch(scope: AttemptScope, inner?: typeof fetch): typeof fetch {
     const send: typeof fetch = inner ?? globalThis.fetch;
     return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      // One snapshot for everything below: identity is read once, before the first await, and the
-      // same values both key the lane and bind the outbound request.
       let attempt: AttemptScope;
+      let providerHint: GuardedProvider | undefined;
+      try {
+        attempt = snapshotScope(scope, (value) => {
+          if (value === 'openai-codex' || value === 'commandcode') providerHint = value;
+        });
+      } catch {
+        if (providerHint) this.deps.fleet.pauseAutomatic(providerHint, 'identity');
+        throw new QuotaError('auth');
+      }
+      try {
+        laneKey(attempt);
+      } catch {
+        if (providerHint) this.deps.fleet.pauseAutomatic(providerHint, 'identity');
+        throw new QuotaError('auth');
+      }
       let signal: AbortSignal | undefined;
       let request: FinalRequest;
       try {
-        attempt = snapshotScope(scope);
         signal = requestSignal(input, init);
         request = normalizeFinalRequest(input, init);
       } catch {
-        this.deps.fleet.pause('identity');
+        this.deps.fleet.pauseAutomatic(attempt.providerId, 'identity');
         throw new QuotaError('auth');
       }
       if (!attempt.credential || !isFirstPartyDestination(request.url, attempt.providerId)) {
-        this.deps.fleet.pause('identity');
+        this.deps.fleet.pauseAutomatic(attempt.providerId, 'identity');
         throw new QuotaError('auth');
       }
       try {
         classifyFinalRequest(request, attempt);
       } catch (error) {
-        this.deps.fleet.pause('identity');
+        this.deps.fleet.pauseAutomatic(attempt.providerId, 'identity');
         throw error;
       }
       // The outbound snapshot is built before admission, so no caller getter can run while a lease is
@@ -313,7 +344,7 @@ export class GuardCoordinator {
       try {
         outbound = forwardingSnapshot(input, init, request, signal);
       } catch {
-        this.deps.fleet.pause('identity');
+        this.deps.fleet.pauseAutomatic(attempt.providerId, 'identity');
         throw new QuotaError('auth');
       }
       const release = await this.admit(attempt, signal);

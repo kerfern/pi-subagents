@@ -48,7 +48,7 @@ import type { CodexLimit } from "./quota-guard/adapters.js";
 import { isQuotaGuardEnabled, quotaGuardExtension, setQuotaGuardEnabled } from "./quota-guard/index.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, snapshotQuotaGuardSettings, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ThinkingLevel, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -1255,10 +1255,16 @@ export default function (pi: ExtensionAPI) {
   // The guard's remaining settings inputs. `quotaGuardExtension` reads them off the host object,
   // which the pi API object is not, so they are held here and handed over as its second argument at
   // the entry call site. Read once at extension init, like `quotaGuardEnabled`, and inert while off.
+  let quotaGuardCodexEnabled = false;
+  let quotaGuardCommandCodeEnabled = false;
+  let quotaGuardCodexSetting: boolean | undefined;
+  let quotaGuardCommandCodeSetting: boolean | undefined;
   let quotaGuardStateDir: string | undefined;
   let quotaGuardCodexLimits: CodexLimit[] | undefined;
   // Keep the persisted record shape here; the guard takes a Map. Read once at init, like the others.
   let quotaGuardReserveUnits: Record<string, number> | undefined;
+  function setQuotaGuardCodexEnabled(enabled: boolean) { quotaGuardCodexEnabled = enabled; }
+  function setQuotaGuardCommandCodeEnabled(enabled: boolean) { quotaGuardCommandCodeEnabled = enabled; }
   function setQuotaGuardStateDir(dir: string) { quotaGuardStateDir = dir; }
   function setQuotaGuardCodexLimits(limits: readonly CodexLimit[]) { quotaGuardCodexLimits = [...limits]; }
   function setQuotaGuardReserveUnits(units: Record<string, number>) { quotaGuardReserveUnits = { ...units }; }
@@ -1465,7 +1471,7 @@ export default function (pi: ExtensionAPI) {
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
-  applyAndEmitLoaded(
+  const loadedSettings = applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setMaxConcurrentForeground: (n) => manager.setMaxConcurrentForeground(n),
@@ -1486,6 +1492,8 @@ export default function (pi: ExtensionAPI) {
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setQuotaGuardEnabled,
+      setQuotaGuardCodexEnabled,
+      setQuotaGuardCommandCodeEnabled,
       setQuotaGuardStateDir,
       setQuotaGuardCodexLimits,
       setQuotaGuardReserveUnits,
@@ -1498,6 +1506,8 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+  quotaGuardCodexSetting = loadedSettings.quotaGuardCodexEnabled;
+  quotaGuardCommandCodeSetting = loadedSettings.quotaGuardCommandCodeEnabled;
 
   // ---- Agent tool ----
 
@@ -3644,7 +3654,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // Defaults off: the guard is inert until an operator enables it, so an
       // unset value must round-trip as unset rather than being materialized as
       // an explicit `false` (same reasoning as `fallbackSubagent` above).
-      quotaGuardEnabled: isQuotaGuardEnabled(),
+      ...snapshotQuotaGuardSettings(
+        isQuotaGuardEnabled(),
+        quotaGuardCodexSetting,
+        quotaGuardCommandCodeSetting,
+      ),
       // Both undefined unless an operator set them in subagents.json; JSON.stringify then drops
       // them, so an unset value round-trips as unset rather than being materialized.
       quotaGuardStateDir,
@@ -4415,13 +4429,33 @@ Write the file using the write tool. Only write the file, nothing else.`;
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
   });
 
-  // Quota guard is opt-in: default-off, so this is inert unless an operator
-  // set `quotaGuardEnabled`. It registers `/quota-guard` and installs against
-  // the runtime handle it is handed; it never forces aborts or patches fetch.
+  // Provider toggles are resolved against the legacy setting by SettingsAppliers;
+  // this explicit list is authoritative, including the all-off case.
   quotaGuardExtension(pi, {
+    guardedProviders: [
+      ...(quotaGuardCodexEnabled ? ['openai-codex' as const] : []),
+      ...(quotaGuardCommandCodeEnabled ? ['commandcode' as const] : []),
+    ],
     ...(quotaGuardStateDir !== undefined ? { stateDir: quotaGuardStateDir } : {}),
     ...(quotaGuardCodexLimits !== undefined ? { codexLimits: quotaGuardCodexLimits } : {}),
     ...(quotaGuardReserveUnits !== undefined ? { reserveUnits: new Map(Object.entries(quotaGuardReserveUnits)) } : {}),
+    persistProviderEnabled: (target, enabled) => {
+      const previousCodex = quotaGuardCodexSetting;
+      const previousCommandCode = quotaGuardCommandCodeSetting;
+      if (target === 'all' || target === 'openai-codex') quotaGuardCodexSetting = enabled;
+      if (target === 'all' || target === 'commandcode') quotaGuardCommandCodeSetting = enabled;
+      const { message, level } = saveAndEmitChanged(
+        snapshotSettings(),
+        `Quota guard ${enabled ? 'on' : 'off'} ${target}`,
+        (event, payload) => pi.events.emit(event, payload),
+      );
+      const persisted = level === 'info';
+      if (!persisted) {
+        quotaGuardCodexSetting = previousCodex;
+        quotaGuardCommandCodeSetting = previousCommandCode;
+      }
+      return { persisted, ...(!persisted && { message }) };
+    },
   });
 
   /**

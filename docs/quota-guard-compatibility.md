@@ -1,8 +1,12 @@
 # Quota guard — compatibility and upgrade guide
 
-The quota guard ships inside this extension at `src/quota-guard/`. It is **off by default**
-(`quotaGuardEnabled` unset or `false`): while it is off the package is inert, resolves no
-credentials, decorates nothing, and registers no commands.
+The quota guard ships inside this extension at `src/quota-guard/`. Each provider's guard is
+**off by default**. `quotaGuardCodexEnabled` and `quotaGuardCommandCodeEnabled` override the
+legacy `quotaGuardEnabled`; an unset provider switch inherits the legacy switch, and if all three
+are unset that provider defaults OFF. When both providers resolve OFF, command-only mode keeps
+`/quota-guard on|off` available for changing persistent settings, but constructs no coordinator,
+resolves no credentials, and decorates nothing. When either is ON, the runtime seam is installed and
+manual holds apply to both known providers.
 
 This document is for the operator. It exists because the guard depends on a handful of seams in the
 installed pi build, and the way those seams can break is *silent*.
@@ -62,14 +66,14 @@ function of a host descriptor — it makes no request and reads no credentials.
 Two other refusals are worth recognizing:
 
 - A **dispatch refusal for a provider whose quota surface is not served here** names the provider, the
-  route and the status, and says the guard cannot read that provider's quota, so dispatch is refused
-  while the guard is enabled. Its code is `unsupported` (see
+  route and the status, and says the guard cannot read that provider's quota. Its code is
+  `unsupported` (see
   [CommandCode's quota surface](#commandcodes-quota-surface-is-not-served-here-verified-live-2026-10-09)).
-  It refuses that provider only: the shared fleet stays open for every other provider, which is the
-  point of it being its own code rather than `unavailable`.
-- `status()` reports it as its own field, so an operator never has to infer it from a pause. The status
-  object carries `unsupported: ["commandcode"]` and `/quota-guard status` prints `unsupported
-  commandcode` alongside the ordinary state — an unsupported provider is *not* a paused fleet.
+  It refuses only that provider while its automatic guard is ON; the peer's automatic state remains
+  independent, which is why this code is distinct from a root-wide pause.
+- `status()` reports it explicitly in that provider's status (for example
+  `status.providers.commandcode.unsupported`) and `/quota-guard status` prints an `unsupported`
+  marker. It is not a root-wide pause: the peer provider remains independently available.
 
 ## Honest limits
 
@@ -94,8 +98,10 @@ Two other refusals are worth recognizing:
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
-- **CommandCode's quota surface is not served at all today**, so the guard refuses its dispatch and the
-  lane above is currently unreachable. This is deliberate and dated, not a silent bypass: see
+- **CommandCode's quota surface is not served at all today**, so guarded dispatch refuses as
+  `unsupported` and its automatic lane is currently unreachable. When
+  `quotaGuardCommandCodeEnabled` is OFF, dispatch is intentionally unguarded (manual pause still
+  applies). This is deliberate and dated, not a silent bypass: see
   [CommandCode's quota surface](#commandcodes-quota-surface-is-not-served-here-verified-live-2026-10-09).
 - **Durability ceiling: a *fresh* pause is not recorded at all.** A pause reaches the durable store
   only when it can name at least one checkpoint, and nothing in the guard can enumerate pending
@@ -109,19 +115,20 @@ Two other refusals are worth recognizing:
   `/quota-guard status` prints `(not durable)`; with no manifest at all it reports `wake: null`. The
   guard deliberately does not fabricate a checkpoint id to make a pause look restorable: a reinstated
   pause that cannot name the work it was waiting for would be worse than the honest gap.
-- A fresh check can only re-read scopes the guard has **actually seen**. The reserve estimator is
-  keyed by lane and the account FIFO's lane set is private, so the guard retains the last scope it was
-  handed (credential included, in memory only) and re-reads *that* one on a manual resume. It cannot
-  enumerate every scope that might exist, and it never guesses one: a resume before any attempt has
-  reached `admit` finds no retained scope and refuses, which is the honest answer rather than a check
-  against a scope nobody verified.
+- For a provider whose automatic guard is ON, a fresh check can only re-read scopes the guard has
+  **actually seen**. The reserve estimator is keyed by lane and the account FIFO's lane set is
+  private, so the guard retains the last scope it was handed (credential included, in memory only)
+  and re-reads *that* one on manual resume. It cannot enumerate or guess scopes: resume before an
+  enabled provider has reached `admit` finds no retained scope and refuses. A provider whose
+  automatic guard is OFF can have its manual hold cleared without a quota read, because OFF means
+  dispatch is intentionally unguarded.
 
 ## CommandCode's quota surface is not served here (verified live, 2026-10-09)
 
-Read this before enabling the guard for `commandcode`. The guard gates a provider by reading its quota
-first, and CommandCode's quota routes are **not currently served**, so the guard cannot read one at
-all. It therefore **refuses CommandCode dispatch** while it is enabled — and that refusal *is* the
-intended behaviour, not a gap. CommandCode is never forwarded ungated.
+Read this before enabling `quotaGuardCommandCodeEnabled`. CommandCode's quota routes are **not
+currently served**, so guarded CommandCode dispatch is refused as `unsupported`; that automatic
+hold affects CommandCode only, and Codex remains independent. With CommandCode's automatic guard OFF,
+dispatch is intentionally unguarded unless a matching manual hold is active.
 
 Full probe evidence — environment, every route probed with its status, the load-bearing user-agent
 header, and third-party corroboration: [CommandCode quota is unsupported here](./quota-guard-commandcode-unsupported.md).
@@ -149,15 +156,12 @@ has no API, and it is not a claim about CommandCode's model endpoints.
 - A quota route answering **404** is reported as **`unsupported`** — its own code, scoped to the
   provider. `status()` names it (see [Reading a refusal](#reading-a-refusal)), so an operator sees an
   unsupported provider rather than a merely unavailable one.
-- An `unsupported` read **refuses that provider's attempt and leaves the fleet open.** The latch is
-  root-wide, so pausing it for one provider's missing quota route would lock out *every* provider.
-  The refusal names the provider, the route and the status, and says plainly that the guard cannot
-  read this provider's quota, so dispatch is refused while the guard is enabled.
-- Everything else is unchanged: `401`/`403` is `auth`, `429` is `rate-limited`, and a `5xx` or a
-  network error is still `unavailable` — which still pauses the fleet, because those are systemic
-  rather than provider-scoped.
-- **No silent unguarding.** The guard does not fall back to dispatching CommandCode ungated, ever. If
-  CommandCode dispatch is needed with the guard enabled, its quota surface has to be served first.
+- An `unsupported` read refuses only that provider's attempt. Auth, schema, network, 5xx, quota, and
+  unknown-reserve automatic holds are provider-local too; a failure in one lane does not pause or
+  block its peer.
+- **No silent unguarding while guarded.** With `quotaGuardCommandCodeEnabled: true`, the guard never
+  falls back to CommandCode dispatch without a successful gate. If CommandCode's automatic guard is
+  OFF, ordinary unguarded pass-through is intentional; a manual hold still blocks it.
 
 ### Re-enabling CommandCode
 
@@ -172,8 +176,9 @@ certification of all three:
 3. **Gate** — a full guarded dispatch through the gate, after `check:quota-host` passes, with the quota
    read happening on the real route.
 
-Until all three hold, leaving CommandCode refused is the honest state. Re-check after any CommandCode
-or pi upgrade: this record is dated, and it expires with the provider's API.
+Until all three hold, leave CommandCode's automatic guard OFF if unguarded dispatch is intended, or
+ON if fail-closed refusal is intended; OFF must not be mistaken for guarded protection. Re-check
+after any CommandCode or pi upgrade: this record is dated, and it expires with the provider's API.
 
 ## Certifying against live quotas (operator-authorised)
 
@@ -241,46 +246,64 @@ or failed, `2` usage.
 | --- | --- | --- |
 | The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows as real. For CommandCode the monthly cap is the guard's own table entry for the reported plan, not a provider number. The reserve stays uncalibrated: one read cannot size it. Certify again after a provider or host upgrade. |
 | A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. Report the code and the provider, never the credential. |
-| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **The guard still refuses dispatch for that provider, and cannot be re-enabled by a flag.** Certify scoped quota, reserve and gate first (see [Re-enabling CommandCode](#re-enabling-commandcode)); other providers are unaffected and stay admitted. |
+| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **That provider's automatic guard refuses dispatch.** Its peer stays independent. Certify scoped quota, reserve and gate before enabling that provider's guard (see [Re-enabling CommandCode](#re-enabling-commandcode)). |
 
 ## Enabling the guard
 
 Only after the host check passes:
 
 ```jsonc
-// subagents.json
+// subagents.json — legacy fallback; per-provider overrides may differ
 { "quotaGuardEnabled": true }
 ```
 
-In a session:
+In a session, persistent provider switches can be changed without editing JSON:
 
 ```
-/quota-guard status    # state, reason, active counts, wake state
-/quota-guard pause     # latches the fleet; admitted work drains, nothing is aborted
-/quota-guard resume    # requires a fresh check to pass before it reopens
-/quota-guard enable
+/quota-guard on codex
+/quota-guard off commandcode
 ```
+
+`on|off` writes explicit provider settings to the current project's `.pi/subagents.json`, preserves
+other settings, and takes effect after restarting Pi. Omit the target to set both providers:
+`/quota-guard on` or `/quota-guard off`. The command remains available in command-only mode while
+both providers are OFF; in that state it does not construct a coordinator, resolve credentials, or
+decorate the runtime. A failed settings write is reported and does not claim success.
+
+For immediate temporary holds, use:
+
+```
+/quota-guard status
+/quota-guard pause [all|codex|commandcode]
+/quota-guard resume [all|codex|commandcode]
+```
+
+Omitting a pause/resume target means `all`. Manual holds still apply when a provider's automatic
+guard is OFF. They do not change the persistent switches. See [Manual control while installed](#manual-control-while-installed) for drain, status, and resume behavior.
 
 For Codex, set the verified meter scope (`quotaGuardCodexLimits`) too — without it a Codex attempt
-is refused rather than attributed to the wrong window.
+is refused rather than attributed to the wrong window. For provider-specific settings and reserve
+example, see [Activating and deactivating](#activating-and-deactivating).
 
 ## First run — what to expect
 
 Two things happen the moment the guard starts gating, and both look like a bug if you have not been
 told to expect them.
 
-**The guard starts closed and opens only once it can size a reserve.** The guard will not admit
-traffic until it knows how much headroom to hold back. On the first sight of a quota window the
-estimator returns `null` for it, `assess` returns `wait` with reason `unknown-reserve`, and the fleet
-latches — so the first attempts after enabling the guard pause rather than dispatch. That is the
-designed starting state, not a fault. An unknown reserve is never treated as zero: admitting traffic
-on a window whose burn rate is unknown is the exact failure the guard exists to prevent.
+**Each guarded provider starts closed and opens only once it can size a reserve.** The guard will
+not admit that provider's traffic until it knows how much headroom to hold back. On first sight of an
+unmeasured quota window, the estimator returns `null`, `assess` returns `wait` with reason
+`unknown-reserve`, and that provider receives an automatic hold. The peer provider is unaffected.
+An unknown reserve is never treated as zero: admitting traffic on a window whose burn rate is unknown
+is the exact failure the guard exists to prevent.
 
 A reserve becomes known once the estimator has at least two observations of the same window with the
 same cap and reset, and has seen the counter move. It then holds twice the largest positive increment
 out of up to five, ignoring refills — a decrease, or a change of scope or reset, clears what it had
-and starts over. Until then, waiting and retrying is the intended path, not a stuck session; each
-retry gives the estimator another observation, and nothing is dispatched unguarded in the meantime.
+and starts over. While a provider is automatically held for an unknown reserve, blind retries do not
+create new observations. Use a targeted `/quota-guard resume codex` or `resume commandcode` to make a
+fresh check against the last observed scope, or configure a conservative operator seed. The affected
+provider stays closed until the reserve can be sized; its peer remains independent.
 
 **On an idle account, retrying does not help — assert a reserve.** Every observation the estimator
 gets happens inside dispatch, and dispatch is what the pause blocks, so on a fresh install over an
@@ -303,7 +326,16 @@ quoted here verbatim:
 Quota guard: no verified Codex meter scope configured; pass codexLimits to installQuotaGuard
 ```
 
-The refusal also latches the fleet, so a missing scope stops traffic loudly instead of gating nothing.
+The refusal applies only to Codex automatic state, so a missing scope stops Codex rather than
+gating nothing; CommandCode remains independent.
+
+## Child-runtime coverage
+
+The runtime hook intercepts the shared SDK `ModelRuntime` prototype used by parent, `runAgent`, and
+`resumeAgent` sessions. The regression test `test/quota-subagent-runtime.test.ts` exercises normal
+text-generation through the real inherited runtime and built-in provider transports using fake HTTP.
+This covers guarded and OFF provider behavior, but does not certify live provider APIs. Auxiliary
+`classify`, image-generation, and deferred-stream operations are outside this guard's coverage.
 
 ## Activating and deactivating
 
@@ -311,21 +343,32 @@ The feature is called the **quota guard**. Two names matter:
 
 | What | Name |
 | --- | --- |
-| The setting (the switch) | `quotaGuardEnabled` |
-| The command | `/quota-guard` (subcommands `status`, `pause`, `resume`, `enable`) |
+| Legacy/global fallback | `quotaGuardEnabled` |
+| Codex override | `quotaGuardCodexEnabled` |
+| CommandCode override | `quotaGuardCommandCodeEnabled` |
+| The command | `/quota-guard` (`on|off [all|codex|commandcode]`, `status`, `pause|resume [all|codex|commandcode]`) |
 | The code | `src/quota-guard/` in this repo; the harness side is `extensions/runtime-hook.mjs` |
 
-**Activate.** In `subagents.json` — project-local `.pi/subagents.json`, or the global settings file:
+For each provider, a defined provider-specific boolean wins; otherwise it inherits the effective
+`quotaGuardEnabled` value, and if that is also unset it defaults OFF. Existing project-over-global
+precedence applies to each key. Thus a provider override can enable one provider while the other stays
+OFF, even if the legacy fallback is true.
+
+**Activate.** In project-local `.pi/subagents.json` or the global settings file. This example
+explicitly enables Codex and disables CommandCode despite the legacy fallback being true:
 
 ```jsonc
 {
   "quotaGuardEnabled": true,
-  // Optional, and both are read once at extension load. The keys are the settings names, not the
-  // guard's internal host-field names.
+  "quotaGuardCodexEnabled": true,
+  "quotaGuardCommandCodeEnabled": false,
   "quotaGuardStateDir": "/absolute/path/to/quota-guard-state",
   "quotaGuardCodexLimits": [{ "id": "codex", "windows": ["primary_window", "secondary_window"] }],
-  // Only needed on an idle account the estimator cannot calibrate; see First run.
-  "quotaGuardReserveUnits": { "monthly": 20, "fiveHour": 8, "weekly": 8 }
+  // Operator estimates in the same 0–100 units as Codex used_percent; fallback only.
+  "quotaGuardReserveUnits": {
+    "codex.primary_window": 3,
+    "codex.secondary_window": 3
+  }
 }
 ```
 
@@ -337,15 +380,22 @@ Check it took effect:
 /quota-guard status
 ```
 
-- `enabled, installed` → it is live and gating.
+- `enabled, installed` → the seam is live; inspect provider lines for `guarded` vs
+  `unguarded`, state, manual/automatic holds, and reserve provenance. OFF means unguarded dispatch
+  unless a manual hold matches.
 - `enabled, not installed` → the switch is on but installation failed. The reason is on stderr at startup and from `quotaGuardInstallFailure()`. The usual cause is that pi was started through the bare `pi` binary rather than the harness entry point, so the runtime hook is absent.
 
 **The one remaining fail-open path, and how to close it.** Installation can fail *after* startup — the harness publishes the hook before the runtime prototype exists, so the decorator is applied asynchronously and can fail then (a host whose prototype lacks `stream`/`streamSimple`, or a refused double-install). The guard detects that failure, records it and calls `pause('identity')` — but a latch is only consulted *by* the decorator, and the decorator is exactly what failed to install. So in that state the guard cannot block anything, and no change inside the guard fixes it: it has no interception point. The enforcement belongs to the seam owner. Set `QUOTA_GUARD_REQUIRE_SEAM=1` and the harness refuses to continue when a decorator fails to install, for every refusal path: a missing `ModelRuntime` prototype, a missing dispatch method, an already-decorated prototype, a decorator that throws, or one that returns no dispose function. Without the flag the default is to report the failure on stderr and keep running — which means genuinely ungated only in the cases where the runtime is left undecorated.
 
 Two consequences worth knowing before you set it. First, without the flag an install failure leaves pi running with nothing gated, so the flag is the only way to make that condition stop the session. Second, **with** the flag a redundant double-install also refuses to continue: the runtime is already decorated and gating, so that refusal is unnecessary, but the harness cannot distinguish "someone else is gating" from "nothing is gating". A reload that installs the guard twice will therefore end a strict-mode session; that is the accepted cost of the flag.
-- `disabled` → your settings file is not being read from where you put it.
+- `disabled` → both effective provider switches are OFF; check settings source if that is unexpected.
 
-**Deactivate.** Delete the line or set it to `false`, and restart pi. With it off the package is inert: no coordinator is constructed, no hook is looked up, no runtime is decorated, nothing is written. There is no half-on state.
+**Deactivate.** Run `/quota-guard off` and restart Pi. This writes both provider switches as explicit
+`false` values without changing the legacy fallback or other settings. Alternatively, set both
+provider switches to `false` in the settings file. A legacy `false` does not override a
+provider-specific `true`. When both are OFF, the command-only entry remains available for future
+`on`/`off` changes, but no coordinator is constructed, no hook is looked up, no credentials are
+resolved, and no runtime is decorated.
 
 **Three optional keys, and what happens without them:**
 
@@ -353,4 +403,17 @@ Two consequences worth knowing before you set it. First, without the flag an ins
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
 - `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number strictly greater than `0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. A seed of `0` is refused for the same reason an unknown reserve is never treated as zero: for a metered window no dispatch burns nothing, so accepting `0` would silently disable the protection this number exists to provide. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
 
-**Manual control while it is on:** `/quota-guard pause` latches the fleet — admitted work drains, nothing is aborted; `/quota-guard resume` re-reads quota for the last scope the guard saw with the same reader and estimator it gates with, so a paused guard can calibrate and reopen; `/quota-guard enable` re-asserts the switch in-session. The check runs *outside* dispatch, which is what breaks the old deadlock where the only observation happened inside `admit` and `admit` itself blocked on the pause. It reopens only on a verified, in-policy read for every window the guard has seen; an unreadable read, an uncalibrated reserve, or no retained scope keeps it closed. Because only observed scopes can be re-checked, a resume before any attempt has reached `admit` is refused.
+### Manual control while installed
+
+`/quota-guard pause [all|codex|commandcode]` and `/quota-guard resume [all|codex|commandcode]`;
+omitted target means `all`. A targeted manual hold
+blocks only that provider, including when its automatic guard is OFF; `pause all` blocks both.
+Pause takes effect for new dispatch immediately. Already-admitted work finishes without abort, while
+status shows the manual target and active counts; active counts fall as work drains. Automatic quota,
+auth, schema, unsupported, network, and reserve outcomes remain provider-local.
+
+For each requested provider whose automatic guard is ON, resume performs a fresh quota check outside
+dispatch against its retained scope(s). It clears guarded holds only after a verified, in-policy
+result; unreadable data, an unknown reserve, or no retained scope keeps that provider closed. A
+resume before an enabled provider reached `admit` is refused. An OFF provider's manual hold can be
+cleared without a quota read. `/quota-guard enable` has no target and applies on the next pi session.

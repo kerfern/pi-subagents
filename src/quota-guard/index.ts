@@ -3,8 +3,8 @@
  *
  * Default-disabled and inert: importing this module does no I/O, resolves no
  * credentials and decorates nothing. `quotaGuardExtension` returns immediately
- * while `quotaGuardEnabled` is false, and only an operator flipping that
- * setting (or the `/quota-guard enable` subcommand) installs the guard.
+ * when the legacy setting is false and no provider is explicitly enabled; provider
+ * toggles and the legacy setting determine which providers install.
  *
  * The host is a single object carrying the public surfaces this package needs:
  * a command-registration function, a runtime handle exposing `stream` /
@@ -14,23 +14,34 @@
  */
 
 import type { CodexLimit } from './adapters.ts';
-import type { FleetSnapshot, PauseReason } from './controller.ts';
+import type { FleetSnapshot, FleetState, GuardTarget as FleetTarget, PauseReason, ProviderFleetSnapshot } from './controller.ts';
 import { findRuntimeHook, installGuardedRuntimeViaHook } from './host-hook.ts';
-import { DEFAULT_POLICY } from './policy.ts';
+import { DEFAULT_POLICY, validateReserveSeed } from './policy.ts';
 import { type GatedCoordinator, type GuardRuntime, installQuotaGuard } from './root.ts';
 import { createQuotaGuardCoordinator, type RootBinding } from './root-binding.ts';
 import { openStore } from './store.ts';
+import type { GuardedProvider } from './types.ts';
 import { CheckpointUnavailableError, RootWake, type WakeCheck } from './wake.ts';
 
 /** The fleet surface the controls observe; satisfied by the public `FleetLatch`. */
 export interface QuotaGuardFleet {
   snapshot(): Readonly<FleetSnapshot>;
+  snapshot(providerId: GuardedProvider): Readonly<ProviderFleetSnapshot>;
   pause(reason: PauseReason): void;
+  pauseManual(target: FleetTarget): void;
+  resume(
+    target: FleetTarget,
+    freshCheck?: (providerId: GuardedProvider) => Promise<boolean>,
+    beforeClearManual?: (commitManual: () => boolean) => Promise<boolean>,
+    /** Await state restoration after the manual fence is captured, before any quota checks. */
+    prepare?: () => Promise<boolean>,
+  ): Promise<boolean>;
   tryResume(freshCheck: () => Promise<boolean>): Promise<boolean>;
 }
 
-/** The wake surface, when one is installed; only its public `status()` is read. */
+/** Wake status and explicit legacy-manual convergence, when a durable wake is installed. */
 export interface QuotaGuardWake {
+  resumeManual?(commitManual?: () => boolean): Promise<boolean>;
   status(): Readonly<{
     state: string;
     backoffIndex?: number;
@@ -63,13 +74,29 @@ export interface QuotaGuardHost {
   reserveUnits?: ReadonlyMap<string, number>;
   /** Unwrapped transport for the quota reads themselves; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
-  /** Fresh quota check a manual resume must pass; absent means resume is refused. */
-  freshCheck?: () => Promise<boolean>;
+  /** Fresh quota check used only for enabled providers with automatic holds; absent means refusal. */
+  freshCheck?: (providerId?: GuardedProvider) => Promise<boolean>;
   rootId?: string;
   /** Durable state directory for the wake machine; absent means no durable wake is recorded. */
   stateDir?: string;
   /** Source the harness runtime hook is published on; defaults to `globalThis`. Injectable for tests. */
   hookSource?: object;
+}
+
+export interface QuotaGuardReserveSeedStatus {
+  id: string;
+  units: number;
+  source: 'operator';
+}
+
+export interface QuotaGuardProviderStatus {
+  guard: 'guarded' | 'unguarded';
+  state: FleetState | 'unknown';
+  manualTarget?: GuardTarget;
+  automaticReason?: PauseReason;
+  unsupported: boolean;
+  /** Configured operator seeds are fallback-only; observed reserves take precedence. */
+  reserveSeeds: readonly QuotaGuardReserveSeedStatus[];
 }
 
 export interface QuotaGuardStatus {
@@ -80,6 +107,7 @@ export interface QuotaGuardStatus {
   active: number;
   inferences: number;
   coding: number;
+  providers: Readonly<Record<GuardedProvider, QuotaGuardProviderStatus>>;
   /**
    * Providers the guard refuses because it cannot read their quota surface here (HTTP 404 on a quota
    * route). A diagnostic, not a latch: the fleet stays open for every other provider. Present only
@@ -89,12 +117,21 @@ export interface QuotaGuardStatus {
   wake: { state: string; backoffIndex?: number; wakeAt?: string; durable?: boolean } | null;
 }
 
+export type GuardTarget = 'all' | 'codex' | 'commandcode';
+
 export interface QuotaGuardControls {
   enable(): void;
-  pause(reason?: PauseReason): void;
-  resume(): Promise<boolean>;
+  pause(target?: GuardTarget): void;
+  resume(target?: GuardTarget): Promise<boolean>;
   status(): QuotaGuardStatus;
   dispose(): void;
+}
+
+const DEFAULT_GUARDED_PROVIDERS: readonly GuardedProvider[] = Object.freeze(['openai-codex', 'commandcode']);
+
+function fleetTarget(target: GuardTarget): FleetTarget {
+  if (target === 'codex') return 'openai-codex';
+  return target;
 }
 
 let enabled = false;
@@ -137,18 +174,50 @@ function unsupportedOf(host: QuotaGuardHost): readonly string[] {
   try { return read.call(coordinator); } catch { return []; }
 }
 
-function statusOf(host: QuotaGuardHost, installed: boolean): QuotaGuardStatus {
+function statusOf(
+  host: QuotaGuardHost,
+  installed: boolean,
+  guardedProviders: readonly GuardedProvider[],
+  reserveUnits?: ReadonlyMap<string, number>,
+): QuotaGuardStatus {
   const snap = host.fleet?.snapshot();
   const wake = host.wake?.status() ?? null;
   const unsupported = unsupportedOf(host);
+  // Match the estimator's all-or-nothing rule; never advertise a subset of a rejected seed map.
+  const validReserveUnits = validateReserveSeed(reserveUnits);
+  const guarded = new Set(guardedProviders);
+  const providerStatus = (providerId: GuardedProvider): QuotaGuardProviderStatus => {
+    const provider = host.fleet?.snapshot(providerId);
+    const reserveSeeds: QuotaGuardReserveSeedStatus[] = [];
+    for (const [id, units] of validReserveUnits ?? []) {
+      const belongsToProvider = providerId === 'openai-codex'
+        ? id.endsWith('.primary_window') || id.endsWith('.secondary_window')
+        : id === 'monthly' || id === 'fiveHour' || id === 'weekly';
+      if (belongsToProvider && Number.isFinite(units) && units > 0) {
+        reserveSeeds.push({ id, units, source: 'operator' });
+      }
+    }
+    return {
+      guard: guarded.has(providerId) ? 'guarded' : 'unguarded',
+      state: provider?.state ?? 'unknown',
+      ...(provider?.manualTarget !== undefined && { manualTarget: publicTarget(provider.manualTarget) }),
+      ...(provider?.automaticReason !== undefined && { automaticReason: provider.automaticReason }),
+      unsupported: unsupported.includes(providerId),
+      reserveSeeds,
+    };
+  };
   return {
-    enabled,
+    enabled: guarded.size > 0,
     installed,
     state: snap?.state ?? 'unknown',
     ...(snap?.reason !== undefined && { reason: snap.reason }),
     active: snap?.active ?? 0,
     inferences: snap?.inferences ?? 0,
     coding: snap?.coding ?? 0,
+    providers: {
+      'openai-codex': providerStatus('openai-codex'),
+      commandcode: providerStatus('commandcode'),
+    },
     ...(unsupported.length ? { unsupported } : {}),
     wake: wake && {
       state: wake.state,
@@ -160,15 +229,38 @@ function statusOf(host: QuotaGuardHost, installed: boolean): QuotaGuardStatus {
   };
 }
 
-function makeControls(host: QuotaGuardHost, binding: Binding): QuotaGuardControls {
+function publicTarget(target: FleetTarget): GuardTarget {
+  return target === 'openai-codex' ? 'codex' : target;
+}
+
+function makeControls(host: QuotaGuardHost, binding: Binding,
+  guardedProviders: readonly GuardedProvider[], reserveUnits?: ReadonlyMap<string, number>): QuotaGuardControls {
+  const guarded = new Set(guardedProviders);
   return {
     enable: () => { enabled = true; },
-    pause: (reason = 'manual') => { host.fleet?.pause(reason); },
-    resume: async () => {
-      if (!host.fleet || !host.freshCheck) return false;
-      return host.fleet.tryResume(host.freshCheck);
+    pause: (target = 'all') => { host.fleet?.pauseManual(fleetTarget(target)); },
+    resume: async (target = 'all') => {
+      const fleet = host.fleet;
+      if (!fleet) return false;
+      const selected = fleetTarget(target);
+      const freshCheck = host.freshCheck;
+      return fleet.resume(selected, async (providerId) => {
+        if (!guarded.has(providerId)) return true;
+        return freshCheck ? freshCheck(providerId) : false;
+      }, async (commitManual) => {
+        const root = fleet.snapshot();
+        const rootAutomatic = selected === 'all' && root.state !== 'open' && root.reason !== 'manual';
+        if (rootAutomatic && (!freshCheck || !await fleet.tryResume(() => freshCheck()))) return false;
+        const wake = selected === 'all' ? host.wake : undefined;
+        return wake?.resumeManual
+          ? wake.resumeManual(commitManual)
+          : commitManual();
+      }, async () => {
+        if (selected === 'all' && rootWakeInit) await rootWakeInit;
+        return true;
+      });
     },
-    status: () => statusOf(host, binding.installed === true),
+    status: () => statusOf(host, binding.installed === true, guardedProviders, reserveUnits),
     dispose: () => {
       binding.installed = false;
       binding.dispose();
@@ -207,6 +299,8 @@ function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   // different coordinator's estimator would calibrate the wrong lane.
   if (rootBinding && coordinator === rootBinding.coordinator) host.freshCheck ??= rootBinding.freshCheck;
   const codexLimits = host.codexLimits ?? config?.codexLimits;
+  const reserveUnits = host.reserveUnits ?? config?.reserveUnits;
+  const guardedProviders = config?.guardedProviders ?? DEFAULT_GUARDED_PROVIDERS;
   resolveWake(host, config);
   const runtime = host.runtime;
   if (runtime && typeof runtime.stream === 'function' && typeof runtime.streamSimple === 'function') {
@@ -216,7 +310,8 @@ function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
       rootId: rootIdOf(host),
       coordinator,
       ...(codexLimits ? { codexLimits } : {}),
-    }));
+      guardedProviders,
+    }), guardedProviders, reserveUnits);
     return;
   }
   // No runtime handle was supplied, so the harness hook is the supported route. Checked
@@ -238,9 +333,10 @@ function install(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
     coordinator,
     rootId: rootIdOf(host),
     ...(codexLimits ? { codexLimits } : {}),
+    guardedProviders,
     ...(host.hookSource !== undefined ? { source: host.hookSource } : {}),
   }).then(
-    (dispose: () => void) => bind(host, hookBindingKey, dispose),
+    (dispose: () => void) => bind(host, hookBindingKey, dispose, guardedProviders, reserveUnits),
     (error: Error) => {
       lastInstallFailure = error;
       coordinator.pause('identity');
@@ -317,11 +413,12 @@ function resolveWake(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   })();
 }
 
-function bind(host: QuotaGuardHost, key: object, dispose: () => void): void {
+function bind(host: QuotaGuardHost, key: object, dispose: () => void,
+  guardedProviders: readonly GuardedProvider[], reserveUnits?: ReadonlyMap<string, number>): void {
   const binding = {} as Binding;
   binding.installed = true;
   binding.dispose = dispose;
-  binding.controls = makeControls(host, binding);
+  binding.controls = makeControls(host, binding, guardedProviders, reserveUnits);
   bindings.set(key, binding);
   lastBinding = binding;
 }
@@ -333,7 +430,19 @@ function describe(status: QuotaGuardStatus): string {
     `state ${status.state}${status.reason ? ` (${status.reason})` : ''}`,
     `active ${status.active} (inference ${status.inferences}, coding ${status.coding})`,
   ];
-  // Reported as its own thing: a provider the guard cannot read is not the same as a paused fleet.
+  // Provider lines make independent guarding, manual intent, automatic holds and reserve provenance explicit.
+  for (const [providerId, label] of [['openai-codex', 'codex'], ['commandcode', 'commandcode']] as const) {
+    const provider = status.providers[providerId];
+    const details = [`${label}: ${provider.guard}`, `state ${provider.state}`];
+    if (provider.manualTarget) details.push(`manual ${provider.manualTarget}`);
+    if (provider.automaticReason) details.push(`automatic ${provider.automaticReason}`);
+    if (provider.unsupported) details.push('unsupported');
+    details.push(provider.reserveSeeds.length
+      ? `configured operator reserve seed ${provider.reserveSeeds.map(seed => `${seed.id}=${seed.units}`).join(', ')} (fallback only; observed values take precedence)`
+      : 'reserve observed/unknown (no operator seed)');
+    parts.push(details.join(', '));
+  }
+  // Retained for compatibility: a provider the guard cannot read is not the same as a paused fleet.
   if (status.unsupported?.length) parts.push(`unsupported ${status.unsupported.join(', ')}`);
   if (status.wake) {
     parts.push(`wake ${status.wake.state}${status.wake.backoffIndex !== undefined ? ` backoff#${status.wake.backoffIndex}` : ''}${status.wake.wakeAt ? ` @${status.wake.wakeAt}` : ''}${status.wake.durable === false ? ' (not durable)' : ''}`);
@@ -341,30 +450,59 @@ function describe(status: QuotaGuardStatus): string {
   return `Quota guard: ${parts.join(' · ')}`;
 }
 
-function registerCommand(host: QuotaGuardHost): void {
+function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   if (typeof host.registerCommand !== 'function') return;
   host.registerCommand('quota-guard', {
-    description: 'Quota guard: enable, pause, resume or show status',
+    description: 'Quota guard: on|off|pause|resume [all|codex|commandcode], or show status',
     handler: async (args: string, ctx?: unknown) => {
-      const sub = (args ?? '').trim().split(/\s+/)[0] ?? '';
+      const tokens = (args ?? '').trim().split(/\s+/).filter(Boolean);
+      const sub = tokens[0] ?? 'status';
+      const targetToken = tokens[1];
+      const validTargets: readonly string[] = ['all', 'codex', 'commandcode'];
+      const invalidTarget = (sub === 'pause' || sub === 'resume' || sub === 'on' || sub === 'off')
+        && (tokens.length > 2 || (targetToken !== undefined && !validTargets.includes(targetToken)));
       const controls = quotaGuardControls();
       let message: string;
-      switch (sub) {
-        case 'enable':
-          controls?.enable();
-          message = 'Quota guard enabled (applies on the next pi session).';
-          break;
-        case 'pause':
-          controls?.pause('manual');
-          message = 'Quota guard paused.';
-          break;
-        case 'resume':
-          message = (await controls?.resume())
-            ? 'Quota guard resumed.'
-            : 'Quota guard resume refused: no fresh check available.';
-          break;
-        default:
-          message = controls ? describe(controls.status()) : 'Quota guard: not installed.';
+      if (invalidTarget || (sub === 'enable' && tokens.length > 1)
+        || (sub === 'status' && tokens.length > 1)) {
+        message = 'Quota guard: invalid target or arguments; use on|off|pause|resume [all|codex|commandcode].';
+      } else {
+        const publicTarget = (targetToken ?? 'all') as GuardTarget;
+        const target = fleetTarget(publicTarget);
+        const targetLabel = publicTarget;
+        switch (sub) {
+          case 'on':
+          case 'off': {
+            const persist = config?.persistProviderEnabled;
+            if (!persist) {
+              message = 'Quota guard: persistent settings changes are unavailable in this session.';
+              break;
+            }
+            const result = persist(target, sub === 'on');
+            message = result.persisted
+              ? `Quota guard ${sub} ${targetLabel} saved; restart pi for it to take effect.`
+              : result.message ?? `Quota guard ${sub} ${targetLabel} could not be saved.`;
+            break;
+          }
+          case 'enable':
+            controls?.enable();
+            message = 'Quota guard enabled (applies on the next pi session).';
+            break;
+          case 'pause':
+            controls?.pause(publicTarget);
+            message = `Quota guard paused (${targetLabel}).`;
+            break;
+          case 'resume':
+            message = (await controls?.resume(publicTarget))
+              ? `Quota guard resumed (${targetLabel}).`
+              : `Quota guard resume refused (${targetLabel}): the applicable holds could not be safely cleared.`;
+            break;
+          case 'status':
+            message = controls ? describe(controls.status()) : 'Quota guard: not installed.';
+            break;
+          default:
+            message = controls ? describe(controls.status()) : 'Quota guard: not installed.';
+        }
       }
       const ui = (ctx as { ui?: { notify?: (m: string, t?: string) => void } } | undefined)?.ui;
       if (typeof ui?.notify === 'function') ui.notify(message, 'info');
@@ -376,11 +514,13 @@ function registerCommand(host: QuotaGuardHost): void {
 /**
  * Configuration the guard reads off the host, transported from the persisted settings.
  *
- * These are the two fields `QuotaGuardHost` declares but the pi API object does not carry, so they
- * arrive as an explicit second argument rather than by mutating the API object: the host identity
+ * Settings-only values the pi API object does not carry arrive as an explicit second argument,
+ * rather than by mutating the API object: the host identity
  * is what `commanded`/`bindings` key on, and rewriting it would lose that identity.
  */
 export interface QuotaGuardConfig {
+  /** Persist provider ON/OFF choices to the current project's settings file. */
+  persistProviderEnabled?: (target: FleetTarget, enabled: boolean) => { persisted: boolean; message?: string };
   /** Durable state directory for the wake machine; must be absolute. */
   stateDir?: string;
   /** Verified Codex meter scope. Absent means a Codex attempt is refused, never misattributed. */
@@ -391,23 +531,32 @@ export interface QuotaGuardConfig {
    * unknown reserve unknown, which keeps the guard closed.
    */
   reserveUnits?: ReadonlyMap<string, number>;
+  /** Providers with automatic quota guarding enabled; omitted preserves legacy both-on behavior. */
+  guardedProviders?: readonly GuardedProvider[];
 }
 
 /**
- * Entry point. Inert unless `quotaGuardEnabled` is true: the enabled check is
- * the very first statement, so a disabled call cannot touch the host at all.
+ * Entry point. An explicit empty provider list overrides legacy enablement. When both providers are
+ * off, a persistence callback permits command-only settings control without installing a runtime.
+ * Otherwise, the guard is inert unless legacy enablement or a provider is enabled.
  *
  * `config` supplies what the host object cannot (see `QuotaGuardConfig`). A value the host already
  * carries wins, so an explicit host field is never overwritten by the settings.
  */
 export function quotaGuardExtension(host: unknown, config?: QuotaGuardConfig): void {
-  if (!enabled) return;
+  const guardedProviders = config?.guardedProviders;
+  const commandOnly = guardedProviders !== undefined && guardedProviders.length === 0
+    && typeof config?.persistProviderEnabled === 'function';
+  if (!commandOnly && (guardedProviders !== undefined ? guardedProviders.length === 0 : !enabled)) return;
   if (!host || typeof host !== 'object') return;
   const h = host as QuotaGuardHost;
   if (typeof h.registerCommand === 'function' && !commanded.has(h)) {
     commanded.add(h);
-    registerCommand(h);
+    registerCommand(h, config);
   }
+  // Keep the persistent settings command available while both providers are OFF, without creating
+  // a coordinator, resolving credentials, looking up the runtime hook, or decorating dispatch.
+  if (commandOnly) return;
   install(h, config);
 }
 

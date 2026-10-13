@@ -2,7 +2,7 @@ import { readQuota } from './adapters.ts';
 import { AccountFifo, FleetLatch } from './controller.ts';
 import { GuardCoordinator } from './coordinator.ts';
 import { DEFAULT_POLICY, ReserveEstimator, seedReserves, validateReserveSeed } from './policy.ts';
-import type { Policy } from './types.ts';
+import type { GuardedProvider, Policy } from './types.ts';
 
 /**
  * Builds the one coordinator a guarded root runs on. Nothing constructs this at import time: it
@@ -35,7 +35,7 @@ export interface RootBinding {
    * Only the scopes the guard has actually seen can be re-checked - the estimator is keyed by lane and
    * `AccountFifo.lanes` is private, so an arbitrary known scope cannot be enumerated from here.
    */
-  freshCheck: () => Promise<boolean>;
+  freshCheck: (providerId?: GuardedProvider) => Promise<boolean>;
 }
 
 export function createQuotaGuardCoordinator(options: RootBindingOptions): RootBinding {
@@ -52,7 +52,7 @@ export function createQuotaGuardCoordinator(options: RootBindingOptions): RootBi
     policy: options.policy ?? DEFAULT_POLICY,
     // The paused mode is what applies the RESUME threshold instead of the pause one, so this must
     // report the latch's real state: getting it wrong silently reopens at the wrong headroom.
-    mode: () => (fleet.snapshot().state === 'open' ? 'running' : 'paused'),
+    mode: (providerId) => (fleet.snapshot(providerId).state === 'open' ? 'running' : 'paused'),
     // Per-window reserve units for that lane. An unseen lane yields null, and null keeps the guard
     // closed - unknown is never treated as zero. The operator's seed fills only those nulls; where
     // the estimator has an observation, that observation is what gates.
@@ -63,5 +63,5 @@ export function createQuotaGuardCoordinator(options: RootBindingOptions): RootBi
     now: options.now ?? Date.now,
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
   });
-  return { coordinator, fleet, estimator, freshCheck: () => coordinator.freshCheck() };
+  return { coordinator, fleet, estimator, freshCheck: (providerId) => coordinator.freshCheck(providerId) };
 }

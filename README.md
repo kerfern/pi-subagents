@@ -717,8 +717,9 @@ Turn `all` on for tools that genuinely emit Markdown, and off again for a diff o
 **Quota guard** (`quotaGuardEnabled`, default `false`): a default-off guard that reads OpenAI Codex and Command Code
 subscription usage and admits a request only after a fresh check, serialising one lane per verified account and
 latching the whole fleet — draining admitted work rather than aborting it — when a window is close to exhausted.
-Nothing runs until an operator sets `"quotaGuardEnabled": true` in `subagents.json`; while it is off the package is
-inert. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
+The guard is off by default. `/quota-guard on|off [all|codex|commandcode]` persists per-provider choices in the
+current project's settings; when both providers are off, command-only mode keeps these controls available without
+resolving credentials or decorating the runtime. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
 failure mode it exists to prevent is a guard that looks installed while dispatching unguarded. Upgrade procedure: run
 `npm run check:quota-host` after a pi upgrade. See [the compatibility guide](docs/quota-guard-compatibility.md).
 
@@ -728,13 +729,14 @@ Leaving it unset is not quite the same as `true`. Unset means *auto*: on, unless
 
 The match is on the exact tool names `Workflow` (Claude Code's) and `SubagentWorkflow` (ours), never a substring, so a `list_workflows` or `github_workflow_run` from some CI integration does not silently take the feature down. The check runs at `session_start` and nowhere earlier, because `getAllTools` throws during extension loading and load order means a check at registration time could not see an extension that has not loaded yet — so the tool is registered first and withdrawn from the active set through `setActiveTools`, which rebuilds the system prompt before any turn runs. When the other extension took the `SubagentWorkflow` name itself, pi's first-registration-wins rule already dropped ours, so there is nothing to withdraw and only the menu and the CLI flag come down.
 
-**Quota guard** (`quotaGuardEnabled`, default `false`): an opt-in, operator-controlled guard that holds subagent dispatch behind a quota check and latches the fleet when a provider's quota is exhausted. **Enabling it is an operator action** — it is off by default, and the extension does no I/O, resolves no credentials and decorates nothing until it is on. Set `"quotaGuardEnabled": true` in `subagents.json`; read at extension load, so it applies on the next pi session. The `/quota-guard` command takes four subcommands:
+**Quota guard** (`quotaGuardEnabled`, default `false`): an opt-in, operator-controlled guard that holds subagent dispatch behind a quota check and latches the fleet when a provider's quota is exhausted. Provider-specific persistent switches can be changed with `/quota-guard on|off [all|codex|commandcode]`; the command saves to the current project's `.pi/subagents.json` and changes take effect after restarting Pi. With both providers OFF, command-only mode keeps those persistent controls available but resolves no credentials and decorates nothing.
 
 | Subcommand | What it does |
 | ---------- | ------------ |
-| `/quota-guard enable` | Turn the guard on for the session |
-| `/quota-guard pause` | Pause the fleet (`manual`); admitted work finishes, new dispatch waits |
-| `/quota-guard resume` | Resume — refused unless a fresh check is available |
+| `/quota-guard on [all|codex|commandcode]` | Persistently turn selected provider guards on (restart Pi to apply) |
+| `/quota-guard off [all|codex|commandcode]` | Persistently turn selected provider guards off (restart Pi to apply) |
+| `/quota-guard pause [all|codex|commandcode]` | Immediately pause selected providers; admitted work finishes, new dispatch waits |
+| `/quota-guard resume [all|codex|commandcode]` | Resume — refused unless a fresh check is available |
 | `/quota-guard status` | Print the fleet snapshot (state, reason, active/inference/coding counts) and wake/backoff state |
 
 It never force-aborts active work and never patches `globalThis.fetch`.

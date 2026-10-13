@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import subagentsExtension from "../src/index.js";
 import {
   applyAndEmitLoaded,
   applySettings,
@@ -10,7 +12,9 @@ import {
   type SettingsAppliers,
   saveAndEmitChanged,
   saveSettings,
+  snapshotQuotaGuardSettings,
 } from "../src/settings.js";
+import { ctx as extensionContext, hermeticDir, makePi } from "./helpers/boot-extension.js";
 
 /**
  * Tests for persistent settings. Uses two tmp directories:
@@ -19,6 +23,81 @@ import {
  * - `projectDir`: passed explicitly as cwd to load/save.
  *   Simulates the user's project root. Settings live at `<projectDir>/.pi/subagents.json`.
  */
+describe("production settings snapshot wiring", () => {
+  it.each([
+    ["unset provider fields", {}],
+    ["legacy-only provider config", { quotaGuardEnabled: false }],
+  ])("saves actual snapshot with %s through /agents → Settings", async (_label, initial) => {
+    const env = hermeticDir({ settings: initial });
+    try {
+      initTheme(undefined, false);
+      const boot = makePi();
+      subagentsExtension(boot.pi);
+      let settingsSelected = false;
+      let built: any;
+      const ui = {
+        notify: vi.fn(),
+        select: vi.fn(async (_title: string, options: string[]) => {
+          if (settingsSelected) return undefined;
+          settingsSelected = true;
+          return options.find(option => option === "Settings");
+        }),
+        custom: vi.fn(async (factory: any) => {
+          built = factory({ requestRender: () => {} }, {}, {}, () => {});
+          built.handleInput(" ");
+          return undefined;
+        }),
+        input: vi.fn(async () => undefined),
+      };
+      await boot.commands.get("agents").handler("", extensionContext({ cwd: env.dir, ui }));
+
+      const persisted = loadSettings(env.dir);
+      expect(ui.notify).toHaveBeenCalled(); // setting mutation reached notifyApplied()/snapshotSettings()
+      expect(persisted).toHaveProperty("maxConcurrent"); // unrelated snapshot field proves full snapshot persisted
+      expect(persisted.quotaGuardEnabled).toBe(initial.quotaGuardEnabled ?? false);
+      expect(persisted.quotaGuardCodexEnabled).toBeUndefined();
+      expect(persisted.quotaGuardCommandCodeEnabled).toBeUndefined();
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("persists quota-guard on/off through its command without replacing other project settings", async () => {
+    const env = hermeticDir({ settings: {
+      maxConcurrent: 7,
+      quotaGuardEnabled: false,
+      quotaGuardCodexEnabled: false,
+      quotaGuardCommandCodeEnabled: false,
+    } });
+    try {
+      initTheme(undefined, false);
+      const boot = makePi();
+      subagentsExtension(boot.pi);
+      const command = boot.commands.get("quota-guard");
+      expect(command).toBeDefined();
+      const ui = { notify: vi.fn() };
+      const ctx = extensionContext({ cwd: env.dir, ui });
+
+      await command!.handler("on codex", ctx);
+      let saved = loadSettings(env.dir);
+      expect(saved.quotaGuardCodexEnabled).toBe(true);
+      expect(saved.quotaGuardCommandCodeEnabled).toBe(false);
+      expect(saved.quotaGuardEnabled).toBe(false);
+      expect(saved.maxConcurrent).toBe(7);
+      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("restart pi"), "info");
+
+      await command!.handler("off codex", ctx);
+      saved = loadSettings(env.dir);
+      expect(saved.quotaGuardCodexEnabled).toBe(false);
+      expect(saved.quotaGuardCommandCodeEnabled).toBe(false);
+      expect(saved.quotaGuardEnabled).toBe(false);
+      expect(saved.maxConcurrent).toBe(7);
+    } finally {
+      env.restore();
+    }
+  });
+});
+
 describe("settings persistence", () => {
   let globalDir: string;
   let projectDir: string;
@@ -229,6 +308,31 @@ describe("settings persistence", () => {
     writeProject({ workflowsEnabled: "on" } as any);
     // Dropped, not coerced — a truthy string must not switch the feature on.
     expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips provider quota guard settings and merges project over global", () => {
+    writeGlobal({ quotaGuardCodexEnabled: true, quotaGuardCommandCodeEnabled: false });
+    writeProject({ quotaGuardCodexEnabled: false });
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardCodexEnabled: false, quotaGuardCommandCodeEnabled: false });
+    saveSettings({ quotaGuardCodexEnabled: true, quotaGuardCommandCodeEnabled: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardCodexEnabled: true, quotaGuardCommandCodeEnabled: false });
+    writeGlobal({});
+    writeProject({ quotaGuardCodexEnabled: "on", quotaGuardCommandCodeEnabled: 1 } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("keeps provider quota guard settings unset in snapshot/save/reload; legacy-only stays legacy-only", () => {
+    // Exercise same production snapshot helper spread by index.ts.
+    const emit = vi.fn();
+    const unsetSnapshot = snapshotQuotaGuardSettings(false);
+    saveAndEmitChanged(unsetSnapshot, "saved", emit, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: false });
+    expect(loadSettings(projectDir).quotaGuardCodexEnabled).toBeUndefined();
+    expect(loadSettings(projectDir).quotaGuardCommandCodeEnabled).toBeUndefined();
+
+    const legacyOnlySnapshot = snapshotQuotaGuardSettings(true);
+    saveAndEmitChanged(legacyOnlySnapshot, "saved", emit, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: true });
   });
 
   it("round-trips quotaGuardEnabled; a non-boolean leaves it off", () => {
@@ -634,6 +738,8 @@ describe("settings persistence", () => {
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
         setQuotaGuardEnabled: vi.fn(),
+        setQuotaGuardCodexEnabled: vi.fn(),
+        setQuotaGuardCommandCodeEnabled: vi.fn(),
         setQuotaGuardStateDir: vi.fn(),
         setQuotaGuardCodexLimits: vi.fn(),
         setQuotaGuardReserveUnits: vi.fn(),
@@ -683,6 +789,21 @@ describe("settings persistence", () => {
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
       expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
+    });
+
+    it("resolves explicit provider values ahead of legacy, then legacy, then off", () => {
+      applySettings({ quotaGuardEnabled: false, quotaGuardCodexEnabled: true, quotaGuardCommandCodeEnabled: true }, appliers);
+      expect(appliers.setQuotaGuardCodexEnabled).toHaveBeenLastCalledWith(true);
+      expect(appliers.setQuotaGuardCommandCodeEnabled).toHaveBeenLastCalledWith(true);
+      applySettings({ quotaGuardEnabled: true, quotaGuardCodexEnabled: false, quotaGuardCommandCodeEnabled: false }, appliers);
+      expect(appliers.setQuotaGuardCodexEnabled).toHaveBeenLastCalledWith(false);
+      expect(appliers.setQuotaGuardCommandCodeEnabled).toHaveBeenLastCalledWith(false);
+      applySettings({ quotaGuardEnabled: true }, appliers);
+      expect(appliers.setQuotaGuardCodexEnabled).toHaveBeenLastCalledWith(true);
+      expect(appliers.setQuotaGuardCommandCodeEnabled).toHaveBeenLastCalledWith(true);
+      applySettings({}, appliers);
+      expect(appliers.setQuotaGuardCodexEnabled).toHaveBeenLastCalledWith(false);
+      expect(appliers.setQuotaGuardCommandCodeEnabled).toHaveBeenLastCalledWith(false);
     });
 
     it("applies quotaGuardStateDir, quotaGuardCodexLimits and quotaGuardReserveUnits; skips them when absent", () => {
@@ -903,6 +1024,8 @@ describe("settings persistence", () => {
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
         setQuotaGuardEnabled: vi.fn(),
+        setQuotaGuardCodexEnabled: vi.fn(),
+        setQuotaGuardCommandCodeEnabled: vi.fn(),
         setQuotaGuardStateDir: vi.fn(),
         setQuotaGuardCodexLimits: vi.fn(),
         setQuotaGuardReserveUnits: vi.fn(),
