@@ -222,6 +222,8 @@ async function createFixture(guardedProviders: readonly ("openai-codex" | "comma
     extensions: false,
     skills: false,
     maxTurns: 1,
+    systemPrompt: "",
+    promptMode: "replace",
   };
   registerAgents(new Map([["quota-runtime-probe", config]]));
   const context = {
