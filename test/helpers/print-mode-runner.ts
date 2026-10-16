@@ -45,6 +45,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as PiAI from "@earendil-works/pi-ai";
 import {
   type AssistantMessage,
   type Context,
@@ -92,6 +93,19 @@ export type FauxResponder = (
   context: Context,
   state: { callCount: number },
 ) => FauxReply | Promise<FauxReply>;
+
+const transcriptHelpers = PiAI as unknown as {
+  getCurrentSystemPrompt?: (messages: Context["messages"]) => string;
+  getCurrentTools?: (messages: Context["messages"]) => NonNullable<Context["tools"]>;
+};
+
+function normalizeFauxContext(context: Context): Context {
+  return {
+    ...context,
+    systemPrompt: context.systemPrompt ?? transcriptHelpers.getCurrentSystemPrompt?.(context.messages),
+    tools: context.tools ?? transcriptHelpers.getCurrentTools?.(context.messages),
+  };
+}
 
 export interface RunPrintModeOptions {
   /** The user prompt that kicks off the parent turn. */
@@ -329,7 +343,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
       }
       const max = options.maxModelCalls ?? 16;
       const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(context, state));
+        toAssistantMessage(await respond(normalizeFauxContext(context), state));
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }

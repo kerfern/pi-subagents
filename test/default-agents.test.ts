@@ -12,7 +12,7 @@ describe("read-only specialist defaults", () => {
     expect(plan?.builtinToolNames).not.toContain("edit");
     expect(plan?.extensions).toBe(false);
     expect(plan?.model).toBe(DEFAULT_REVIEWER_MODEL);
-    expect(plan?.thinking).toBe("high");
+    expect(plan?.thinking).toBe("xhigh");
     expect(plan?.persistSession).toBe(true);
     expect(plan?.systemPrompt).not.toMatch(/\bbash\b/i);
 

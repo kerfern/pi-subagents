@@ -13,7 +13,7 @@ export default defineConfig({
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
     // Separate Node suites keep their native runner; retain every default Vitest exclusion.
-    exclude: [...configDefaults.exclude, "quota-guard/**", ".superpowers/**"],
+    exclude: [...configDefaults.exclude, "quota-guard/**", ".superpowers/**", ".worktrees/**"],
     setupFiles: ["test/setup.ts"],
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // The harnesses drive narrow faux catalogs, so the reviewer/shared subagent

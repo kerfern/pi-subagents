@@ -81,7 +81,7 @@ Use only the available read-only tools; shell access is not provided.
       extensions: false,
       skills: true,
       model: DEFAULT_REVIEWER_MODEL,
-      thinking: "high",
+      thinking: "xhigh",
       persistSession: true,
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a software architect and planning specialist.

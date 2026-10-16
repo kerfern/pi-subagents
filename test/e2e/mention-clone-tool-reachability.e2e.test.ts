@@ -18,13 +18,13 @@
  * prose, and fell back to a direct start with a warning. The unit suite stayed
  * green throughout.
  *
- * So this asserts against a REAL session, on the two things a mock cannot
- * establish:
- *   1. the clone's `Agent` tool is actually active on it, and
- *   2. nothing else is — the invisible turn cannot read, write or run anything.
+ * These tests use a REAL session to establish behavior a mock cannot:
+ *   1. the clone's `Agent` tool is active, and nothing else is;
+ *   2. the provider receives the main prompt/history and Agent dispatch retains
+ *      main-session attribution.
  *
- * No network/LLM: a faux provider satisfies session construction, and the
- * assertion is on the constructed tool set rather than on a model turn.
+ * No network/LLM: a faux provider drives a real turn for prompt/history and
+ * attribution; a second test inspects the constructed tool set directly.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +51,9 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   };
 });
 
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { defineTool, type ExtensionToolContext, SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 import { runMentionClone } from "../../src/mention-clone.js";
 import { fauxModelBackend } from "../helpers/faux-model-backend.js";
 import { registerFauxProvider } from "../helpers/pi-ai.js";
@@ -69,6 +72,86 @@ describe("mention clone tool reachability against real pi-mono", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
+  it("projects the exact main-session prompt and branch to the provider", async () => {
+    const model = faux.getModel();
+    const backend = fauxModelBackend(model);
+    const parentSessionManager = SessionManager.inMemory(cwd);
+    parentSessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "main-session user marker" }],
+      timestamp: 1,
+    } as any);
+    parentSessionManager.appendMessage(fauxAssistantMessage("main-session assistant marker", { timestamp: 2 }));
+
+    let request: any;
+    faux.setResponses([
+      (context) => {
+        request = context;
+        return fauxAssistantMessage(
+          fauxToolCall("Agent", { subagent_type: "Explore", prompt: "spawn" }),
+          { stopReason: "toolUse" },
+        );
+      },
+      fauxAssistantMessage("finished"),
+    ]);
+
+    const ctx: any = {
+      cwd,
+      model,
+      getSystemPrompt: () => "PARENT LIVE SYSTEM PROMPT",
+      modelRegistry: { ...backend.modelRegistry, runtime: backend.modelRuntime },
+      sessionManager: parentSessionManager,
+    };
+    const executeAgent = vi.fn(async (
+      _toolCallId: string,
+      _params: { subagent_type: string; prompt: string; run_in_background?: boolean },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      _ctx: ExtensionToolContext,
+    ) => ({
+      content: [{ type: "text" as const, text: "Agent ID: a1" }],
+      details: {},
+    }));
+    const agentTool = defineTool({
+      name: "Agent",
+      label: "Agent",
+      description: "Launch a test agent",
+      parameters: Type.Object({
+        subagent_type: Type.String(),
+        prompt: Type.String(),
+        run_in_background: Type.Optional(Type.Boolean()),
+      }),
+      execute: executeAgent,
+    });
+
+    const result = await runMentionClone({ ctx, type: "Explore", message: "go", agentTool });
+
+    expect(faux.state.callCount).toBe(2);
+    expect(executeAgent).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ spawned: true });
+    expect(request).toBeDefined();
+    const effectiveSystemPrompt =
+      request.systemPrompt ?? request.messages.find((message: any) => message.role === "system")?.content;
+    expect(effectiveSystemPrompt).toBe("PARENT LIVE SYSTEM PROMPT");
+    const transcriptText = request.messages
+      .flatMap((message: any) =>
+        typeof message.content === "string"
+          ? [message.content]
+          : Array.isArray(message.content)
+            ? message.content.flatMap((block: any) => (block.type === "text" ? [block.text] : []))
+            : [],
+      )
+      .join("\n");
+    expect(transcriptText).toContain("main-session user marker");
+    expect(transcriptText).toContain("main-session assistant marker");
+    expect(sessions[0].getActiveToolNames()).toEqual(["Agent"]);
+    const agentCall = executeAgent.mock.calls.at(-1);
+    if (!agentCall) throw new Error("Agent handler was not called");
+    const toolContext = agentCall[4];
+    expect(toolContext.cwd).toBe(cwd);
+    expect(toolContext.sessionManager).toBe(parentSessionManager);
+  });
+
   it("the clone's Agent tool is live on the real session, and it is the only one", async () => {
     const model = faux.getModel();
     const backend = fauxModelBackend(model);
@@ -79,7 +162,7 @@ describe("mention clone tool reachability against real pi-mono", () => {
       // mention-clone reads the runtime off the registry facade, the same shim
       // agent-runner carries for Pi >= 0.80.8.
       modelRegistry: { ...backend.modelRegistry, runtime: backend.modelRuntime },
-      sessionManager: { getEntries: () => [], getLeafId: () => undefined },
+      sessionManager: { getEntries: () => [], getLeafId: () => undefined, getBranch: () => [] },
     };
 
     // Never called: the assertion is on what the session exposes, not on the

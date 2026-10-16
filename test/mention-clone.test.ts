@@ -17,10 +17,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts.
-const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
+const {
+  buildSessionContext,
+  createAgentSession,
+  inMemory,
+  createDefaultResourceLoader,
+  createSettingsManager,
+  getAgentDir,
+  sessionManagerPrototype,
+} = vi.hoisted(() => ({
   buildSessionContext: vi.fn(),
   createAgentSession: vi.fn(),
   inMemory: vi.fn(),
+  createDefaultResourceLoader: vi.fn(class {
+    constructor(_options: unknown) {}
+    reload = vi.fn().mockResolvedValue(undefined);
+  }),
+  createSettingsManager: vi.fn(() => ({ kind: "settings-manager" })),
+  getAgentDir: vi.fn(() => "/agent"),
+  sessionManagerPrototype: {} as Record<string, unknown>,
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async () => {
@@ -29,10 +44,14 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
     ...actual,
     buildSessionContext,
     createAgentSession,
-    SessionManager: { ...actual.SessionManager, inMemory },
+    DefaultResourceLoader: createDefaultResourceLoader,
+    getAgentDir,
+    SessionManager: { ...actual.SessionManager, inMemory, prototype: sessionManagerPrototype },
+    SettingsManager: { create: createSettingsManager },
   };
 });
 
+import { inChildSessionContext } from "../src/child-context.js";
 import { agentMentionReminder } from "../src/mention.js";
 import { runMentionClone } from "../src/mention-clone.js";
 
@@ -41,13 +60,31 @@ const CONVERSATION = [
   { role: "user", content: [{ type: "text", text: "hi" }] },
   { role: "assistant", content: [{ type: "text", text: "hello" }] },
 ] as any[];
+const MAIN_BRANCH = [{ type: "message", id: "main-entry" }] as any[];
+
+let loaderOptionsAtConstruction: unknown;
+let reloadWasInChildContext = false;
 
 beforeEach(() => {
   createAgentSession.mockReset();
   inMemory.mockReset();
   inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
+  delete sessionManagerPrototype.buildSessionProjection;
   buildSessionContext.mockReset();
   buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
+  createDefaultResourceLoader.mockClear();
+  loaderOptionsAtConstruction = undefined;
+  reloadWasInChildContext = false;
+  createDefaultResourceLoader.mockImplementation(class {
+    constructor(options: unknown) {
+      loaderOptionsAtConstruction = options;
+    }
+    reload = vi.fn(async () => {
+      reloadWasInChildContext = inChildSessionContext();
+    });
+  });
+  createSettingsManager.mockClear();
+  getAgentDir.mockClear();
 });
 
 /** The main session's context — the one the spawn must be attributed to. */
@@ -59,8 +96,9 @@ function mainCtx(overrides: Record<string, unknown> = {}) {
     modelRegistry: { runtime: { kind: "runtime" } },
     getSystemPrompt: vi.fn(() => "the live system prompt"),
     sessionManager: {
-      getEntries: vi.fn(() => [{ type: "message" }] as any[]),
+      getEntries: vi.fn(() => MAIN_BRANCH),
       getLeafId: vi.fn(() => "leaf-1"),
+      getBranch: vi.fn(() => MAIN_BRANCH),
     },
     ...overrides,
   } as any;
@@ -131,13 +169,14 @@ const opts = (over: Record<string, unknown> = {}) => ({
 }) as any;
 
 describe("cloning the conversation", () => {
-  it("carries the conversation's own messages, not a rendering of them", async () => {
+  it("keeps legacy manager empty, then carries the conversation's own messages", async () => {
     // The whole point: the copy reasons over what the main model can see.
     const session = cloneSession(callsAgent());
 
     await runMentionClone(opts());
 
-    expect(session.agent.state.messages).toEqual([
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, []);
+    expect(session.agent.state.messages.filter((message: any) => message.role !== "system")).toEqual([
       { role: "user", content: [{ type: "text", text: "hi" }] },
       { role: "assistant", content: [{ type: "text", text: "hello" }] },
     ]);
@@ -152,10 +191,23 @@ describe("cloning the conversation", () => {
 
     await runMentionClone(o);
 
-    expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
+    expect(buildSessionContext).toHaveBeenCalledWith(MAIN_BRANCH, "leaf-1");
     expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
       kind: "in-memory-session-manager",
     });
+  });
+
+  it("seeds the modern in-memory session with the main branch", async () => {
+    const modernManager = { kind: "in-memory-session-manager" };
+    sessionManagerPrototype.buildSessionProjection = vi.fn();
+    inMemory.mockReturnValue(modernManager as any);
+    cloneSession(callsAgent());
+
+    await runMentionClone(opts());
+
+    expect(inMemory).toHaveBeenCalledWith("/repo", undefined, MAIN_BRANCH);
+    expect(buildSessionContext).not.toHaveBeenCalled();
+    expect(createAgentSession.mock.calls[0][0].sessionManager).toBe(modernManager);
   });
 
   it("thinks at the level the session is really on", async () => {
@@ -193,17 +245,32 @@ describe("cloning the conversation", () => {
 
     expect(result).toEqual({ spawned: true });
     expect(session.agent.state.messages).toEqual([]);
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    expect(session.agent.state.systemPrompt).toBe("rebuilt-from-cwd");
   });
 
-  it("carries the live system prompt rather than the one it rebuilt", async () => {
-    // createAgentSession derives a prompt from cwd and agentDir. Close, but not
-    // what the user's model is working under — extensions add to it per turn.
-    const session = cloneSession(callsAgent());
+  it("forces the live prompt through the clone-only before_agent_start hook", async () => {
+    cloneSession(callsAgent());
 
     await runMentionClone(opts());
 
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    const loaderOptions = loaderOptionsAtConstruction as any;
+    expect(loaderOptions).toMatchObject({
+      cwd: "/repo",
+      agentDir: "/agent",
+      settingsManager: { kind: "settings-manager" },
+    });
+    const registerHandler = vi.fn();
+    loaderOptions.extensionFactories[0].factory({ on: registerHandler });
+    expect(registerHandler).toHaveBeenCalledWith("before_agent_start", expect.any(Function));
+    expect(registerHandler.mock.calls[0][1]()).toEqual({ systemPrompt: "the live system prompt" });
+  });
+
+  it("reloads clone resources while the child-session guard is active", async () => {
+    cloneSession(callsAgent());
+
+    await runMentionClone(opts());
+
+    expect(reloadWasInChildContext).toBe(true);
   });
 
   it("inherits the parent's model, thinking level and providers", async () => {
@@ -270,7 +337,24 @@ describe("attributing the spawn to the real session", () => {
     await runMentionClone(o);
 
     expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(tool.execute.mock.calls[0][4]).toBe(o.ctx);
+    const toolContext = tool.execute.mock.calls[0][4];
+    expect(toolContext).not.toBe(o.ctx);
+    expect(toolContext.cwd).toBe(o.ctx.cwd);
+    expect(toolContext.model).toBe(o.ctx.model);
+    expect(toolContext.sessionManager).toBe(o.ctx.sessionManager);
+  });
+
+  it("disables nested tool execution in the derived main context", async () => {
+    const tool = agentTool();
+    cloneSession(callsAgent());
+
+    await runMentionClone(opts({ agentTool: tool }));
+
+    const toolContext = tool.execute.mock.calls[0][4];
+    expect(toolContext.tools).toEqual([]);
+    const nestedCall = await toolContext.executeTool("Bash", {});
+    expect(nestedCall.isError).toBe(true);
+    expect(nestedCall.result.content[0].text).toMatch(/disabled/i);
   });
 
   it("passes no tool-call id, since the real session issued none", async () => {
