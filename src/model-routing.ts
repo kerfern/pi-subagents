@@ -11,10 +11,10 @@
 
 import type { ThinkingLevel } from "./types.js";
 
-export const DEFAULT_SUBAGENT_MODEL = "github-copilot/gpt-6-luna";
+export const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-6-luna";
 export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.1-sol";
 const DEFAULT_SUBAGENT_THINKING: ThinkingLevel = "low";
-const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "high";
+const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "xhigh";
 /**
  * Where one provider failure retries to. Deliberately a DIFFERENT provider from
  * the default: retrying inside the provider that just failed re-dials the same

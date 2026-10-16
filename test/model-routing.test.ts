@@ -97,17 +97,17 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
-  it("routes reviewer, Plan, and advisor to Sol; ordinary agents use GitHub Copilot Luna", () => {
+  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use OpenAI Codex Luna/low", () => {
     const state = restoreRoutingState([], [
       { provider: "openai-codex", id: "gpt-6.1-sol" },
-      { provider: "github-copilot", id: "gpt-6-luna" },
+      { provider: "openai-codex", id: "gpt-6-luna" },
     ]);
     for (const role of ["reviewer", "Plan", "advisor"]) {
       expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.1-sol");
-      expect(thinkingForSubagent(state, role)).toBe("high");
+      expect(thinkingForSubagent(state, role)).toBe("xhigh");
     }
-    for (const role of ["worker", "Explore", "custom-role"]) {
-      expect(modelForSubagent(state, role)).toBe("github-copilot/gpt-6-luna");
+    for (const role of ["worker", "Explore", "implementer", "custom-role"]) {
+      expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6-luna");
       expect(thinkingForSubagent(state, role)).toBe("low");
     }
   });
@@ -121,7 +121,7 @@ describe("restore + migration", () => {
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
     expect(state.reviewerEffective).toBe(DEFAULT_REVIEWER_MODEL);
     expect(thinkingForSubagent(state, "worker")).toBe("low");
-    expect(thinkingForSubagent(state, "reviewer")).toBe("high");
+    expect(thinkingForSubagent(state, "reviewer")).toBe("xhigh");
     expect(state.stale).toBe(true);
   });
 

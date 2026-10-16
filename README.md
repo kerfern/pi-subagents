@@ -622,7 +622,7 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 
 | | |
 | --------- | ------------- |
-| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.1-sol` (high); other agents `github-copilot/gpt-6-luna` (low) |
+| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.1-sol` (xhigh); other agents `openai-codex/gpt-6-luna` (low) |
 | Roles | Reviewer, built-in `Plan`, and custom `advisor` use specialist route; all other types use shared route |
 | Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
