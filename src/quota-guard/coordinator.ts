@@ -1,3 +1,4 @@
+import { writeSync } from 'node:fs';
 import type { CodexLimit, QuotaAuth, ReadOptions, readQuota } from './adapters.ts';
 import { FIRST_PARTY_ORIGINS, QuotaError } from './adapters.ts';
 import type { AccountFifo, FleetLatch, PauseReason, Release } from './controller.ts';
@@ -16,6 +17,16 @@ export interface AttemptScope {
 export interface FinalRequest { url: string; headers: Headers }
 
 interface Outbound { destination: string | Request; init: RequestInit }
+
+function diagnostic(line: string): void {
+  try { writeSync(2, `${line}\n`); } catch { /* diagnostics never change admission */ }
+}
+
+function safeDiagnosticValue(value: string): string {
+  const truncated = value.slice(0, 40);
+  const escaped = truncated.replace(/[^A-Za-z0-9_.:-]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return `${escaped}${value.length > 40 ? '...' : ''}`;
+}
 
 /**
  * Reads every caller-controlled scope field exactly once, before any validation or await. A caller
@@ -164,7 +175,22 @@ export class GuardCoordinator {
    * every other in-memory record here, and never a licence to dispatch unguarded.
    */
   private readonly unsupported = new Set<GuardedProvider>();
-  constructor(deps: CoordinatorDeps) { this.deps = deps; }
+  /**
+   * Providers refused because a window has no reserve and none can be calibrated (an idle account
+   * never moves a counter). Session-scoped, like every other in-memory record here. It exists so a
+   * retry fails fast with the same actionable error instead of parking in the latch wait on a hold
+   * that only new configuration - a restart with seeds - can lift. The hold itself stays: a pause is
+   * this guard's normal refusal, and resume remains the operator's recovery path. An entry is retired
+   * only when an admission observes the provider's hold verifiably open - never on a bare read, and
+   * never while the hold is still latched - so a fenced resume cannot strand the next retry, and one
+   * lane's success cannot erase a refusal another lane is parked on.
+   */
+  private readonly unconfigured = new Map<GuardedProvider, string>();
+  private readonly diagnosticSink: (line: string) => void;
+  constructor(deps: CoordinatorDeps, diagnosticSink: (line: string) => void = diagnostic) {
+    this.deps = deps;
+    this.diagnosticSink = diagnosticSink;
+  }
 
   /** Providers refused as unsupported (their quota surface is not served here). Sorted, for `status()`. */
   unsupportedProviders(): readonly GuardedProvider[] { return [...this.unsupported].sort(); }
@@ -212,6 +238,8 @@ export class GuardCoordinator {
         return false;
       }
     }
+    // A passing read alone does not retire the missing-reserve record: only an admission that sees
+    // the provider's hold verifiably open does, so a fenced resume cannot strand the next retry.
     return true;
   }
 
@@ -238,6 +266,15 @@ export class GuardCoordinator {
     if (!scopes.has(lane)) fleet.noteScope(attempt.providerId);
     scopes.set(lane, { attempt, lane });
     this.held.set(attempt.providerId, scopes);
+    const missingReserve = this.unconfigured.get(attempt.providerId);
+    if (missingReserve !== undefined
+      && (fleet.snapshot().state !== 'open' || fleet.snapshot(attempt.providerId).state !== 'open')) {
+      // Still a refusal, never an unguarded pass-through - but a terminal one: answering immediately
+      // is what stops a retry loop from hanging the caller on a hold it cannot clear itself. A hold
+      // already lifted skips this and is retired below, so a fenced resume cannot strand the retry.
+      throw new QuotaError('unconfigured', undefined,
+        `Quota guard: provider=${attempt.providerId} has no reserve for window(s) ${missingReserve}; set quotaGuardReserveUnits for them and restart Pi`);
+    }
     await fleet.wait(attempt.providerId, signal);
     const releaseLane = await fifo.enter(lane, signal);
     for (;;) {
@@ -245,6 +282,9 @@ export class GuardCoordinator {
       const rootBefore = fleet.snapshot();
       const providerBefore = fleet.snapshot(attempt.providerId);
       if (rootBefore.state !== 'open' || providerBefore.state !== 'open') continue;
+      // An open provider means the hold is genuinely lifted, so a fenced or rejected resume can never
+      // strand the next retry in the latch wait; retire the missing-reserve record now.
+      this.unconfigured.delete(attempt.providerId);
       const rootGeneration = rootBefore.generation;
       const providerGeneration = providerBefore.generation;
       const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
@@ -263,19 +303,42 @@ export class GuardCoordinator {
             failure.code === 'auth' || failure.code === 'schema' ? 'identity' : 'unavailable');
         }
         releaseLane();
+        try { this.diagnosticSink(`Quota guard: provider=${attempt.providerId} phase=read code=${failure.code}`); } catch { /* diagnostics never change admission */ }
         throw failure;
       }
+      let reserveUnits: ReturnType<typeof reserve>;
       let assessment: Assessment;
       try {
-        assessment = assess(snapshot, policy, mode(attempt.providerId), reserve(lane, snapshot), now());
+        reserveUnits = reserve(lane, snapshot);
+        assessment = assess(snapshot, policy, mode(attempt.providerId), reserveUnits, now());
       } catch (error) {
         fleet.pauseAutomatic(attempt.providerId, 'unavailable');
         releaseLane();
         throw error;
       }
       if (assessment.state !== 'open' && assessment.state !== 'warn') {
+        // The hold stays for every refusal, including an unknown reserve: pause-then-resume is this
+        // guard's recovery path. What changes for an unknown reserve is the error the caller sees
+        // (a terminal 'unconfigured' naming the missing windows) instead of a generic 'unavailable'.
         fleet.pauseAutomatic(attempt.providerId, pauseReasonFor(assessment.reason));
         releaseLane();
+        // Installed BEFORE the diagnostic sink: a reentrant sink, or any other admission racing this
+        // one, must already see the refusal - otherwise its retry parks on the hold just taken.
+        const missingReserveWindows = assessment.reason === 'unknown-reserve'
+          ? snapshot.windows.filter(window => reserveUnits.get(window.id) == null)
+            .map(window => safeDiagnosticValue(window.id)).join(', ')
+          : undefined;
+        if (missingReserveWindows !== undefined) this.unconfigured.set(attempt.providerId, missingReserveWindows);
+        const details = `Quota guard: provider=${attempt.providerId} phase=assessment state=${assessment.state} reason=${assessment.reason}`
+          + (assessment.limitingWindow === undefined ? '' : ` limitingWindow=${safeDiagnosticValue(assessment.limitingWindow)}`)
+          + (assessment.nextCheckAt === undefined ? '' : ` nextCheckAt=${safeDiagnosticValue(assessment.nextCheckAt)}`)
+          // An unknown reserve is only fixable by configuration, so the line carries the remedy too.
+          + (assessment.reason === 'unknown-reserve' ? '; set quotaGuardReserveUnits and restart Pi' : '');
+        try { this.diagnosticSink(details); } catch { /* diagnostics never change admission */ }
+        if (missingReserveWindows !== undefined) {
+          throw new QuotaError('unconfigured', undefined,
+            `Quota guard: provider=${attempt.providerId} has no reserve for window(s) ${missingReserveWindows}; set quotaGuardReserveUnits for them and restart Pi`);
+        }
         throw new QuotaError('unavailable');
       }
       let release: Release;

@@ -371,9 +371,10 @@ test('a paused fleet reopens through the real freshCheck and is then admitted fo
   assert.ok(controls, 'the hook install must expose the real controls');
 
   // Healthy window, but no observation yet: the reserve is unknown, so the provider stays closed.
+  // The refusal is terminal and configuration-scoped: it names the gap instead of a generic outage.
   await assert.rejects(
     () => instance.stream(model, 'ctx', { fetch: inner.fetchImpl }),
-    (error: unknown) => (error as { code?: string }).code === 'unavailable');
+    (error: unknown) => (error as { code?: string }).code === 'unconfigured');
   assert.deepEqual(inner.calls, [], 'an unknown reserve must not reach the inner transport');
   const binding = quotaGuardRootBinding();
   assert.ok(binding);

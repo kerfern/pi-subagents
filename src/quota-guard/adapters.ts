@@ -24,8 +24,13 @@ export interface ReadOptions {
  * `unsupported` is the one provider-scoped failure: this provider's quota surface is not served here
  * (a 404 on a quota route), so the guard cannot read its quota at all. Deliberately NOT `unavailable`,
  * which is the systemic code (network down, 5xx) that pauses the whole fleet.
+ *
+ * `unconfigured` is the operator-scoped failure: the guard cannot bound the cost of a dispatch because a
+ * window has no reserve and none can be calibrated (an idle account never moves a counter). It stays a
+ * refusal and the provider hold is still taken like every other refusal; the difference is only that a
+ * retry is answered at once, naming the missing windows, instead of being left parked on that hold.
  */
-export type QuotaErrorCode = 'auth' | 'schema' | 'unavailable' | 'rate-limited' | 'timeout' | 'aborted' | 'unsupported';
+export type QuotaErrorCode = 'auth' | 'schema' | 'unavailable' | 'rate-limited' | 'timeout' | 'aborted' | 'unsupported' | 'unconfigured';
 export class QuotaError extends Error {
   readonly code: QuotaErrorCode;
   readonly retryAt?: string;
@@ -62,11 +67,16 @@ function text(value: unknown): string {
   if (typeof value !== 'string' || !value.length || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) throw new QuotaError('schema');
   return value;
 }
-function instant(value: unknown): string {
+// `allowMilliseconds` is opt-in for the CommandCode window resets, which arrive in epoch
+// milliseconds; Codex reset_at is epoch seconds, so a nonsensical Codex value stays a schema error
+// instead of being silently reinterpreted as a different instant.
+function instant(value: unknown, allowMilliseconds = false): string {
   let time: number;
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || value <= 0) throw new QuotaError('schema');
-    time = value * 1000;
+    // No valid seconds value reaches 1e12 (year 33658), so magnitude disambiguates the unit and the
+    // ceiling below is unchanged. Callers that did not opt in keep the seconds-only meaning.
+    time = allowMilliseconds && value >= 1e12 ? value : value * 1000;
   } else {
     const source = text(value);
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(source)) throw new QuotaError('schema');
@@ -160,7 +170,7 @@ export function normalizeCommandCode(creditsPayload: unknown, subscriptionsPaylo
   for (const id of ['fiveHour', 'weekly']) {
     const window = object(limits[id]); const used = number(window.used); const rollingCap = number(window.cap);
     if (rollingCap <= 0 || typeof window.exceeded !== 'boolean') throw new QuotaError('schema');
-    windows.push({ id, used: window.exceeded ? Math.max(used, rollingCap) : used, cap: rollingCap, resetAt: instant(window.resetAt) });
+    windows.push({ id, used: window.exceeded ? Math.max(used, rollingCap) : used, cap: rollingCap, resetAt: instant(window.resetAt, true) });
   }
   // Returned rolling caps apply even with limited:false; purchased/free credits never substitute.
   return snapshot(identity, 'commandcode', windows, now);

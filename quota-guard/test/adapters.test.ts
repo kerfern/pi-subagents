@@ -90,6 +90,33 @@ test('normalizers reject identity/provider mismatch, nonfinite clock and invalid
   schema(() => normalizeCommandCode(bad, subscription(), commandId, now));
 });
 
+test('Codex reset_at stays seconds-only: a nonsensical value is never reinterpreted as milliseconds', () => {
+  const bad = codex(); bad.rate_limit.primary_window.reset_at = 1000000000000;
+  schema(() => normalizeCodex(bad, codexId, limits, now));
+});
+
+test('CommandCode epoch-millisecond resets parse; seconds/ISO unchanged and malformed numerics still reject', () => {
+  const roll = (fiveHour: number, weekly: number) => ({ ...credits(), windowLimits: { ...credits().windowLimits,
+    fiveHour: { ...credits().windowLimits.fiveHour, resetAt: fiveHour },
+    weekly: { ...credits().windowLimits.weekly, resetAt: weekly } } });
+  const millis = normalizeCommandCode(roll(1792234746174, 1792232858338), subscription(), commandId, now);
+  assert.deepEqual(millis.windows.slice(1).map(w => w.resetAt), ['2026-10-17T10:59:06.174Z', '2026-10-17T10:27:38.338Z']);
+  assert.equal(normalizeCommandCode(credits(), subscription(), commandId, now).windows[1]?.resetAt, new Date(now + 3600000).toISOString(),
+    'epoch-seconds resets keep their exact former meaning');
+  for (const value of [0, -1, 1.5, Number.MAX_VALUE, 253402300800000]) {
+    schema(() => normalizeCommandCode(roll(value, now / 1000 + 3600), subscription(), commandId, now));
+  }
+});
+
+test('readQuota accepts CommandCode millisecond resets end to end', async () => {
+  const body = { ...credits(), windowLimits: { ...credits().windowLimits,
+    fiveHour: { ...credits().windowLimits.fiveHour, resetAt: 1792234746174 },
+    weekly: { ...credits().windowLimits.weekly, resetAt: 1792232858338 } } };
+  const snapshot = await readQuota(auth('commandcode'), { now: () => now,
+    fetchImpl: fake(url => json(url.endsWith('credits') ? body : subscription())) });
+  assert.deepEqual(snapshot.windows.slice(1).map(w => w.resetAt), ['2026-10-17T10:59:06.174Z', '2026-10-17T10:27:38.338Z']);
+});
+
 test('GET origins, paths, redirect policy and per-provider headers pinned', async () => {
   const calls: { url: string; init?: RequestInit }[] = [];
   const fetchImpl = fake((url, init) => { calls.push({ url, init }); return json(url.includes('chatgpt.com') ? codex() : url.endsWith('credits') ? credits() : subscription()); });

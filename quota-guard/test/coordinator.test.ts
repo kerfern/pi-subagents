@@ -50,6 +50,82 @@ test('manual assertion refuses only held provider and ignores automatic holds', 
   assert.doesNotThrow(() => coordinator.assertManualAllowed('openai-codex'));
 });
 
+test('admit emits safe diagnostic distinguishing read and assessment refusals', async () => {
+  const logs: string[] = [];
+  const readDeps = deps({ readQuota: (async () => { throw new Error('secret exception'); }) as unknown as typeof readQuota }).deps;
+  const readCoordinator = new GuardCoordinator(readDeps, line => {
+    assert.equal(readDeps.fleet.snapshot('commandcode').state, 'paused');
+    assert.equal(readDeps.fifo.activeAccounts, 0);
+    logs.push(line);
+  });
+  await assert.rejects(() => readCoordinator.admit(commandcodeScope));
+  const readLog = logs.splice(0).join('');
+  assert.match(readLog, /provider=commandcode phase=read code=unavailable/);
+  assert.doesNotMatch(readLog, /secret exception|k1|accountId/);
+
+  const policyDeps = deps({ reserve: () => new Map<string, number | null>([['monthly', null]]) }).deps;
+  const policyCoordinator = new GuardCoordinator(policyDeps, line => {
+    assert.equal(policyDeps.fleet.snapshot('commandcode').state, 'paused');
+    assert.equal(policyDeps.fifo.activeAccounts, 0);
+    logs.push(line);
+  });
+  await assert.rejects(() => policyCoordinator.admit(commandcodeScope));
+  assert.match(logs.join(''), /provider=commandcode phase=assessment state=wait reason=unknown-reserve limitingWindow=monthly/);
+});
+
+test('throwing diagnostic sink preserves quota error and cleanup', async () => {
+  const failure = new QuotaError('unavailable');
+  const { deps: d } = deps({ readQuota: (async () => { throw failure; }) as unknown as typeof readQuota });
+  const coordinator = new GuardCoordinator(d, () => {
+    assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+    assert.equal(d.fifo.activeAccounts, 0);
+    throw new Error('sink');
+  });
+  await assert.rejects(() => coordinator.admit(commandcodeScope), (error) => error === failure);
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(d.fifo.activeAccounts, 0);
+});
+
+test('assessment diagnostic escapes and bounds provider-controlled window ids', async () => {
+  const hostileId = `monthly\nphase=read code=auth ${'x'.repeat(200)}`;
+  const snapshot = openSnapshot('provider');
+  const hostileSnapshot = { ...snapshot, windows: [{ ...snapshot.windows[0]!, id: hostileId }] };
+  const d = deps({
+    readQuota: (async () => hostileSnapshot) as unknown as typeof readQuota,
+    reserve: () => new Map<string, number | null>([[hostileId, null]]),
+  }).deps;
+  const logs: string[] = [];
+  await assert.rejects(() => new GuardCoordinator(d, line => logs.push(line)).admit(commandcodeScope));
+  assert.equal(logs.length, 1);
+  assert.match(logs[0]!, /limitingWindow=monthly\\u000aphase\\u003dread\\u0020code\\u003dauth/);
+  assert.doesNotMatch(logs[0]!, /[\r\n]/);
+  assert.ok(logs[0]!.length < 300);
+});
+
+test('reset-settling diagnostic includes available next-check time', async () => {
+  const snapshot = openSnapshot('provider');
+  const window = { ...snapshot.windows[0]!, resetAt: new Date(NOW - 30_000).toISOString() };
+  const resetSnapshot = { ...snapshot, windows: [window] };
+  const d = deps({ readQuota: (async () => resetSnapshot) as unknown as typeof readQuota }).deps;
+  const logs: string[] = [];
+  await assert.rejects(() => new GuardCoordinator(d, line => logs.push(line)).admit(commandcodeScope));
+  assert.match(logs[0]!, /phase=assessment state=wait reason=reset-settling limitingWindow=monthly nextCheckAt=2026-10-04T12:00:30\.000Z/);
+});
+
+test('open and warning admissions emit no refusal diagnostics', async () => {
+  const logs: string[] = [];
+  const openDeps = deps().deps;
+  const releaseOpen = await new GuardCoordinator(openDeps, line => logs.push(line)).admit(commandcodeScope);
+  releaseOpen();
+
+  const snapshot = openSnapshot('provider');
+  const warningSnapshot = { ...snapshot, windows: [{ ...snapshot.windows[0]!, used: 57, cap: 70 }] };
+  const warningDeps = deps({ readQuota: (async () => warningSnapshot) as unknown as typeof readQuota }).deps;
+  const releaseWarning = await new GuardCoordinator(warningDeps, line => logs.push(line)).admit(commandcodeScope);
+  releaseWarning();
+  assert.deepEqual(logs, []);
+});
+
 test('admit performs a fresh quota read and pauses only the failing provider', async () => {
   const d = deps({ readQuota: (async () => { throw new QuotaError('unavailable'); }) as unknown as typeof readQuota }).deps;
   await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
@@ -58,11 +134,147 @@ test('admit performs a fresh quota read and pauses only the failing provider', a
   assert.equal(d.fleet.snapshot('commandcode').reason, 'unavailable');
 });
 
-test('an unknown reserve pauses only its provider as a reserve blocker', async () => {
-  const d = deps({ reserve: () => new Map<string, number | null>([['monthly', null]]) }).deps;
-  await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope));
-  assert.equal(d.fleet.snapshot().state, 'open');
+test('an unknown reserve refuses as unconfigured, and a retry answers instead of parking', async () => {
+  const { calls, deps: d } = deps({ reserve: () => new Map<string, number | null>([['monthly', null]]) });
+  const coordinator = new GuardCoordinator(d);
+  await assert.rejects(() => coordinator.admit(commandcodeScope), (error: unknown) => {
+    assert.ok(error instanceof QuotaError);
+    assert.equal(error.code, 'unconfigured', 'an unknown reserve is a configuration gap, not a generic outage');
+    assert.match(error.message, /provider=commandcode/);
+    assert.match(error.message, /monthly/);
+    assert.match(error.message, /quotaGuardReserveUnits/);
+    return true;
+  });
+  // The retry must be answered, not parked: no second read, and no change to any latch state. If it
+  // parked, this await would never settle and the test would time out instead of asserting.
+  const before = calls.length;
+  await assert.rejects(() => coordinator.admit(commandcodeScope),
+    (error: unknown) => (error as QuotaError).code === 'unconfigured');
+  assert.equal(calls.length, before, 'a parked retry would have re-read quota; it must answer at once');
+  // The hold stays (that is the design's pause-then-resume recovery path), the lane is released, and
+  // the provider is reported as a reserve blocker rather than an unavailable provider.
+  assert.equal(d.fleet.snapshot().state, 'open', 'a provider-scoped refusal leaves the root latch open');
   assert.equal(d.fleet.snapshot('commandcode').state, 'paused');
+  assert.equal(d.fleet.snapshot('commandcode').reason, 'reserve');
+  assert.equal(d.fifo.activeAccounts, 0);
+});
+
+test('a second lane finishing healthy cannot clear another lane\'s refusal, so no retry parks', async () => {
+  const limits = [{ id: 'codex', windows: ['primary_window', 'secondary_window'] as const }];
+  const scopeFor = (accountId: string) => ({ providerId: 'openai-codex' as const, scope: 'account' as const,
+    accountId, credential: 'k1', codexLimits: limits });
+  const snapshotFor = (accountId: string) => ({ providerId: 'openai-codex' as const, scope: 'account' as const,
+    accountId, checkedAt: new Date(NOW - 60_000).toISOString(),
+    windows: [
+      { id: 'codex.primary_window', used: 1, cap: 100, resetAt: new Date(NOW + 3_600_000).toISOString() },
+      { id: 'codex.secondary_window', used: 1, cap: 100, resetAt: new Date(NOW + 7_200_000).toISOString() },
+    ] });
+  let known = false;
+  let openB: ((value: ReturnType<typeof snapshotFor>) => void) | undefined;
+  const gateB = new Promise<ReturnType<typeof snapshotFor>>((resolve) => { openB = resolve; });
+  const { deps: d } = deps({
+    reserve: () => new Map<string, number | null>([
+      ['codex.primary_window', known ? 5 : null], ['codex.secondary_window', known ? 5 : null]]),
+    readQuota: (async (auth: { accountId?: string }) =>
+      auth.accountId === 'b' ? gateB : snapshotFor(auth.accountId ?? 'a')) as unknown as typeof readQuota,
+  });
+  const coordinator = new GuardCoordinator(d);
+  // Lane B is parked inside its read - past the latch wait - while lane A refuses.
+  const controller = new AbortController();
+  const laneB = coordinator.admit(scopeFor('b'), controller.signal).then(() => 'admitted', (e: unknown) => (e as Error).name);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await assert.rejects(() => coordinator.admit(scopeFor('a')),
+    (error: unknown) => (error as QuotaError).code === 'unconfigured');
+  // B now finishes healthy. If a successful assessment clears the refusal recorded by A, the next
+  // attempt sails past the marker and parks on A's hold - so it must still answer immediately.
+  known = true;
+  openB!(snapshotFor('b'));
+  // A real macrotask turn, so B's healthy assessment completes (and, in the buggy version, clears the
+  // marker) before the next attempt is made.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await assert.rejects(() => coordinator.admit(scopeFor('c')),
+    (error: unknown) => (error as QuotaError).code === 'unconfigured');
+  controller.abort();
+  assert.equal(await laneB, 'AbortError');
+});
+
+test('a fresh check that fails keeps the missing-reserve refusal answering at once', async () => {
+  const reserve = new Map<string, number | null>([['monthly', null]]);
+  const { deps: d } = deps({ reserve: () => reserve });
+  const coordinator = new GuardCoordinator(d);
+  const refused = (error: unknown) => (error as QuotaError).code === 'unconfigured';
+
+  await assert.rejects(() => coordinator.admit(commandcodeScope), refused);
+  // The reserve is still unknown, so the check cannot pass - and must not retire the refusal either.
+  assert.equal(await coordinator.freshCheck('commandcode'), false);
+  await assert.rejects(() => coordinator.admit(commandcodeScope), refused);
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused', 'the hold is untouched by a failed check');
+  assert.equal(d.fifo.activeAccounts, 0);
+});
+
+test('only a successful freshCheck clears the missing-reserve refusal, and it then admits again', async () => {
+  let reserve = new Map<string, number | null>([['monthly', null]]);
+  const { deps: d } = deps({ reserve: () => reserve });
+  const coordinator = new GuardCoordinator(d);
+  const refused = (error: unknown) => (error as QuotaError).code === 'unconfigured';
+
+  await assert.rejects(() => coordinator.admit(commandcodeScope), refused);
+  // A reserve that merely becomes known does not clear the refusal: the provider is still held, so
+  // dropping the record here would hand the next attempt a hold nothing can lift.
+  reserve = new Map<string, number | null>([['monthly', 5]]);
+  await assert.rejects(() => coordinator.admit(commandcodeScope), refused);
+
+  // The recovery path: a verified freshCheck clears the refusal and reopens the provider.
+  assert.equal(await d.fleet.resumeAutomatic('commandcode', () => coordinator.freshCheck('commandcode')), true);
+  const release = await coordinator.admit(commandcodeScope);
+  release();
+  assert.equal(d.fleet.snapshot('commandcode').state, 'open');
+});
+
+test('a fenced resume keeps the missing-reserve refusal terminal, so the retry does not park', async () => {
+  let reserve = new Map<string, number | null>([['monthly', null]]);
+  // The read bumps the provider generation every time, so the resume that follows the read is fenced
+  // exactly as a concurrent noteScope() would fence it - deterministic, no timing and no sleeping.
+  let fleet!: FleetLatch;
+  const { deps: d } = deps({
+    reserve: () => reserve,
+    readQuota: (async () => { fleet.noteScope('commandcode'); return openSnapshot('provider'); }) as unknown as typeof readQuota,
+  });
+  fleet = d.fleet;
+  const coordinator = new GuardCoordinator(d);
+  const refused = (error: unknown) => (error as QuotaError).code === 'unconfigured';
+
+  await assert.rejects(() => coordinator.admit(commandcodeScope), refused);
+
+  // The reserve is now known and the read passes, but it changes the generation mid-read, so the
+  // resume is rejected: the hold stays latched and the refusal must stay recorded.
+  reserve = new Map<string, number | null>([['monthly', 5]]);
+  assert.equal(await d.fleet.resumeAutomatic('commandcode', () => coordinator.freshCheck('commandcode')), false,
+    'a read that changes the provider generation must reject the resume');
+
+  // The retry must answer terminally instead of parking in the latch wait. Race it against a short
+  // bound so a regression fails fast rather than hanging the runner.
+  const outcome = await Promise.race([
+    coordinator.admit(commandcodeScope).then(() => 'admitted', (error: unknown) => (error as QuotaError).code),
+    new Promise<string>((resolve) => setTimeout(() => resolve('parked'), 100)),
+  ]);
+  assert.equal(outcome, 'unconfigured', 'a fenced resume must not strand the next retry in the latch wait');
+});
+
+test('an incomplete seed refuses and names only the windows it is missing', async () => {
+  const base = openSnapshot('provider');
+  const twoWindows = { ...base, windows: [...base.windows, { ...base.windows[0]!, id: 'weekly' }] };
+  const d = deps({
+    readQuota: (async () => twoWindows) as unknown as typeof readQuota,
+    reserve: () => new Map<string, number | null>([['monthly', 5], ['weekly', null]]),
+  }).deps;
+  await assert.rejects(() => new GuardCoordinator(d).admit(commandcodeScope), (error: unknown) => {
+    assert.ok(error instanceof QuotaError);
+    assert.equal(error.code, 'unconfigured');
+    assert.match(error.message, /weekly/);
+    assert.doesNotMatch(error.message, /monthly/);
+    return true;
+  });
   assert.equal(d.fleet.snapshot('commandcode').reason, 'reserve');
 });
 

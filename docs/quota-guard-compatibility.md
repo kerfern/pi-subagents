@@ -48,6 +48,26 @@ which is the intended behaviour but not a working guard.
 
 ## Reading a refusal
 
+Quota admission refusals also emit transient stderr diagnostics. `phase=read` carries the normalized
+read code; `phase=assessment` carries the policy state and reason, plus the limiting window and next
+check when known (bounded and escaped, so provider-controlled text cannot forge a second line):
+
+```
+Quota guard: provider=openai-codex phase=read code=unavailable
+Quota guard: provider=openai-codex phase=assessment state=wait reason=unknown-reserve limitingWindow=primary_window nextCheckAt=2026-10-17T12:00:30.000Z
+```
+
+This distinguishes an unreadable quota surface from a successful read that policy refused — a refusal
+can follow a healthy read. The lines are written after the pause or lane release, and a failing
+stderr write never changes the refusal; dispatch remains fail-closed in both cases.
+
+A window with no reserve and no calibratable estimate is its own terminal refusal: the error code is
+`unconfigured`, it names the missing window ids, and the retry answers immediately instead of parking
+on a hold only configuration can lift. The provider hold stays latched until a successful fresh check
+commits a resume, and the terminal record is retired only once an admission observes the provider
+open, so operator recovery is unchanged: seed `quotaGuardReserveUnits` for the named windows and
+restart Pi.
+
 A refusal names the host build and every contract that failed, for example:
 
 ```
