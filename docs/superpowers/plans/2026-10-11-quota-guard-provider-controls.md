@@ -135,12 +135,18 @@
 
 ### Task 6: Full acceptance and independent review
 
-- [ ] Run `npx vitest run test/settings.test.ts test/quota-subagent-runtime.test.ts` in `pi-subagents`.
-- [ ] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/host-hook.test.ts test/production-wiring.test.ts`.
-- [ ] Run `npm run typecheck:quota`, `npx tsc --noEmit`, `node quota-guard/check-host.mjs`, and `npm run check` in `pi-subagents`.
-- [ ] Run `npm test` in `pi-harness`.
-- [ ] Run `git diff --check`; confirm `git status --short` contains only intended files and report commits for each repo.
-- [ ] Request one reviewer pass over provider isolation, legacy precedence, manual pause composition, and real subagent-path proof; fix blocking findings and rerun affected checks.
+- [x] Run `npx vitest run test/settings.test.ts test/quota-subagent-runtime.test.ts` in `pi-subagents`.
+- [x] From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/host-hook.test.ts test/production-wiring.test.ts`.
+- [x] Run `npm run typecheck:quota`, `npx tsc --noEmit`, `node quota-guard/check-host.mjs`, and `npm run check` in `pi-subagents`.
+- [x] Run `npm test` in `pi-harness`.
+- [x] Run `git diff --check`; confirm `git status --short` contains only intended files and report commits for each repo.
+- [x] Request one reviewer pass over provider isolation, legacy precedence, manual pause composition, and real subagent-path proof; fix blocking findings and rerun affected checks.
+
+Verified 2026-10-17 on `main` (`2bdd0e8`): 104 tests (settings + subagent-runtime) and 91 tests
+(the four quota-guard files) passed, `npm run check` exited 0 with 287 quota-suite tests, `pi-harness`
+`npm test` passed 63, `npx tsc --noEmit` and `npm run typecheck:quota` both exited 0,
+`node quota-guard/check-host.mjs` passed 10/10, and one reviewer pass over provider isolation,
+legacy precedence, manual pause composition and real subagent-path proof returned ship.
 
 ## Execution Recommendation
 
