@@ -1,6 +1,6 @@
 # Quota Guard Provider Controls — Design
 
-**Status:** Draft for user review
+**Status:** Implemented on `main` (`07bbc57`); acceptance evidence is recorded in the archived implementation plan.
 **Date:** 2026-10-11
 **Repositories:** `pi-subagents`, `pi-harness`
 
