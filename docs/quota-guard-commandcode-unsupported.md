@@ -1,12 +1,13 @@
 # CommandCode quota is unsupported here — live evidence
 
-> **Superseded 2026-10-18.** CommandCode's billing routes answer 200 again and the guard reads them; see
+> **Superseded 2026-10-18.** CommandCode's billing routes now answer 200 and the guard reads them; see
 > [Compatibility and upgrade guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).
 > Everything below is the dated 2026-10-09 record, kept as evidence for how it was established.
 
-**Status: CommandCode quota cannot be read.** With `quotaGuardCommandCodeEnabled: true`,
-CommandCode dispatch is **refused**, not passed through unguarded. When its automatic guard is OFF,
-dispatch is intentionally unguarded unless manually paused. Codex is unaffected.
+**Status (2026-10-09, superseded): CommandCode quota could not be read.** With
+`quotaGuardCommandCodeEnabled: true`, CommandCode dispatch was **refused**, not passed through
+unguarded. When its automatic guard was OFF, dispatch was intentionally unguarded unless manually
+paused. Codex was unaffected.
 
 **Scope of this claim.** These probes establish that the routes *tested* are not served from *this*
 host with *this* credential. They do **not** establish that no CommandCode quota API exists anywhere,
@@ -68,13 +69,15 @@ admission decision, so they could not gate it.
 
 ## Why refusal, not removal
 
-Dropping CommandCode from the guard would leave it running with **no** quota protection while looking
-like a fix. The guard therefore refuses CommandCode dispatch with a message naming the provider, the
-route and the status. A 404 on a quota route is classified `unsupported`, which is scoped to that
+Dropping CommandCode from the guard would have left it running with **no** quota protection while
+looking like a fix. The guard therefore refused CommandCode dispatch with a message naming the
+provider, the route and the status. A 404 on a quota route is classified `unsupported`, which is scoped to that
 provider: it refuses the CommandCode attempt and leaves Codex unaffected. Network and 5xx
 automatic holds are provider-local too.
 
 ## Re-enabling
 
 Requires live certification of a **scoped** quota read (per-account or per-plan, with a reserve and a
-gate) — not merely a route that returns 200.
+gate) — not merely a route that returns 200. **Met on 2026-10-18**: the scoped reads, the operator
+reserve and a full guarded dispatch all certify, so CommandCode's automatic guard is ON again; see the
+[compatibility guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).
