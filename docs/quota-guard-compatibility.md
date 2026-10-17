@@ -71,10 +71,11 @@ restart Pi.
 Admission is refused by two independent triggers, and they are in different units. The percentage
 thresholds (`warn 20`, `pause 3`, `resume 20` of the headroom that REMAINS, each test inclusive) are
 percentages; the per-window reserve is `cap - used <= reserve`, in that window's own units. Because the
-two do not share a scale, the reserve normally dominates on a small window: with a 3-credit seed a
-14-credit window refuses with roughly 21% of its headroom left, whereas the same window seeded at its
-own 3% would refuse at 3%. A seed only fills an uncalibrated reserve - two rising observations replace
-it with `2 x max delta` - so the effective refusal point settles on whichever trigger is reached first.
+two do not share a scale, the reserve dominates whenever it exceeds that window's 3%: a 3-credit seed on a
+14-credit window refuses with roughly 21% of its headroom left, which is why the shipped seeds sit below 3%
+of each cap (monthly 2, weekly 1, fiveHour 0.4). A seed only fills an uncalibrated reserve - two rising
+observations replace it with `2 x max delta` - so the effective refusal point settles on whichever trigger
+is reached first.
 
 A window whose usage falls only at the end of its period (a monthly pool) cannot satisfy the resume
 threshold mid-cycle, so a pause it causes lasts until the reset. `/quota-guard resume` applies the same
@@ -100,7 +101,7 @@ Two other refusals are worth recognizing:
 - A **dispatch refusal for a provider whose quota surface is not served here** names the provider, the
   route and the status, and says the guard cannot read that provider's quota. Its code is
   `unsupported` (see
-  [CommandCode's quota surface](#commandcodes-quota-surface-is-not-served-here-verified-live-2026-10-09)).
+  [CommandCode's quota surface](#commandcodes-quota-surface-live-status)).
   It refuses only that provider while its automatic guard is ON; the peer's automatic state remains
   independent, which is why this code is distinct from a root-wide pause.
 - `status()` reports it explicitly in that provider's status (for example
@@ -130,11 +131,12 @@ Two other refusals are worth recognizing:
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
-- **CommandCode's quota surface is not served at all today**, so guarded dispatch refuses as
-  `unsupported` and its automatic lane is currently unreachable. When
+- **CommandCode's quota surface is served again (verified 2026-10-18)**, so its automatic lane is
+  reachable and guarded dispatch admits. A quota route answering 404 would still refuse that provider
+  as `unsupported`, which is no longer this provider's case. When
   `quotaGuardCommandCodeEnabled` is OFF, dispatch is intentionally unguarded (manual pause still
   applies). This is deliberate and dated, not a silent bypass: see
-  [CommandCode's quota surface](#commandcodes-quota-surface-is-not-served-here-verified-live-2026-10-09).
+  [CommandCode's quota surface](#commandcodes-quota-surface-live-status).
 - **Durability ceiling: a *fresh* pause is not recorded at all.** A pause reaches the durable store
   only when it can name at least one checkpoint, and nothing in the guard can enumerate pending
   effects yet. The store refuses a checkpoint-less pause by design, so the guard raises
@@ -155,20 +157,20 @@ Two other refusals are worth recognizing:
   automatic guard is OFF can have its manual hold cleared without a quota read, because OFF means
   dispatch is intentionally unguarded.
 
-## CommandCode's quota surface is not served here (verified live, 2026-10-09)
+## CommandCode's quota surface (live status)
 
-Read this before enabling `quotaGuardCommandCodeEnabled`. CommandCode's quota routes are **not
-currently served**, so guarded CommandCode dispatch is refused as `unsupported`; that automatic
-hold affects CommandCode only, and Codex remains independent. With CommandCode's automatic guard OFF,
-dispatch is intentionally unguarded unless a matching manual hold is active.
+**Current: served.** Verified live on **2026-10-18** against the pinned origin
+`https://api.commandcode.ai`: `GET /alpha/billing/credits` and `GET /alpha/billing/subscriptions` both
+answer **200** with the same credential that serves models, and the guard parses them into real windows —
+`monthly` (cap taken from `COMMANDCODE_MONTHLY_POOLS` for the reported plan), `fiveHour` and `weekly`
+with their own caps and resets. Guarded CommandCode dispatch is enabled and admits; a refusal now comes
+from policy (threshold or reserve) or from an unreadable read, never from a missing route.
 
-Full probe evidence — environment, every route probed with its status, the load-bearing user-agent
-header, and third-party corroboration: [CommandCode quota is unsupported here](./quota-guard-commandcode-unsupported.md).
+Historically, on **2026-10-09**, those same routes answered **404** and guarded dispatch refused as
+`unsupported`. That record is kept below, dated, because it no longer describes the API
+([original probe evidence](./quota-guard-commandcode-unsupported.md), superseded). The 2026-10-09 probe: 
 
-Verified live on **2026-10-09** against the pinned origin `https://api.commandcode.ai`, one
-bearer-authenticated `GET` per route, with the same credential that serves models:
-
-| Route | Status |
+| Route | Status (2026-10-09) |
 | --- | --- |
 | `/alpha/whoami` | 404 |
 | `/alpha/billing/credits` | 404 |
@@ -180,8 +182,11 @@ bearer-authenticated `GET` per route, with the same credential that serves model
 
 The 404s come from the application itself (`X-Powered-By: Hono`), not from a WAF or an edge rule, and
 `/models` answering 200 with the same key proves the credential is fine and that model serving works.
-So this says exactly one thing: **the quota routes are not served here.** It does *not* say the vendor
-has no API, and it is not a claim about CommandCode's model endpoints.
+So this said exactly one thing: **the quota routes were not served here.** It did *not* say the vendor
+has no API, and it was not a claim about CommandCode's model endpoints.
+
+**Superseded 2026-10-18:** both billing routes now answer 200 and the guard reads them, so the
+conclusion above no longer holds for this provider.
 
 ### What the guard does about it
 
@@ -208,9 +213,12 @@ certification of all three:
 3. **Gate** — a full guarded dispatch through the gate, after `check:quota-host` passes, with the quota
    read happening on the real route.
 
-Until all three hold, leave CommandCode's automatic guard OFF if unguarded dispatch is intended, or
-ON if fail-closed refusal is intended; OFF must not be mistaken for guarded protection. Re-check
-after any CommandCode or pi upgrade: this record is dated, and it expires with the provider's API.
+**All three hold as of 2026-10-18**: `node quota-guard/certify-live.mjs commandcode` prints real windows,
+the operator supplies `quotaGuardReserveUnits` (the estimator's own values take over once they calibrate),
+and a guarded dispatch through the gate returns a real completion. CommandCode's automatic guard is ON.
+When a provider has not been certified, leave its guard OFF if unguarded dispatch is intended, or ON if
+fail-closed refusal is intended; OFF must not be mistaken for guarded protection. Re-check after any
+CommandCode or pi upgrade: this record is dated, and it expires with the provider's API.
 
 ## Certifying against live quotas (operator-authorised)
 
@@ -278,7 +286,7 @@ or failed, `2` usage.
 | --- | --- | --- |
 | The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows as real. For CommandCode the monthly cap is the guard's own table entry for the reported plan, not a provider number. The reserve stays uncalibrated: one read cannot size it. Certify again after a provider or host upgrade. |
 | A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. Report the code and the provider, never the credential. |
-| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **That provider's automatic guard refuses dispatch.** Its peer stays independent. Certify scoped quota, reserve and gate before enabling that provider's guard (see [Re-enabling CommandCode](#re-enabling-commandcode)). |
+| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **That provider's automatic guard refuses dispatch.** Its peer stays independent. Certify scoped quota, reserve and gate before enabling that provider's guard (see [Re-enabling CommandCode](#re-enabling-commandcode)). Not CommandCode's case since 2026-10-18: its routes answer 200 and its guard is enabled. |
 
 ## Enabling the guard
 

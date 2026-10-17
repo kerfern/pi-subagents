@@ -1,5 +1,9 @@
 # CommandCode quota is unsupported here — live evidence
 
+> **Superseded 2026-10-18.** CommandCode's billing routes answer 200 again and the guard reads them; see
+> [Compatibility and upgrade guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).
+> Everything below is the dated 2026-10-09 record, kept as evidence for how it was established.
+
 **Status: CommandCode quota cannot be read.** With `quotaGuardCommandCodeEnabled: true`,
 CommandCode dispatch is **refused**, not passed through unguarded. When its automatic guard is OFF,
 dispatch is intentionally unguarded unless manually paused. Codex is unaffected.
