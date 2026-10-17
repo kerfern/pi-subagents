@@ -409,7 +409,10 @@ explicitly enables Codex and disables CommandCode despite the legacy fallback be
   "quotaGuardCommandCodeEnabled": false,
   "quotaGuardStateDir": "/absolute/path/to/quota-guard-state",
   "quotaGuardCodexLimits": [{ "id": "codex", "windows": ["primary_window", "secondary_window"] }],
-  // Operator estimates in the same 0–100 units as Codex used_percent; fallback only.
+  // Operator estimates in each window's OWN units - 0-100 for a Codex window, plan credits for a
+  // CommandCode window (`monthly`, `fiveHour`, `weekly`). Fallback only: an observed reserve wins.
+  // Keep a seed below that window's pause threshold (3% of its cap) if the threshold, not the
+  // reserve, should decide where dispatch stops.
   "quotaGuardReserveUnits": {
     "codex.primary_window": 3,
     "codex.secondary_window": 3
