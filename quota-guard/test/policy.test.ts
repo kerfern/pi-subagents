@@ -20,10 +20,20 @@ function assessAt(
   return assess(snapshotOf(windows, checkedAt), policy, mode, reserves, now);
 }
 
+describe('shipped thresholds', () => {
+  it('refuses only once 3% of the headroom is left', () => {
+    const at = (used: number) => assess(snapshotOf([windowOf('monthly', used, 100)]), DEFAULT_POLICY, 'running',
+      reserve(['monthly', 0]), now);
+    assert.equal(at(96).state, 'warn', '4% left still admits, in the warn band');
+    assert.equal(at(97).state, 'pause', 'the boundary is inclusive: exactly 3% left already refuses');
+    assert.equal(at(98).state, 'pause', '2% left refuses');
+  });
+});
+
 describe('policy validation', () => {
   it('returns frozen copy of valid policy and rejects out-of-order or non-finite values', () => {
     const input = { ...policy };
-    assert.deepEqual(DEFAULT_POLICY, policy);
+    assert.deepEqual(DEFAULT_POLICY, { warn: 20, pause: 3, resume: 20 });
     const result = validatePolicy(input);
     assert.deepEqual(result, input);
     assert.notEqual(result, input);

@@ -68,6 +68,18 @@ commits a resume, and the terminal record is retired only once an admission obse
 open, so operator recovery is unchanged: seed `quotaGuardReserveUnits` for the named windows and
 restart Pi.
 
+Admission is refused by two independent triggers, and they are in different units. The percentage
+thresholds (`warn 20`, `pause 3`, `resume 20` of the headroom that REMAINS, each test inclusive) are
+percentages; the per-window reserve is `cap - used <= reserve`, in that window's own units. Because the
+two do not share a scale, the reserve normally dominates on a small window: with a 3-credit seed a
+14-credit window refuses with roughly 21% of its headroom left, whereas the same window seeded at its
+own 3% would refuse at 3%. A seed only fills an uncalibrated reserve - two rising observations replace
+it with `2 x max delta` - so the effective refusal point settles on whichever trigger is reached first.
+
+A window whose usage falls only at the end of its period (a monthly pool) cannot satisfy the resume
+threshold mid-cycle, so a pause it causes lasts until the reset. `/quota-guard resume` applies the same
+threshold and will refuse, and the hold lives in memory, so only a restart clears it.
+
 A refusal names the host build and every contract that failed, for example:
 
 ```

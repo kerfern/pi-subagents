@@ -1,6 +1,6 @@
 import type { Assessment, GuardMode, Policy, QuotaSnapshot, QuotaWindow } from './types.ts';
 
-export const DEFAULT_POLICY: Readonly<Policy> = Object.freeze({ warn: 20, pause: 10, resume: 20 });
+export const DEFAULT_POLICY: Readonly<Policy> = Object.freeze({ warn: 20, pause: 3, resume: 20 });
 
 export function validatePolicy(policy: Policy): Readonly<Policy> {
   const { pause, warn, resume } = policy;

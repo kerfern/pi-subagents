@@ -144,7 +144,7 @@ test('a certified read prints the windows, reserve state and request count', asy
   assert.match(lines, /reserve:/);
   assert.match(lines, /unknown \(one read/);
   assert.match(lines, /assessment: \w+ \/ [\w-]+/);
-  assert.match(lines, /thresholds: warn 20% pause 10% resume 20%/);
+  assert.match(lines, /thresholds: warn 20% pause 3% resume 20%/);
   assert.match(lines, /certified: yes/);
   assert.deepEqual(commandcode.urls, [
     'https://api.commandcode.ai/alpha/billing/credits',

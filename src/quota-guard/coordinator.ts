@@ -186,14 +186,64 @@ export class GuardCoordinator {
    * lane's success cannot erase a refusal another lane is parked on.
    */
   private readonly unconfigured = new Map<GuardedProvider, string>();
+  /**
+   * One controller per provider, aborted the moment a missing-reserve record is installed, so an
+   * admission already inside a latch wait is answered with the terminal refusal instead of parking on
+   * a hold only configuration can lift. The entry lives exactly as long as the record does.
+   */
+  private readonly strand = new Map<GuardedProvider, AbortController>();
   private readonly diagnosticSink: (line: string) => void;
   constructor(deps: CoordinatorDeps, diagnosticSink: (line: string) => void = diagnostic) {
     this.deps = deps;
     this.diagnosticSink = diagnosticSink;
   }
 
+  /** The single refusal for an uncalibratable reserve, so every site says the same thing. */
+  private missingReserveError(providerId: GuardedProvider, missing: string): QuotaError {
+    return new QuotaError('unconfigured', undefined,
+      `Quota guard: provider=${providerId} has no reserve for window(s) ${missing}; set quotaGuardReserveUnits for them and restart Pi`);
+  }
+
   /** Providers refused as unsupported (their quota surface is not served here). Sorted, for `status()`. */
   unsupportedProviders(): readonly GuardedProvider[] { return [...this.unsupported].sort(); }
+
+  /**
+   * Ends every wait parked for this provider, and keeps doing so for as long as the record exists:
+   * the record MEANS "answer now", so its strand stays aborted until it is retired. Without this an
+   * admission that reached its latch call after the refusal would wait on the very hold the refusal
+   * says nothing can lift.
+   */
+  private strandWaiters(providerId: GuardedProvider): void {
+    const controller = this.strand.get(providerId) ?? new AbortController();
+    this.strand.set(providerId, controller);
+    controller.abort();
+  }
+
+  /** Nothing is stranded once the record is gone, so a later resume is an ordinary latch wait again. */
+  private unstrand(providerId: GuardedProvider): void { this.strand.delete(providerId); }
+
+  /**
+   * Runs a latch operation under the caller's signal, and under the provider's strand when one is
+   * active. A wake caused by the strand is the terminal refusal, not a generic abort, so the caller
+   * learns the configuration gap rather than waiting forever.
+   */
+  private async stranded<T>(providerId: GuardedProvider, signal: AbortSignal | undefined,
+    op: (s?: AbortSignal) => Promise<T>): Promise<T> {
+    // The strand stands for the HOLD, not the record: once the hold is verifiably open the wait is
+    // ordinary again, so an admission that reaches it can retire the record instead of being refused
+    // by it. Without this a successful resume would leave the record permanently unretirable.
+    const blocked = this.deps.fleet.snapshot().state !== 'open'
+      || this.deps.fleet.snapshot(providerId).state !== 'open';
+    const strand = blocked ? this.strand.get(providerId)?.signal : undefined;
+    const combined = strand ? (signal ? AbortSignal.any([signal, strand]) : strand) : signal;
+    try {
+      return await op(combined);
+    } catch (error) {
+      const missing = this.unconfigured.get(providerId);
+      if (missing !== undefined && strand?.aborted) throw this.missingReserveError(providerId, missing);
+      throw error;
+    }
+  }
 
   /** Provider-attributed failures stay local; unattributed callers retain the root fail-closed latch. */
   pause(reason: PauseReason, providerId?: GuardedProvider): void {
@@ -272,19 +322,29 @@ export class GuardCoordinator {
       // Still a refusal, never an unguarded pass-through - but a terminal one: answering immediately
       // is what stops a retry loop from hanging the caller on a hold it cannot clear itself. A hold
       // already lifted skips this and is retired below, so a fenced resume cannot strand the retry.
-      throw new QuotaError('unconfigured', undefined,
-        `Quota guard: provider=${attempt.providerId} has no reserve for window(s) ${missingReserve}; set quotaGuardReserveUnits for them and restart Pi`);
+      throw this.missingReserveError(attempt.providerId, missingReserve);
     }
-    await fleet.wait(attempt.providerId, signal);
-    const releaseLane = await fifo.enter(lane, signal);
+    await this.stranded(attempt.providerId, signal, (s) => fleet.wait(attempt.providerId, s));
+    const releaseLane = await this.stranded(attempt.providerId, signal, (s) => fifo.enter(lane, s));
     for (;;) {
-      await fleet.wait(attempt.providerId, signal);
+      await this.stranded(attempt.providerId, signal, (s) => fleet.wait(attempt.providerId, s));
       const rootBefore = fleet.snapshot();
       const providerBefore = fleet.snapshot(attempt.providerId);
-      if (rootBefore.state !== 'open' || providerBefore.state !== 'open') continue;
+      if (rootBefore.state !== 'open' || providerBefore.state !== 'open') {
+        // A hold this record explains cannot be lifted by anything the caller can do, so an admission
+        // that was already past the marker check answers with the same terminal refusal instead of
+        // parking on it. The hold itself is untouched, and the lane is released.
+        const stranded = this.unconfigured.get(attempt.providerId);
+        if (stranded !== undefined) {
+          releaseLane();
+          throw this.missingReserveError(attempt.providerId, stranded);
+        }
+        continue;
+      }
       // An open provider means the hold is genuinely lifted, so a fenced or rejected resume can never
       // strand the next retry in the latch wait; retire the missing-reserve record now.
       this.unconfigured.delete(attempt.providerId);
+      this.unstrand(attempt.providerId);
       const rootGeneration = rootBefore.generation;
       const providerGeneration = providerBefore.generation;
       const auth: QuotaAuth = { providerId: attempt.providerId, scope: attempt.scope,
@@ -328,7 +388,10 @@ export class GuardCoordinator {
           ? snapshot.windows.filter(window => reserveUnits.get(window.id) == null)
             .map(window => safeDiagnosticValue(window.id)).join(', ')
           : undefined;
-        if (missingReserveWindows !== undefined) this.unconfigured.set(attempt.providerId, missingReserveWindows);
+        if (missingReserveWindows !== undefined) {
+          this.unconfigured.set(attempt.providerId, missingReserveWindows);
+          this.strandWaiters(attempt.providerId);
+        }
         const details = `Quota guard: provider=${attempt.providerId} phase=assessment state=${assessment.state} reason=${assessment.reason}`
           + (assessment.limitingWindow === undefined ? '' : ` limitingWindow=${safeDiagnosticValue(assessment.limitingWindow)}`)
           + (assessment.nextCheckAt === undefined ? '' : ` nextCheckAt=${safeDiagnosticValue(assessment.nextCheckAt)}`)
@@ -336,14 +399,14 @@ export class GuardCoordinator {
           + (assessment.reason === 'unknown-reserve' ? '; set quotaGuardReserveUnits and restart Pi' : '');
         try { this.diagnosticSink(details); } catch { /* diagnostics never change admission */ }
         if (missingReserveWindows !== undefined) {
-          throw new QuotaError('unconfigured', undefined,
-            `Quota guard: provider=${attempt.providerId} has no reserve for window(s) ${missingReserveWindows}; set quotaGuardReserveUnits for them and restart Pi`);
+          throw this.missingReserveError(attempt.providerId, missingReserveWindows);
         }
         throw new QuotaError('unavailable');
       }
       let release: Release;
       try {
-        release = await fleet.enter(attempt.providerId, 'inference', signal);
+        release = await this.stranded(attempt.providerId, signal,
+          (s) => fleet.enter(attempt.providerId, 'inference', s));
       } catch (error) {
         releaseLane();
         throw error;

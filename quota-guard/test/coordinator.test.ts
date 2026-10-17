@@ -181,7 +181,8 @@ test('a second lane finishing healthy cannot clear another lane\'s refusal, so n
   const coordinator = new GuardCoordinator(d);
   // Lane B is parked inside its read - past the latch wait - while lane A refuses.
   const controller = new AbortController();
-  const laneB = coordinator.admit(scopeFor('b'), controller.signal).then(() => 'admitted', (e: unknown) => (e as Error).name);
+  const laneB = coordinator.admit(scopeFor('b'), controller.signal)
+    .then(() => 'admitted', (e: unknown) => (e as QuotaError).code ?? (e as Error).name);
   await new Promise((resolve) => setTimeout(resolve, 0));
   await assert.rejects(() => coordinator.admit(scopeFor('a')),
     (error: unknown) => (error as QuotaError).code === 'unconfigured');
@@ -194,8 +195,45 @@ test('a second lane finishing healthy cannot clear another lane\'s refusal, so n
   await new Promise((resolve) => setTimeout(resolve, 0));
   await assert.rejects(() => coordinator.admit(scopeFor('c')),
     (error: unknown) => (error as QuotaError).code === 'unconfigured');
-  controller.abort();
-  assert.equal(await laneB, 'AbortError');
+  // B was already past the marker check when the hold landed. It must terminate with the same
+  // terminal refusal rather than park on a hold only configuration can lift - no abort needed.
+  assert.equal(await laneB, 'unconfigured', 'an in-flight admission must not park on the hold');
+  assert.equal(d.fleet.snapshot('openai-codex').state, 'paused', 'the hold itself is preserved');
+  assert.equal(d.fifo.activeAccounts, 0, 'the stranded lane is released');
+});
+
+test('a pause drains: admitted work finishes first, and only then is the provider paused', async () => {
+  const limits = [{ id: 'codex', windows: ['primary_window', 'secondary_window'] as const }];
+  const scopeFor = (accountId: string) => ({ providerId: 'openai-codex' as const, scope: 'account' as const,
+    accountId, credential: 'k1', codexLimits: limits });
+  const snapshotFor = (accountId: string) => ({ providerId: 'openai-codex' as const, scope: 'account' as const,
+    accountId, checkedAt: new Date(NOW - 60_000).toISOString(),
+    windows: [
+      { id: 'codex.primary_window', used: 1, cap: 100, resetAt: new Date(NOW + 3_600_000).toISOString() },
+      { id: 'codex.secondary_window', used: 1, cap: 100, resetAt: new Date(NOW + 7_200_000).toISOString() },
+    ] });
+  let reserve: Map<string, number | null> = new Map([['codex.primary_window', 5], ['codex.secondary_window', 5]]);
+  const { deps: d } = deps({
+    reserve: () => reserve,
+    readQuota: (async (auth: { accountId?: string }) => snapshotFor(auth.accountId ?? 'a')) as unknown as typeof readQuota,
+  });
+  const coordinator = new GuardCoordinator(d);
+
+  // Work in flight: a lease is held, so the provider is active.
+  const inFlight = await coordinator.admit(scopeFor('a'));
+  assert.equal(d.fleet.snapshot('openai-codex').active, 1);
+
+  // The pause lands while that work is still running. It must not disturb it: the provider drains.
+  reserve = new Map([['codex.primary_window', null], ['codex.secondary_window', null]]);
+  await assert.rejects(() => coordinator.admit(scopeFor('b')),
+    (error: unknown) => (error as QuotaError).code === 'unconfigured');
+  assert.equal(d.fleet.snapshot('openai-codex').state, 'draining', 'the pause waits for the work already admitted');
+  assert.equal(d.fleet.snapshot('openai-codex').active, 1, 'the in-flight work is untouched');
+
+  // Only once it finishes does the provider become paused.
+  inFlight();
+  assert.equal(d.fleet.snapshot('openai-codex').active, 0);
+  assert.equal(d.fleet.snapshot('openai-codex').state, 'paused', 'and only then is it paused');
 });
 
 test('a fresh check that fails keeps the missing-reserve refusal answering at once', async () => {
