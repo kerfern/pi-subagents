@@ -1,6 +1,6 @@
 # CommandCode quota was unsupported here — live probe record (2026-10-09)
 
-> **Superseded 2026-10-18.** CommandCode's billing routes now answer 200 and the guard reads them; see
+> **Superseded 2026-10-17.** CommandCode's billing routes now answer 200 and the guard reads them; see
 > [Compatibility and upgrade guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).
 > Everything below is the dated 2026-10-09 record, kept as evidence for how it was established.
 
@@ -78,6 +78,6 @@ automatic holds are provider-local too.
 ## Re-enabling
 
 Requires live certification of a **scoped** quota read (per-account or per-plan, with a reserve and a
-gate) — not merely a route that returns 200. **Met on 2026-10-18**: the scoped reads, the operator
+gate) — not merely a route that returns 200. **Met on 2026-10-17**: the scoped reads, the operator
 reserve and a full guarded dispatch all certify, so CommandCode's automatic guard is ON again; see the
 [compatibility guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).
