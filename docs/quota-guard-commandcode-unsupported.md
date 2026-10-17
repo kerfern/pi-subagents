@@ -1,4 +1,4 @@
-# CommandCode quota is unsupported here — live evidence
+# CommandCode quota was unsupported here — live probe record (2026-10-09)
 
 > **Superseded 2026-10-18.** CommandCode's billing routes now answer 200 and the guard reads them; see
 > [Compatibility and upgrade guide](./quota-guard-compatibility.md#commandcodes-quota-surface-live-status).

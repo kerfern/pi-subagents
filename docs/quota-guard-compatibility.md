@@ -79,7 +79,9 @@ is reached first.
 
 A window whose usage falls only at the end of its period (a monthly pool) cannot satisfy the resume
 threshold mid-cycle, so a pause it causes lasts until the reset. `/quota-guard resume` applies the same
-threshold and will refuse, and the hold lives in memory, so only a restart clears it.
+threshold and will refuse. The reset is the ordinary recovery: it restores enough headroom for the
+threshold test to pass. Restarting discards the in-memory hold but replenishes no quota, so it is not a
+substitute for the reset.
 
 A refusal names the host build and every contract that failed, for example:
 
@@ -164,7 +166,8 @@ Two other refusals are worth recognizing:
 answer **200** with the same credential that serves models, and the guard parses them into real windows —
 `monthly` (cap taken from `COMMANDCODE_MONTHLY_POOLS` for the reported plan), `fiveHour` and `weekly`
 with their own caps and resets. Guarded CommandCode dispatch is enabled and admits; a refusal now comes
-from policy (threshold or reserve) or from an unreadable read, never from a missing route.
+from policy (threshold or reserve) or from an unreadable read. The missing-route failure documented below
+was not observed on 2026-10-18, and a quota route answering 404 would still be classified `unsupported`.
 
 Historically, on **2026-10-09**, those same routes answered **404** and guarded dispatch refused as
 `unsupported`. That record is kept below, dated, because it no longer describes the API
@@ -216,6 +219,8 @@ certification of all three:
 **All three hold as of 2026-10-18**: `node quota-guard/certify-live.mjs commandcode` prints real windows,
 the operator supplies `quotaGuardReserveUnits` (the estimator's own values take over once they calibrate),
 and a guarded dispatch through the gate returns a real completion. CommandCode's automatic guard is ON.
+Observed on that date: `npm run check:quota-host` passed 10/10, the certifier reported `certified: yes`, and
+a guarded dispatch through the gate returned a real completion.
 When a provider has not been certified, leave its guard OFF if unguarded dispatch is intended, or ON if
 fail-closed refusal is intended; OFF must not be mistaken for guarded protection. Re-check after any
 CommandCode or pi upgrade: this record is dated, and it expires with the provider's API.
