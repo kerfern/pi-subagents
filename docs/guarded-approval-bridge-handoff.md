@@ -60,6 +60,12 @@ class ChildConfirmationBridge {
 
 ## Remaining actions
 
+> The standalone brief for the acceptance session is
+> `docs/guarded-approval-bridge-tui-acceptance.md`. It carries the contract, the
+> probe-extension recipe, the ten pass/fail scenarios, the already-fixed defects
+> and their regression tests, the sharp edges, and the report format. A fresh
+> coding agent can run the acceptance from that document alone.
+
 1. **Real TUI operator acceptance (human step, the only open item).** Everything below must be observed in a real root TUI session, by the operator, with a child extension that calls `ctx.ui.confirm`:
    - the child's request reaches the ROOT's native dialog, with the child attribution prefix and the message unchanged;
    - an explicit APPROVE settles the child with `true`, and an explicit DENY settles it with `false`;
