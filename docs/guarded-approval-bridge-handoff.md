@@ -1,13 +1,15 @@
 # Guarded Approval Bridge — Next-Session Handoff
 
-**Updated:** 2026-10-19  
-**State:** Implementation and offline verification complete. Reviews found three capability/lifecycle bugs; all fixed with regression tests. Final targeted re-review found no remaining findings. Real TUI acceptance remains a separate operator step.  
-**Target:** `/Users/kerf/Projects/pi-subagents`, branch `main`  
-**Other work:** VEMCsite remains paused through bridge review; preserve its checkout/worktree.
+- **Updated:** 2026-10-20
+- **State:** implementation, offline verification and the operator's offline re-verification are complete, and the work is COMMITTED and PUSHED (`3a964dd`, branch `main`, clean tree). Reviews found three capability/lifecycle bugs; all fixed with regression tests. Final targeted re-review found no remaining findings. **Real TUI operator acceptance remains the one open item** and is a human step.
+- **Target:** `/Users/kerf/Projects/pi-subagents`, branch `main`
+- **Other work:** VEMCsite is no longer paused: PR #1 (the Xero-only invoicing cutover) was reviewed, merged into `main` and its branch deleted. The VEMCsite worktree was removed after the merge; the gitignored plan/ledger was copied into the main checkout.
 
 ## Current state
 
-Bridge is implemented in uncommitted working-tree changes. Tracked files: `CHANGELOG.md`, `README.md`, `docs/rpc.md`, `src/agent-manager.ts`, `src/agent-runner.ts`, `src/index.ts`, `test/rpc-lifecycle-gating.test.ts`. New files: `docs/guarded-approval-bridge-handoff.md`, `src/child-confirmation.ts`, `test/child-confirmation.test.ts`, `test/child-confirmation-manager.test.ts`, `test/child-confirmation-integration.test.ts`. Nothing staged or committed; no push, install, guard/config change, live UI call, or deployment.
+Bridge is implemented, committed and pushed. Commit `3a964dd` ("feat: route child extension confirmations through a guarded root approval bridge") contains the tracked changes (`CHANGELOG.md`, `README.md`, `docs/rpc.md`, `src/agent-manager.ts`, `src/agent-runner.ts`, `src/index.ts`, `test/rpc-lifecycle-gating.test.ts`) and the new files (`docs/guarded-approval-bridge-handoff.md`, `src/child-confirmation.ts`, `test/child-confirmation.test.ts`, `test/child-confirmation-manager.test.ts`, `test/child-confirmation-integration.test.ts`). The working tree is clean and `main` matches `origin/main`; no install, guard/config change, live UI call or deployment was performed.
+
+**Operator re-verification (2026-10-20, this session):** the offline suite was re-run from a clean tree and passes — focused bridge suites 4 files / 33 passed (`child-confirmation`, `child-confirmation-manager`, `child-confirmation-integration`, `rpc-lifecycle-gating`), full `PI_E2E_LIVE=false npm run check` 2,289 passed / 7 skipped (lint, typecheck and quota checks included), `git diff --check` clean, `git status --short --branch` clean. These are OFFLINE checks: they are evidence that the contract holds under test, and they are NOT operator acceptance.
 
 - Environment: Node 26.7.0, npm 11.19.0; Pi SDK/AI/TUI 1.0.4; installed Pi runtime 1.3.0; Vitest 4.1.11, TypeScript 6.0.3, Biome 2.4.15.
 - Focused tests: 5 files, 153/153 passed after all review fixes.
@@ -58,8 +60,14 @@ class ChildConfirmationBridge {
 
 ## Remaining actions
 
-1. Separate operator acceptance: user-controlled `/reload` and harmless real TUI smoke should establish root-dialog routing/child attribution, explicit approve/deny, concurrent FIFO, cancellation/timeout and stale-resume denial. Do not infer this from tests. Never reload the user's session automatically.
-2. Resume approved VEMCsite Task 4 Round G §2 after bridge review; preserve existing work and restrictions. No live Xero/D1 calls, migrations, deployments, secrets, readiness bypasses, inference, quota-route changes, staging or commits without explicit approval.
+1. **Real TUI operator acceptance (human step, the only open item).** Everything below must be observed in a real root TUI session, by the operator, with a child extension that calls `ctx.ui.confirm`:
+   - the child's request reaches the ROOT's native dialog, with the child attribution prefix and the message unchanged;
+   - an explicit APPROVE settles the child with `true`, and an explicit DENY settles it with `false`;
+   - two concurrent child requests are shown one at a time, in arrival order (FIFO), and the second never appears while the first is unanswered;
+   - cancelling the native dialog, letting the 60-second deadline pass, or aborting the child all DENY the request;
+   - a stale resume (a run that was closed, then resumed) cannot approve through the earlier request.
+   Use a harmless confirmation (for example "delete the temporary scratch file?") and a scratch directory. NEVER reload the user's session automatically: `/reload` invalidates the bridge, and a reload is only safe when the operator runs it themselves. Do not infer any of this from the offline tests.
+2. **VEMCsite follow-ups (approved, separately tracked).** The Xero-only cutover is merged (`main` at `f083c14` after the dependency pin). Still open, and each needs its own explicit approval: the connected organisation's invoice-email eligibility, the granular scope that authorises credit-note writes, production D1 clock/distributed verification, and a live tenant acceptance. No live Xero/D1 calls, migrations, deployments, secrets or readiness bypasses are authorised by this handoff.
 
 ## Verification commands
 
