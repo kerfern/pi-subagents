@@ -21,7 +21,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxToolCall } from "@earendil-works/pi-ai";
-import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionUIContext,
+  ExtensionUIDialogOptions,
+} from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agentCall,
@@ -825,5 +829,77 @@ describe("guarded approval bridge (offline e2e)", () => {
     call!.resolve(true);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(readTrace(tracePath).filter((row) => row.event === "end").length).toBe(1);
+  });
+
+  it("scopes the probe extension to the child session, not to the parent", async () => {
+    const { dir, tracePath } = createProject();
+    dirs.push(dir);
+    const ui = new ScriptedRootUI();
+    let manager: ManagerHandle | undefined;
+    let childId: string | undefined;
+
+    const run = await runPrintMode({
+      prompt: "Ask the probe for a confirmation.",
+      live: false,
+      cwd: dir,
+      uiContext: toUIContext(ui),
+      respond: routeBySession({
+        parentInitial: agentCall({
+          subagent_type: "bridge-probe",
+          description: "probe",
+          prompt: "PROBE_LABEL=scoped",
+          run_in_background: false,
+        }),
+        parentFinal: "done",
+        subagent: childResponder(tracePath),
+      }),
+      onBound: (handle) => {
+        manager = handle.manager;
+        void (async () => {
+          const call = await ui.nextCall();
+          // The bridge attributes the request to the child's own record id —
+          // the handle onto the child session this test inspects.
+          childId = /id=([^\]]+)\]/.exec(call.title)?.[1];
+          call.resolve(true);
+        })();
+      },
+    });
+    runs.push(run);
+
+    // The child really asked, and really was answered.
+    expect(ui.calls.length).toBe(1);
+
+    // The PARENT never loaded the probe: the `extensions:` allowlist in the
+    // agent frontmatter belongs to the CHILD, so the parent's tool set carries
+    // no bridge_confirm_probe — neither registered nor active.
+    // The guard below keeps the negative assertion from passing vacuously: the
+    // parent's tool set is real (it holds the `Agent` tool this test spawned
+    // the child with), so "no bridge_confirm_probe" means "not among them".
+    expect(run.parentSession.getAllTools().map((tool) => tool.name)).toContain("Agent");
+    expect(
+      run.parentSession.getAllTools().map((tool) => tool.name),
+      "the parent session registered the child-only probe tool",
+    ).not.toContain("bridge_confirm_probe");
+    expect(
+      run.parentSession.getActiveToolNames(),
+      "the parent session activated the child-only probe tool",
+    ).not.toContain("bridge_confirm_probe");
+
+    // The CHILD did load it. These asserts fail loudly — never a skip — when
+    // the child session cannot be reached, so a broken handle shows up as a
+    // failing test rather than as a silently weaker one.
+    expect(childId, "the child's agent id was never captured").toBeTruthy();
+    const record = manager?.getRecord(childId!) as { session?: AgentSession } | undefined;
+    expect(record, "the child's record was not reachable through the manager").toBeDefined();
+    const childSession = record?.session;
+    expect(childSession, "the child's session was not reachable through its record").toBeDefined();
+    expect(
+      childSession!.getAllTools().map((tool) => tool.name),
+      "the child session did not register the probe tool",
+    ).toContain("bridge_confirm_probe");
+    expect(
+      childSession!.getActiveToolNames(),
+      "the child session did not activate the probe tool",
+    ).toContain("bridge_confirm_probe");
   });
 });
