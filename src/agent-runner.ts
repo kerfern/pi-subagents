@@ -18,6 +18,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import type { ChildConfirmationBinding } from "./child-confirmation.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -440,6 +441,8 @@ export interface RunOptions {
   model?: Model<any>;
   maxTurns?: number;
   signal?: AbortSignal;
+  /** Manager-issued UI capability; never derive root authority from this child context. */
+  childConfirmation?: ChildConfirmationBinding;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -634,9 +637,15 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
+
+const childConfirmationBySession = new WeakMap<AgentSession, ChildConfirmationBinding>();
 
 function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string): string | undefined {
   if (!sessionDir) return undefined;
@@ -1013,9 +1022,9 @@ export async function runAgent(
         })
       : SessionManager.inMemory(effectiveCwd);
 
-  // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
+  // SAFETY: Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
-  // Pass both so the full supported Pi range retains the parent's providers.
+  // Read optional runtime for newer hosts while preserving older registry support.
   const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
@@ -1050,11 +1059,18 @@ export async function runAgent(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
 
-  // Bind extensions so that session_start fires and extensions can initialize
-  // (e.g. loading credentials, setting up state). Tool gating already happened
-  // at session construction via the `tools:` allowlist above — no separate
-  // post-bind filter is needed. All ExtensionBindings fields are optional.
-  await session.bindExtensions({
+  let closeConfirmationRun: (() => void) | undefined;
+  try {
+    closeConfirmationRun = options.childConfirmation?.beginRun(options.signal);
+    if (options.childConfirmation) childConfirmationBySession.set(session, options.childConfirmation);
+    const uiContext = options.childConfirmation?.uiContext;
+
+    // Bind extensions so that session_start fires and extensions can initialize
+    // (e.g. loading credentials, setting up state). Tool gating already happened
+    // at session construction via the `tools:` allowlist above — no separate
+    // post-bind filter is needed. Omit uiContext when this binding is headless.
+    await session.bindExtensions({
+      ...(uiContext !== undefined ? { uiContext } : {}),
     onError: (err) => {
       options.onToolActivity?.({
         type: "end",
@@ -1099,6 +1115,7 @@ export async function runAgent(
           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
+          closeConfirmationRun?.();
           session.abort();
         }
       }
@@ -1181,6 +1198,9 @@ export async function runAgent(
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
+  } finally {
+    closeConfirmationRun?.();
+  }
 }
 
 /**
@@ -1220,12 +1240,15 @@ export async function resumeAgent(
       })
     : () => {};
 
+  let closeConfirmationRun: (() => void) | undefined;
   try {
+    closeConfirmationRun = childConfirmationBySession.get(session)?.beginRun(options.signal);
     await session.prompt(prompt);
   } finally {
     collector.unsubscribe();
     unsubEvents();
     cleanupAbort();
+    closeConfirmationRun?.();
   }
 
   return {

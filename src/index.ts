@@ -21,6 +21,7 @@ import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, loca
 import { AgentManager, isTopLevelAgent, type SubagentRouting } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { ChildConfirmationBridge } from "./child-confirmation.js";
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -606,6 +607,14 @@ export default function (pi: ExtensionAPI) {
     }),
   };
 
+  const MANAGER_KEY = Symbol.for("pi-subagents:manager");
+  const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
+  let currentCtx: ExtensionContext | undefined;
+  // Child activations have their own context, not root operator UI authority.
+  const confirmationBridge = new ChildConfirmationBridge(() =>
+    ownsManagerRegistry && currentCtx?.hasUI ? currentCtx : undefined,
+  );
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     if (record.workflowId !== undefined) {
@@ -694,7 +703,7 @@ export default function (pi: ExtensionAPI) {
     // see `PendingUsagePool`. Skipped entirely when the feature is off, so no
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
-  }, routing);
+  }, routing, confirmationBridge);
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -706,7 +715,6 @@ export default function (pi: ExtensionAPI) {
   // child manager — and the child's shutdown would then delete the root
   // session's entry. The first activation (the root session) wins; child
   // activations leave it alone.
-  const MANAGER_KEY = Symbol.for("pi-subagents:manager");
   // Process-external callers may supply arbitrary options. Nested ownership and
   // config-root metadata are internal capabilities issued only by scoped tools.
   /**
@@ -794,13 +802,11 @@ export default function (pi: ExtensionAPI) {
       return record !== undefined && isTopLevelAgent(record) ? record : undefined;
     },
   };
-  const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
   if (ownsManagerRegistry) {
     (globalThis as any)[MANAGER_KEY] = registryEntry;
   }
 
   // --- Cross-extension RPC via pi.events ---
-  let currentCtx: ExtensionContext | undefined;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -837,6 +843,9 @@ export default function (pi: ExtensionAPI) {
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    const previousUi = currentCtx?.hasUI ? currentCtx.ui : undefined;
+    const nextUi = ctx.hasUI ? ctx.ui : undefined;
+    if (currentCtx !== undefined && previousUi !== nextUi) confirmationBridge.invalidate();
     currentCtx = ctx;
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
@@ -1139,6 +1148,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    confirmationBridge.invalidate();
+    currentCtx = undefined;
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -1152,6 +1163,7 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubConsume();
     rpcHandle = undefined;
     currentCtx = undefined;
+    confirmationBridge.invalidate();
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
     if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {

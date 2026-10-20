@@ -20,6 +20,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type RunResult, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { ChildConfirmationBridge } from "./child-confirmation.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import {
@@ -474,6 +475,8 @@ export class AgentManager {
      * pass-through — keeps today's behavior exactly.
      */
     private routing?: SubagentRouting,
+    /** Programmatic managers are headless unless the root activation injects UI authority. */
+    private childConfirmations = new ChildConfirmationBridge(() => undefined),
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
@@ -1005,6 +1008,10 @@ export class AgentManager {
       worktreeBase: worktreeCwd ? baseCwd : undefined,
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
       signal: record.abortController!.signal,
+      childConfirmation: this.childConfirmations.forChild(
+        id,
+        record.alias ?? record.handle ?? type,
+      ),
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1341,6 +1348,10 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
+    // Re-entering an active or queued session would replace its abort controller
+    // or run a second prompt against the same SDK session.
+    if (record.status === "running" || record.status === "queued") return undefined;
+
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
     // "running" — or "queued" when at the concurrency limit. Previously
@@ -1348,17 +1359,6 @@ export class AgentManager {
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
-      // gets control back while the record stays "running", so nothing stops the
-      // model from resuming the same agent again. Starting a second run would
-      // overwrite record.abortController — orphaning the live run beyond the
-      // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-      // then reject from session.prompt() with "Agent is already processing",
-      // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
@@ -1400,6 +1400,22 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    let detachCallerSignal: (() => void) | undefined;
+    if (signal) {
+      const callerSignal = signal;
+      const onCallerAbort = () => this.abort(id);
+      if (callerSignal.aborted) onCallerAbort();
+      else {
+        callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+        detachCallerSignal = () => callerSignal.removeEventListener("abort", onCallerAbort);
+      }
+    }
+    if (this.getRecord(id)?.status === "stopped") {
+      this.abortOwnedChildren(id);
+      return record;
+    }
 
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
@@ -1417,18 +1433,24 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      if (this.getRecord(id)?.status !== "stopped") {
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+      }
       record.result = text;
-      record.completedAt = Date.now();
+      record.completedAt ??= Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+      if (this.getRecord(id)?.status !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
+      record.completedAt ??= Date.now();
+    } finally {
+      detachCallerSignal?.();
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1453,6 +1475,11 @@ export class AgentManager {
     options: ResumeOptions,
   ) {
     if (!record.session) return;
+    if (parentSignal?.aborted) {
+      record.status = "stopped";
+      record.completedAt = Date.now();
+      return;
+    }
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -1783,6 +1810,7 @@ export class AgentManager {
    *   it (tests, teardown of a manager that never spawned) skips the prune.
    */
   async dispose(pi?: ExtensionAPI): Promise<void> {
+    this.childConfirmations.dispose();
     clearInterval(this.cleanupInterval);
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.

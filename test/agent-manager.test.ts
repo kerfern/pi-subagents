@@ -2249,6 +2249,39 @@ describe("AgentManager — background resume", () => {
     expect(liveController!.signal.aborted).toBe(true);
   });
 
+  it("refuses foreground resume while a background run is still in flight", async () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete);
+    const id = await spawnSettled(manager);
+    onComplete.mockClear();
+
+    let finish!: (result: { text: string; failure?: string }) => void;
+    vi.mocked(resumeAgent).mockReset()
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }))
+      .mockRejectedValueOnce(new Error("Agent is already processing"));
+
+    let first: Awaited<ReturnType<AgentManager["resume"]>>;
+    try {
+      first = await manager.resume(id, "background", undefined, { isBackground: true });
+      expect(first?.status).toBe("running");
+      const liveController = manager.getRecord(id)!.abortController;
+
+      const second = await manager.resume(id, "foreground");
+
+      expect(second).toBeUndefined();
+      expect(resumeAgent).toHaveBeenCalledOnce();
+      expect(manager.getRecord(id)!.abortController).toBe(liveController);
+      expect(manager.getRecord(id)!.status).toBe("running");
+      expect(onComplete).not.toHaveBeenCalled();
+      expect(manager.abort(id)).toBe(true);
+      expect(liveController!.signal.aborted).toBe(true);
+    } finally {
+      finish?.({ text: "settled" });
+      await first?.promise;
+      vi.mocked(resumeAgent).mockReset();
+    }
+  });
+
   it("refuses to background-resume an agent that is still queued", async () => {
     manager = new AgentManager(undefined, 1); // maxConcurrent = 1
     const id = await spawnSettled(manager);
@@ -2265,6 +2298,44 @@ describe("AgentManager — background resume", () => {
 
     expect(await manager.resume(id, "later again", undefined, { isBackground: true })).toBeUndefined();
     expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it("refuses foreground resume while a background resume is queued", async () => {
+    manager = new AgentManager(undefined, 1);
+    const id = await spawnSettled(manager);
+
+    let releaseBlocker!: (result: any) => void;
+    vi.mocked(runAgent).mockReset().mockImplementation(
+      () => new Promise(resolve => { releaseBlocker = resolve; }),
+    );
+    const blockerId = manager.spawn(mockPi, mockCtx, "general-purpose", "blocker", {
+      description: "blocker",
+      isBackground: true,
+    });
+    const record = manager.getRecord(id)!;
+    vi.mocked(resumeAgent).mockReset().mockResolvedValue({ text: "should not run" } as any);
+
+    try {
+      const queued = await manager.resume(id, "queued", undefined, { isBackground: true });
+      const queuedController = record.abortController;
+      expect(queued?.status).toBe("queued");
+
+      const foreground = await manager.resume(id, "foreground");
+
+      expect(foreground).toBeUndefined();
+      expect(resumeAgent).not.toHaveBeenCalled();
+      expect(record.status).toBe("queued");
+      expect(record.abortController).toBe(queuedController);
+    } finally {
+      manager.abortAll();
+      releaseBlocker?.({
+        responseText: "done",
+        session: mockSession(),
+        aborted: false,
+        steered: false,
+      });
+      await manager.getRecord(blockerId)?.promise;
+    }
   });
 
   // onStarted is where the Agent tool hangs output-file streaming. It must fire

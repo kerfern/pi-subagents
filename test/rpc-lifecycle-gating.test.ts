@@ -25,7 +25,7 @@ vi.mock("../src/agent-runner.js", async () => {
   return { ...actual, runAgent: vi.fn() };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { type RunResult, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
@@ -109,6 +109,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     else process.env.HOME = prevHome;
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
+    Reflect.deleteProperty(globalThis, Symbol.for("pi-subagents:manager"));
     vi.restoreAllMocks();
   });
 
@@ -220,6 +221,87 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     ).render().join("\n");
     expect(lines).toContain("running command…");
     expect(lines).not.toContain("thinking…");
+  });
+
+  it("routes child confirmations through genuine root UI and invalidates them before switch", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    const root = ctx(true);
+    const nativeConfirm = vi.fn(async (_title: string, _message: string) => true);
+    root.ui.confirm = nativeConfirm;
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, root);
+    vi.mocked(runAgent).mockImplementation(() => new Promise<RunResult>(() => {}));
+
+    let closeRun: (() => void) | undefined;
+    try {
+      await busHandlers.get("subagents:rpc:spawn")!({
+        requestId: "req-confirmation",
+        type: "general-purpose",
+        prompt: "inspect",
+        options: { description: "approval owner" },
+      });
+      const runOptions = vi.mocked(runAgent).mock.calls.at(-1)?.[3] as unknown as {
+        signal?: AbortSignal;
+        childConfirmation?: {
+          beginRun(signal?: AbortSignal): () => void;
+          readonly uiContext?: {
+            confirm(title: string, message: string, options?: { signal?: AbortSignal; timeout?: number }): Promise<boolean>;
+          };
+        };
+      };
+      expect(runOptions.childConfirmation).toBeDefined();
+      closeRun = runOptions.childConfirmation!.beginRun(runOptions.signal);
+      const childUi = runOptions.childConfirmation!.uiContext;
+      expect(childUi).toBeDefined();
+      expect(childUi).not.toBe(root.ui);
+      await expect(childUi!.confirm("Inspect path", "Read source? ")).resolves.toBe(true);
+      expect(nativeConfirm).toHaveBeenCalledOnce();
+      expect(nativeConfirm.mock.calls[0][1]).toBe("Read source? ");
+
+      await lifecycle.get("session_before_switch")();
+      await expect(childUi!.confirm("Inspect path", "Read source? ")).resolves.toBe(false);
+    } finally {
+      closeRun?.();
+      await lifecycle.get("session_shutdown")();
+    }
+  });
+
+  it("keeps child activations headless even when their context exposes UI", async () => {
+    const rootApi = makePi();
+    const childApi = makePi();
+    const rootContext = ctx(true);
+    const childContext = ctx(true);
+    const childConfirm = vi.fn(async () => true);
+    childContext.ui.confirm = childConfirm;
+    subagentsExtension(rootApi.pi);
+    await rootApi.lifecycle.get("session_start")({}, rootContext);
+    subagentsExtension(childApi.pi);
+    await childApi.lifecycle.get("session_start")({}, childContext);
+    vi.mocked(runAgent).mockImplementation(() => new Promise<RunResult>(() => {}));
+
+    try {
+      await childApi.busHandlers.get("subagents:rpc:spawn")!({
+        requestId: "req-child-activation",
+        type: "general-purpose",
+        prompt: "inspect",
+        options: { description: "non-root activation" },
+      });
+      const runOptions = vi.mocked(runAgent).mock.calls.at(-1)?.[3] as unknown as {
+        signal?: AbortSignal;
+        childConfirmation?: {
+          beginRun(signal?: AbortSignal): () => void;
+          readonly uiContext?: unknown;
+        };
+      };
+      expect(runOptions.childConfirmation).toBeDefined();
+      const closeRun = runOptions.childConfirmation!.beginRun(runOptions.signal);
+      expect(runOptions.childConfirmation!.uiContext).toBeUndefined();
+      expect(childConfirm).not.toHaveBeenCalled();
+      closeRun();
+    } finally {
+      await childApi.lifecycle.get("session_shutdown")();
+      await rootApi.lifecycle.get("session_shutdown")();
+    }
   });
 
   it("is idempotent — a second session_start does not re-advertise or double-register", async () => {

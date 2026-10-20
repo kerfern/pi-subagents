@@ -45,6 +45,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 **Silently overwritten** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` are replaced by the activity tracker's own (`src/index.ts:693`). Every programmatic spawn passes through one funnel so none can supply half-wired callbacks; a half-wired tracker renders worse than none, which is the bug behind a row that reads `thinking…` for an agent's whole life ([#181](https://github.com/tintinweb/pi-subagents/pull/181)).
 
+Child extensions started by an RPC spawn use the same confirmation broker as other dispatch paths: `ctx.ui.confirm` reaches the active root's native dialog UI with child attribution. Only explicit native approval succeeds; requests expire after 60 seconds (or the caller's shorter timeout). Missing UI, cancellation, abort, root switch, or teardown denies. Headless runs never auto-approve.
+
 Four things that are not obvious from the tables:
 
 - **Nothing is required at runtime.** `description` is non-optional in TypeScript and never validated. A spawn with no `options` at all is legal and is what `test/cross-extension-rpc.test.ts:81-94` pins.
