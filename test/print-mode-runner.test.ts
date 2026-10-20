@@ -21,6 +21,7 @@ describe("print-mode runner guards", () => {
     const running = runPrintMode({
       prompt: "hello",
       respond,
+      live: false,
       timeoutMs: 1_000,
       onBound: async (handle) => {
         // Spy on the session the runner is about to prompt: the losing race arm
@@ -46,13 +47,28 @@ describe("print-mode runner guards", () => {
     expect(respond).not.toHaveBeenCalled();
   });
 
-  it("disposes idempotently", async () => {
+  it("disposes once, not twice", async () => {
+    let shutdowns = 0;
     const run = await runPrintMode({
       prompt: "hello",
       respond: () => "done",
+      live: false,
       timeoutMs: 30_000,
+      onBound: (handle) => {
+        const runner = handle.session.extensionRunner as unknown as {
+          emit: (event: { type: string }) => Promise<unknown> | unknown;
+        };
+        const original = runner.emit.bind(runner);
+        runner.emit = (event: { type: string }) => {
+          if (event.type === "session_shutdown") shutdowns++;
+          return original(event);
+        };
+      },
     });
     await run.dispose();
     await expect(run.dispose()).resolves.toBeUndefined();
+    // The teardown ran exactly once: a second dispose must not re-emit the
+    // shutdown that extensions use to release timers and child sessions.
+    expect(shutdowns).toBe(1);
   });
 });

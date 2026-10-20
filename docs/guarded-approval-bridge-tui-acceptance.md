@@ -49,7 +49,7 @@ PI_E2E_LIVE=false rtk summary npm run check
 rtk git diff --check
 ```
 
-Expected: 4 files / 33 passed; `npm run check` -> 2,289 passed, 7 skipped; clean diff and status.
+Expected: 5 files / 45 passed (the glob now also picks up `child-confirmation-e2e`, the offline suite added after the run); `npm run check` -> 2,300 passed, 7 skipped; clean diff and status. Both numbers drift as the suite grows — read them off the run, not off this line.
 
 ---
 
@@ -266,12 +266,13 @@ The probe in section 4 of this brief does not work as written: `ExtensionContext
 The TUI run above is a human step. The parts of the contract that are not visual are now also covered OFFLINE, so a regression fails in CI instead of waiting for the next acceptance session:
 
 ```sh
-PI_E2E_LIVE=false npx vitest run test/child-confirmation-e2e.test.ts
+PI_E2E_LIVE=false npx vitest run test/child-confirmation-e2e.test.ts test/print-mode-runner.test.ts
 ```
 
 - `test/child-confirmation-e2e.test.ts` — real extension, real child session, real child extension calling `ctx.ui.confirm`; the only fake is the ROOT's dialog (a scripted `ExtensionUIContext` bound to the parent session) plus the faux model. The child loads the probe through a project agent's `extensions:` allowlist, exactly like the TUI harness.
 - `test/fixtures/bridge-confirm-probe.ts` — the child-side probe extension: one tool that calls `ctx.ui.confirm` and records "requested"/"end" rows to a trace file.
-- `test/helpers/print-mode-runner.ts` — three optional options added for this: `uiContext` (the scripted root dialog), `eventBus` (so a test can use the extension's own RPC channels) and `onBound` (handles handed over before the turn starts, so a test can drive the run in flight). The hook runs inside the runner's wall-clock guard, and a hook that resolves after the guard must not prompt a session that is already being torn down (`test/print-mode-runner.test.ts` pins both).
+- `test/helpers/print-mode-runner.ts` — three optional options added for this: `uiContext` (the scripted root dialog), `eventBus` (so a test can use the extension's own RPC channels) and `onBound` (handles handed over before the turn starts, so a test can drive the run in flight).
+- `test/print-mode-runner.test.ts` — the host's own guards: the `onBound` hook runs inside the runner's wall-clock guard, and a hook that resolves AFTER that guard must not prompt a session that is already being torn down; disposal is idempotent.
 
 | Scenario | Offline coverage | Still TUI-only |
 | --- | --- | --- |
@@ -287,9 +288,15 @@ PI_E2E_LIVE=false npx vitest run test/child-confirmation-e2e.test.ts
 | S9 headless | no root UI -> `false`, no dialog, no hang | nothing |
 | S10 root switch | the SDK's `session_before_switch` invalidates the bridge and the pending request denies | an actual reload replacing the runtime |
 
-Every run pins faux mode (`live: false`), so `PI_E2E_LIVE=1` cannot turn the suite into a networked one. The suite is mutation-checked: reversing the queue order, dropping the attribution prefix, accepting a truthy non-boolean, letting a caller abort approve and leaving a closed lease's request unsettled each turn it red. An independent review pass tightened it further: the `onBound` hook moved inside the runner's guarded race so a throwing or hanging hook cannot outlive the run's cleanup, the 60s budget is asserted from both sides, and each denial test also asserts that the root dialog really was shown.
+Beyond the ten scenarios, one test pins the probe's SCOPING: the probe extension must load in the child only. The parent's tool set carries no `bridge_confirm_probe` (neither registered nor active) while the child's does. Without it, a leak of the agent frontmatter's `extensions:` allowlist into the root would have left every other test green.
+
+Every run in both files pins faux mode (`live: false`), so `PI_E2E_LIVE=1` cannot turn either suite into a networked one. The suite is mutation-checked: reversing the queue order, dropping the attribution prefix, accepting a truthy non-boolean, letting a caller abort approve, leaving a closed lease's request unsettled and removing the late-hook guard each turn it red. An independent review pass tightened it further: the `onBound` hook moved inside the runner's guarded race, so a throwing hook now reaches the run's cleanup path and a hook that resolves after the guard can no longer prompt a session that is being torn down; the 60s budget is asserted from both sides; and every denial test that has a dialog to show also asserts that the root dialog really was shown.
 
 The offline suite asserts the NONVISUAL contract. It does not replace this brief: native rendering, real key input and dialog teardown during a real reload remain operator-only checks.
+
+### Delegated agents in this repo
+
+pi-jev's shield withholds any tool output that merely mentions a "system prompt" — its deterministic injection marker scores 0.99, over the 0.8 threshold, so the whole output is replaced. That hits ordinary code: SDK type files, `AGENTS.md`, the test helpers. The symptom is a delegated child that concludes the repository is unreadable and stops. It is switched off for the output-blocking path in `~/.pi/agent/jev.json` (`modules.shield.shadow: true`; the gate and the watchdog stay live). Re-enabling the shield will break delegated file reads here again.
 
 ### Evidence and limits
 
