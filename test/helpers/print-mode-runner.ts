@@ -62,6 +62,8 @@ import {
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
+  type EventBus,
+  type ExtensionUIContext,
   getAgentDir,
   SessionManager,
   SettingsManager,
@@ -146,6 +148,29 @@ export interface RunPrintModeOptions {
   timeoutMs?: number;
   /** Abort the parent (and forwarded children) externally. */
   signal?: AbortSignal;
+  /**
+   * Scripted root UI handed to the PARENT session's extension binding. The
+   * extension builds its approval bridge from the owning root activation, so
+   * this is what a child extension's `ctx.ui.confirm` is routed to. The child
+   * still receives the bridge facade from production code, never this object.
+   */
+  uiContext?: ExtensionUIContext;
+  /**
+   * Event bus forwarded to the resource loader, so a test can drive the
+   * extension's own RPC channels and lifecycle events.
+   */
+  eventBus?: EventBus;
+  /**
+   * Called inside the guarded execution, right before the parent turn starts,
+   * with the live handles. Use it to take control of a run in flight — e.g.
+   * start an async task that waits for a child to ask for confirmation — since
+   * the runner keeps driving the turn to completion on its own.
+   */
+  onBound?: (handle: {
+    session: AgentSession;
+    manager: ManagerHandle | undefined;
+    dispose: () => Promise<void>;
+  }) => void | Promise<void>;
   /**
    * Force live mode against a specific provider/model (overrides PI_E2E_LIVE).
    * When omitted, live mode is on iff `PI_E2E_LIVE` is truthy. In live mode, if
@@ -360,6 +385,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
+    ...(options.eventBus ? { eventBus: options.eventBus } : {}),
   });
   await loader.reload();
 
@@ -386,8 +412,11 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   session.setSessionName("print-mode-host");
 
   // Binding fires session_start so the extension initializes and publishes its
-  // manager on the global Symbol.
-  await session.bindExtensions({});
+  // manager on the global Symbol. A scripted root UI (if any) is bound HERE —
+  // this is the root activation the approval bridge is built from, so a child
+  // extension's `ctx.ui.confirm` is routed to it. The child session still gets
+  // the bridge facade from production code, never this object.
+  await session.bindExtensions(options.uiContext ? { uiContext: options.uiContext } : {});
 
   const manager = (globalThis as Record<symbol, unknown>)[MANAGER_KEY] as
     | ManagerHandle
@@ -431,7 +460,10 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   const onAbort = () => session.abort();
   options.signal?.addEventListener("abort", onAbort, { once: true });
 
+  let disposed = false;
   const dispose = async () => {
+    if (disposed) return;
+    disposed = true;
     // Emit session_shutdown FIRST so extensions tear down cleanly — in live mode
     // the real env loads global extensions (e.g. a status-bar) whose background
     // timers would otherwise fire after dispose() invalidates the ctx and surface
@@ -477,6 +509,16 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   try {
     await Promise.race([
       (async () => {
+        // The test gets the handles before the turn starts, so it can drive the
+        // run in flight (a child asking for confirmation, an abort, a lifecycle
+        // event) without racing the runner. It runs INSIDE the guarded race so
+        // a throwing or hanging hook cannot outlive the run's cleanup.
+        await options.onBound?.({ session, manager, dispose });
+        // The hook can resolve AFTER this arm lost the race (the wall-clock
+        // guard) or after teardown started. Prompting then would drive a
+        // session that is being torn down — Promise.race does not cancel the
+        // losing arm, so fence it here.
+        if (failed || disposed) return;
         await session.prompt(options.prompt);
         // Fallback for when the hold patch is unavailable: catch any subagents
         // still running after prompt() returns and process their results.

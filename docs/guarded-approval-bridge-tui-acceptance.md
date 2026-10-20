@@ -226,3 +226,73 @@ Finish with:
 5. An explicit statement of what you did NOT verify (anything you could not observe, and why).
 
 If everything passes, say plainly: "the guarded approval bridge behaves as contracted under real TUI observation" - and nothing stronger. If something could not be observed (for example the TUI refused to start, or no second child could be spawned), say that instead of implying it passed.
+
+---
+
+## 9. Result of the 2026-10-20 run
+
+All ten scenarios were observed in a real root Pi TUI (Pi runtime 1.3.0, SDK 1.0.4, live model). **No defect was found**, so no source file changed and the offline suite is unchanged (2,286 passed / 7 skipped, clean diff, clean tree).
+
+| Scenario | Observed | Verdict |
+| --- | --- | --- |
+| S1 routing + attribution | Root TUI showed `[Child name=s1; id=3d0de49f-1bd5-4df] Delete the temporary scratch file?` with the message unchanged | pass |
+| S2 explicit approve | Operator `Enter` on the default `Yes` -> child resolved `true` (2718 ms) | pass |
+| S3 explicit deny | Selection moved to `No`, `Enter` -> child resolved `false` (57147 ms) | pass |
+| S4 FIFO | With two requests pending, exactly one dialog was on screen (attribution `fifoA`); after answering it, still exactly one (attribution `fifoB`) | pass |
+| S5 cancellation | `Escape` dismissed the dialog -> child resolved `false` (3016 ms), not the 60 s deadline | pass |
+| S6 timeout | Dialog closed itself at 60002 ms from enqueue -> child resolved `false` | pass |
+| S7 child abort | With the dialog on screen (`[Child name=s7d; id=15325d1c-2a51-4c6]`, `-> Yes`), the child was stopped via `subagents:rpc:stop` -> the dialog disappeared and the request settled `false` (4234 ms) | pass |
+| S8 stale resume | Closed run's request denied `false` (62 ms); the resumed run's own request (same child session, new tool call, same attribution) was the only live one and was approved -> `true` (7064 ms) | pass |
+| S9 headless | Real child spawned through the headless print-mode host -> `false` in 0 ms, no dialog, no hang | pass |
+| S10 reload | Reload while a confirmation was pending -> request denied `false` (2678 ms); a child spawned after the reload worked normally (`true`, 2958 ms) | pass |
+
+### Harness that worked
+
+The probe in section 4 of this brief does not work as written: `ExtensionContext` carries no child/root discriminator, so a `session_start` probe also fires in the root session and pollutes the attribution evidence. What worked:
+
+- A child-side extension registering one tool (`bridge_confirm_probe`) whose handler calls `ctx.ui.confirm(...)` and appends a JSON row to a log before and after the call. The tool is loaded into the child only, through a project agent definition in the scratch directory: `extensions: ["/abs/path/confirm-probe.ts"]` plus `tools: ext:confirm-probe/bridge_confirm_probe`.
+- A root-side driver extension with slash commands that spawn children over the `subagents:rpc:spawn` channel, wait for the probe's `pending` row, and stop a child over `subagents:rpc:stop`. The RPC path is the same child-spawn path the `Agent` tool uses, so the bridge is in play.
+- A real root TUI in tmux (`tmux -L <name> new-session -d -s root -c <scratch> "pi -a -e <driver.ts>"`). `-a` trusts the scratch project's `.pi`; without it the project agent and extension are not loaded.
+
+### Method caveats
+
+- The confirm dialog is an extension selector (`Yes`/`No`) whose keys are `tui.select.up`/`down` (`k`/`j`), `Enter` and `Esc`/`ctrl+c`. Arrow keys are the documented way to move, but they are not the only way - the `j` shortcut works and is easier to drive.
+- A native dialog holds the keyboard: while it is up, typed characters and `Enter` go to the dialog, not to the editor. Sending a command while a dialog is open therefore answers the dialog instead of running the command. Drive the harness so that no keystroke is sent while a dialog is up.
+- Stock `/reload` and extension shortcuts are editor-scoped, so neither is reachable while a dialog holds the keyboard. A reload during a pending confirmation needs a global terminal-input hook (`ctx.ui.onTerminalInput`, which the TUI consults before the focused component) that calls the real `reload()`.
+- The operator's terminal may not decode arrow keys into the TUI at all. If a `↓` has no effect, use `j`.
+
+### Offline coverage (added after the run)
+
+The TUI run above is a human step. The parts of the contract that are not visual are now also covered OFFLINE, so a regression fails in CI instead of waiting for the next acceptance session:
+
+```sh
+PI_E2E_LIVE=false npx vitest run test/child-confirmation-e2e.test.ts
+```
+
+- `test/child-confirmation-e2e.test.ts` — real extension, real child session, real child extension calling `ctx.ui.confirm`; the only fake is the ROOT's dialog (a scripted `ExtensionUIContext` bound to the parent session) plus the faux model. The child loads the probe through a project agent's `extensions:` allowlist, exactly like the TUI harness.
+- `test/fixtures/bridge-confirm-probe.ts` — the child-side probe extension: one tool that calls `ctx.ui.confirm` and records "requested"/"end" rows to a trace file.
+- `test/helpers/print-mode-runner.ts` — three optional options added for this: `uiContext` (the scripted root dialog), `eventBus` (so a test can use the extension's own RPC channels) and `onBound` (handles handed over before the turn starts, so a test can drive the run in flight). The hook runs inside the runner's wall-clock guard, and a hook that resolves after the guard must not prompt a session that is already being torn down (`test/print-mode-runner.test.ts` pins both).
+
+| Scenario | Offline coverage | Still TUI-only |
+| --- | --- | --- |
+| S1 routing/attribution | the root dialog receives the prefixed title and the unchanged message | native rendering and placement |
+| S2 approve | the child's `true` comes from the root's literal `true` | key input |
+| S3 deny | the child's `false` from the root's `false` | the native No selection |
+| S4 FIFO | three concurrent children: one dialog at a time, shown in arrival order | visual simultaneity |
+| S5 cancellation | the root dialog rejects -> `false` | Esc and native dismissal |
+| S6 deadline | the caller's timeout expires -> `false`, the root's signal is aborted, a late approval is ignored; the 60s budget is asserted through the timeout handed to the root dialog | the real countdown |
+| S7 child abort | the child is stopped over `subagents:rpc:stop` while its request is pending -> the stop succeeds, the root dialog is torn down (its signal aborted) and the child gets `false` | the native dialog's teardown |
+| caller abort | the caller aborts its own signal right after asking -> `false`, the root dialog is aborted | the native dialog's teardown |
+| S8 stale resume | the closed run's request denies, its late approval is ignored, and only the resumed run's request can approve | native interaction |
+| S9 headless | no root UI -> `false`, no dialog, no hang | nothing |
+| S10 root switch | the SDK's `session_before_switch` invalidates the bridge and the pending request denies | an actual reload replacing the runtime |
+
+Every run pins faux mode (`live: false`), so `PI_E2E_LIVE=1` cannot turn the suite into a networked one. The suite is mutation-checked: reversing the queue order, dropping the attribution prefix, accepting a truthy non-boolean, letting a caller abort approve and leaving a closed lease's request unsettled each turn it red. An independent review pass tightened it further: the `onBound` hook moved inside the runner's guarded race so a throwing or hanging hook cannot outlive the run's cleanup, the 60s budget is asserted from both sides, and each denial test also asserts that the root dialog really was shown.
+
+The offline suite asserts the NONVISUAL contract. It does not replace this brief: native rendering, real key input and dialog teardown during a real reload remain operator-only checks.
+
+### Evidence and limits
+
+Probe rows: `/tmp/bridge-acceptance/result.log`. Spawn/stop/reload trace: `/tmp/bridge-acceptance/driver.log`. Root dialogs: tmux pane captures of session `root`.
+
+Not verified by this run: the deny and cancel keystrokes were driven by `tmux send-keys` rather than by a human (only the approve was a real operator keystroke); that a reload denial comes from the bridge's invalidation rather than from the native dialog's own teardown (the offline `test/rpc-lifecycle-gating.test.ts` covers the invalidation path directly); session switching, disposal, a distinct caller abort, non-literal `true` returns, late approvals after expiry or invalidation, and queued-request expiry; the SDK version in `node_modules` (1.0.4) is older than the installed Pi runtime (1.3.0).
