@@ -78,11 +78,11 @@ Keep exactly one entry — the local path. If a clone or npm copy reappears, rem
 
 pi-jev's SHIELD withholds any tool output that merely mentions a "system prompt": its deterministic injection marker scores 0.99, so the whole output is replaced with a notice. Ordinary code trips it — SDK type files, `AGENTS.md`, `test/helpers/print-mode-runner.ts`. The symptom is a delegated child that concludes the repository is unreadable, burns turns hunting for a way around it, and gives up. Two `implementer` dispatches died this way before the cause was found.
 
-This repo carries a project-scoped `.pi/jev.json` (gitignored, machine-local): `modules.shield.deterministicInjection: false` drops only the 0.99 offline floor and `modules.shield.injectionThreshold: 0.8` keeps the classifier — the shield stays live, the gate and the watchdog are untouched, and the global `~/.pi/agent/jev.json` is left alone. A delegated child inherits it because it reads the config at its own `session_start` and the child's cwd is this repo.
+This repo carries a project-scoped, committed `.pi/jev.json`: `modules.shield.deterministicInjection: false` drops only the 0.99 offline floor and `modules.shield.injectionThreshold: 0.8` keeps the classifier — the shield stays live, the gate and the watchdog are untouched, and the global `~/.pi/agent/jev.json` is left alone. A delegated child inherits it because it reads the config at its own `session_start` and the child's cwd is this repo.
 
 Two caveats:
 
-- **A worktree child does not inherit it.** The project file is keyed to the cwd, and a worktree is a fresh checkout without untracked files — it falls back to the global config and the 0.99 floor is back. `implementer` dispatches run in a worktree; `worker` dispatches run in this checkout. Prefer `worker` for work that must land here.
+- **A worktree child does not inherit it.** pi-jev merges the project file only for a TRUSTED project, and the worktree's temp path is not under the trusted root in `~/.pi/agent/trust.json` — so a worktree child falls back to the global config and the 0.99 floor is back. `implementer` dispatches run in a worktree; `worker` dispatches run in this checkout. Prefer `worker` for work that must land here.
 - **A session toggle cannot reach a child.** pi-jev's state is per SDK session, so `/jev off` and `/jev shadow shield on` change only the session you typed them in. The lever that reaches children is the environment: `PI_JEV_SHIELD_SHADOW=1 pi` starts the whole process with the shield in shadow, children included.
 
 When a child reports it cannot read a file that plainly exists, check the tool output for a `Jev: output from ... was withheld` notice before believing it.

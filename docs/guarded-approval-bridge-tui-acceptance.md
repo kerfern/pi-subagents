@@ -298,7 +298,7 @@ The offline suite asserts the NONVISUAL contract. It does not replace this brief
 
 pi-jev's shield withholds any tool output that merely mentions a "system prompt" — its deterministic injection marker scores 0.99, over the threshold, so the whole output is replaced. That hits ordinary code: SDK type files, `AGENTS.md`, the test helpers. The symptom is a delegated child that concludes the repository is unreadable and stops.
 
-This repo's sessions are covered by a project-scoped `.pi/jev.json` (gitignored, machine-local):
+This repo's sessions are covered by a project-scoped `.pi/jev.json` (committed, so it travels with the repo):
 
 ```json
 { "modules": { "shield": { "shadow": false, "deterministicInjection": false, "injectionThreshold": 0.8 } } }
@@ -307,7 +307,7 @@ This repo's sessions are covered by a project-scoped `.pi/jev.json` (gitignored,
 `deterministicInjection: false` drops only the 0.99 offline floor, so the shield STAYS LIVE and the classifier still decides — at 0.8, above the 0.74–0.76 that benign but instruction-shaped subagent reports scored on this machine. The gate and the watchdog are untouched, and the global `~/.pi/agent/jev.json` is left alone so the rest of the machine keeps its own configuration.
 
 Three things to know:
-- The project file applies to sessions whose CWD is this repo. A child in another directory (a worktree, say) falls back to the global config and can be blocked again.
+- The project file applies to sessions whose CWD is this repo **and whose project is trusted** (pi-jev only merges it for trusted projects). A worktree under a temp path is untrusted, so it falls back to the global config and can be blocked again.
 - A session toggle does not reach children: `/jev shadow shield on` in the parent changes only the parent. The one lever that reaches children is the environment — `PI_JEV_SHIELD_SHADOW=1 pi` starts a whole process with the shield in shadow, children included.
 - The proper fix is upstream: a per-tool exemption (`modules.shield.skipTools`, mirroring the gate's), which this build does not have.
 

@@ -1,0 +1,9 @@
+{
+  "modules": {
+    "shield": {
+      "shadow": false,
+      "deterministicInjection": false,
+      "injectionThreshold": 0.8
+    }
+  }
+}

@@ -44,7 +44,3 @@ CLAUDE.md
 
 # Serena MCP project state (indexes, memories, caches)
 .serena/
-
-# Local pi-jev project config (shield in shadow: the upstream marker withholds
-# ordinary code that merely mentions a "system prompt").
-.pi/jev.json
