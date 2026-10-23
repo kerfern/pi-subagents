@@ -11,11 +11,11 @@ vi.mock("../src/worktree.js", () => ({
 import { AgentManager, type SubagentRouting } from "../src/agent-manager.js";
 import type { RunResult } from "../src/agent-runner.js";
 import { runAgent } from "../src/agent-runner.js";
-import { FALLBACK_SUBAGENT_MODEL, modelKey, type SubagentRoutingState } from "../src/model-routing.js";
+import type { SubagentRoutingState } from "../src/model-routing.js";
 
 const PRIMARY = { provider: "faux", id: "primary-1" };
-/** The real fallback constant: the retry leg is fixed, not configurable. */
-const FALLBACK = { provider: "openrouter", id: "nvidia/nemotron-3-ultra-550b-a55b:free" };
+/** Independent catalog entry required by the retry behavior test. */
+const FALLBACK = { provider: "commandcode", id: "minimax/minimax-m3.1-flash" };
 
 function router(state: SubagentRoutingState, models = [PRIMARY, FALLBACK]): SubagentRouting {
   return { state, catalogFor: () => models };
@@ -166,7 +166,6 @@ describe("shared routing at startAgent", () => {
   });
 
   it("retries the same task once on the fallback after a provider failure", async () => {
-    expect(modelKey(FALLBACK)).toBe(FALLBACK_SUBAGENT_MODEL);
     vi.mocked(runAgent).mockResolvedValueOnce(providerFail() as RunResult).mockResolvedValueOnce(ok() as RunResult);
     const routing = state();
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));

@@ -324,7 +324,7 @@ describe("the Agent tool under a live route", () => {
       FAUX,
       { provider: "openai-codex", id: "gpt-5.6-luna" },
       { provider: "openai-codex", id: "gpt-5.6-sol" },
-      { provider: "openrouter", id: "nvidia/nemotron-3-ultra-550b-a55b:free" },
+      { provider: "commandcode", id: "minimax/minimax-m3.1-flash" },
     ];
     const context = agentCtx(models, [{
       type: "custom",

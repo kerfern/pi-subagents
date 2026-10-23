@@ -626,7 +626,7 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 | --------- | ------------- |
 | Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.1-sol` (xhigh); other agents `openai-codex/gpt-6-luna` (low) |
 | Roles | Reviewer, built-in `Plan`, and custom `advisor` use specialist route; all other types use shared route |
-| Fallback | `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` |
+| Fallback | CommandCode MiniMax M3.1 Flash (`commandcode/minimax/minimax-m3.1-flash`); exact catalog validation before primary execution |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
 | Picker order | Reviewer/Plan/advisor model → thinking → other-agent model → thinking |
 | Stored | Session entry `subagent-model-state` — shared `provider/model` + `thinking`, reviewer `reviewerProvider/reviewerModel` + `reviewerThinking`, per session, never per project |

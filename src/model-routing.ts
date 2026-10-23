@@ -20,7 +20,7 @@ const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "xhigh";
  * the default: retrying inside the provider that just failed re-dials the same
  * dead endpoint.
  */
-export const FALLBACK_SUBAGENT_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free";
+export const FALLBACK_SUBAGENT_MODEL = "commandcode/minimax/minimax-m3.1-flash";
 export const ROUTING_STATE_TYPE = "subagent-model-state";
 /** Predecessor entry written by the standalone implementer-model extension. */
 export const LEGACY_ROUTING_STATE_TYPE = "implementer-model-state";
