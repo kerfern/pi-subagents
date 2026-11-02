@@ -11,6 +11,7 @@ import {
   persistToastFor,
   type SettingsAppliers,
   saveAndEmitChanged,
+  saveQuotaGuardProviderSetting,
   saveSettings,
   snapshotQuotaGuardSettings,
 } from "../src/settings.js";
@@ -128,12 +129,11 @@ describe("production settings snapshot wiring", () => {
       const ctx = extensionContext({ cwd: env.dir, ui });
 
       await first.commands.get("quota-guard").handler("on codex", ctx);
-      await second.commands.get("quota-guard").handler("on commandcode", ctx);
       await second.commands.get("agents").handler("", ctx);
 
       const saved = loadSettings(env.dir);
       expect(saved.quotaGuardCodexEnabled).toBe(true);
-      expect(saved.quotaGuardCommandCodeEnabled).toBe(true);
+      expect(saved.quotaGuardCommandCodeEnabled).toBe(false);
     } finally {
       env.restore();
     }
@@ -157,7 +157,36 @@ describe("production settings snapshot wiring", () => {
       await boot.commands.get("quota-guard").handler("on codex", extensionContext({ cwd: env.dir, ui }));
 
       expect(readFileSync(settingsPath, "utf8")).toBe(malformed);
-      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/malformed|not saved|repair/i), "info");
+      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/malformed|not saved|repair/i), "warning");
+    } finally {
+      env.restore();
+    }
+  });
+
+  it("reports failed quota-guard writes without changing current session or emitting attempted settings", async () => {
+    const env = hermeticDir({ settings: {
+      quotaGuardEnabled: false,
+      quotaGuardCodexEnabled: false,
+      quotaGuardCommandCodeEnabled: false,
+    } });
+    const settingsDir = join(env.dir, ".pi");
+    try {
+      initTheme(undefined, false);
+      const boot = makePi();
+      subagentsExtension(boot.pi);
+      rmSync(settingsDir, { recursive: true, force: true });
+      writeFileSync(settingsDir, "not a directory", "utf8");
+      boot.pi.events.emit.mockClear();
+      const ui = { notify: vi.fn() };
+      const ctx = extensionContext({ cwd: env.dir, ui });
+      const command = boot.commands.get("quota-guard");
+
+      await command.handler("on codex", ctx);
+
+      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/not saved; current session unchanged/i), "warning");
+      expect(boot.pi.events.emit).not.toHaveBeenCalled();
+      await command.handler("status", ctx);
+      expect(ui.notify).toHaveBeenLastCalledWith(expect.stringMatching(/not installed/i), "info");
     } finally {
       env.restore();
     }
@@ -399,6 +428,46 @@ describe("settings persistence", () => {
     const legacyOnlySnapshot = snapshotQuotaGuardSettings(true);
     saveAndEmitChanged(legacyOnlySnapshot, "saved", emit, projectDir);
     expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: true });
+  });
+
+  it("does not materialize inherited provider switches during an unrelated save", () => {
+    writeGlobal({ quotaGuardCodexEnabled: true, quotaGuardCommandCodeEnabled: false });
+    writeProject({ maxConcurrent: 3 });
+    const snapshot = {
+      maxConcurrent: 4,
+      quotaGuardCodexEnabled: true,
+      quotaGuardCommandCodeEnabled: false,
+    };
+
+    saveAndEmitChanged(snapshot, "saved", vi.fn(), projectDir);
+
+    expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 4 });
+    expect(loadSettings(projectDir)).toEqual({
+      maxConcurrent: 4,
+      quotaGuardCodexEnabled: true,
+      quotaGuardCommandCodeEnabled: false,
+    });
+  });
+
+  it("refuses unrelated saves over malformed project settings", () => {
+    mkdirSync(join(projectDir, ".pi"), { recursive: true });
+    const malformed = "not json {{{";
+    writeFileSync(projectFile(), malformed);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const emit = vi.fn();
+
+    try {
+      const toast = saveAndEmitChanged({ maxConcurrent: 4 }, "saved", emit, projectDir);
+
+      expect(readFileSync(projectFile(), "utf-8")).toBe(malformed);
+      expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
+        settings: { maxConcurrent: 4 },
+        persisted: false,
+      });
+      expect(toast.level).toBe("warning");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("round-trips quotaGuardEnabled; a non-boolean leaves it off", () => {
@@ -1043,6 +1112,21 @@ describe("settings persistence", () => {
       applySettings({ maxConcurrent: 4 }, appliers);
       expect(appliers.setSchedulingEnabled).not.toHaveBeenCalled();
     });
+  });
+
+  it("reports quota-guard write failures as unsaved, not session-only", () => {
+    const filePosingAsCwd = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
+    writeFileSync(filePosingAsCwd, "");
+    const emit = vi.fn();
+    try {
+      const result = saveQuotaGuardProviderSetting("openai-codex", true, emit, filePosingAsCwd);
+      expect(result.level).toBe("warning");
+      expect(result.message).toMatch(/not saved|could not be saved/i);
+      expect(result.message).not.toMatch(/session only/i);
+      expect(emit).not.toHaveBeenCalled();
+    } finally {
+      rmSync(filePosingAsCwd, { force: true });
+    }
   });
 
   describe("persistToastFor", () => {

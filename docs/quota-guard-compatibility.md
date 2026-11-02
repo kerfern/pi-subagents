@@ -108,7 +108,8 @@ Two other refusals are worth recognizing:
   independent, which is why this code is distinct from a root-wide pause.
 - `status()` reports it explicitly in that provider's status (for example
   `status.providers.commandcode.unsupported`) and `/quota-guard status` prints an `unsupported`
-  marker. It is not a root-wide pause: the peer provider remains independently available.
+  marker. A later successful quota read clears this marker; any separate policy refusal still keeps its
+  automatic hold. It is not a root-wide pause: the peer provider remains independently available.
 
 ## Honest limits
 
@@ -313,7 +314,15 @@ In a session, persistent provider switches can be changed without editing JSON:
 other settings, and takes effect after restarting Pi. Omit the target to set both providers:
 `/quota-guard on` or `/quota-guard off`. The command remains available in command-only mode while
 both providers are OFF; in that state it does not construct a coordinator, resolve credentials, or
-decorate the runtime. A failed settings write is reported and does not claim success.
+decorate the runtime. A failed provider-toggle write warns that it was not saved and leaves the
+current session unchanged. Unrelated `/agents → Settings` saves preserve the latest provider switches
+already on disk; malformed or unreadable project settings are not overwritten.
+
+For troubleshooting, capture `/quota-guard status` and any nearby refusal diagnostic on stderr. Status
+shows each provider's guard/hold state and the reserve or wake details available; refusal diagnostics
+identify the phase and normalized code or assessment reason. These diagnostics are transient, not a
+durable history, and intentionally exclude credentials, authorization headers, and raw provider
+responses.
 
 For immediate temporary holds, use:
 

@@ -281,6 +281,7 @@ export class GuardCoordinator {
       let snapshot: QuotaSnapshot;
       try {
         snapshot = await read(auth, options);
+        this.unsupported.delete(attempt.providerId);
         if (!['open', 'warn'].includes(assess(snapshot, policy, mode(attempt.providerId), reserve(lane, snapshot), now()).state)) {
           return false;
         }
@@ -355,6 +356,7 @@ export class GuardCoordinator {
       let snapshot: QuotaSnapshot;
       try {
         snapshot = await read(auth, options);
+        this.unsupported.delete(attempt.providerId);
       } catch (error) {
         const failure = error instanceof QuotaError ? error : new QuotaError('unavailable');
         if (failure.code === 'unsupported') this.unsupported.add(attempt.providerId);

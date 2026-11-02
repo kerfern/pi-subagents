@@ -719,8 +719,19 @@ export function saveAndEmitChanged(
   emit: SettingsEmit,
   cwd: string = process.cwd(),
 ): { message: string; level: "info" | "warning" } {
-  const persisted = saveSettings(snapshot, cwd);
-  emit("subagents:settings_changed", { settings: snapshot, persisted });
+  let readFailed = false;
+  const projectSettings = readSettingsFile(projectPath(cwd), () => { readFailed = true; });
+  const settings = { ...snapshot };
+  if (!readFailed) {
+    // A stale session's full snapshot must not overwrite newer project provider switches,
+    // or materialize a provider override inherited only from global settings.
+    if (projectSettings.quotaGuardCodexEnabled === undefined) delete settings.quotaGuardCodexEnabled;
+    else settings.quotaGuardCodexEnabled = projectSettings.quotaGuardCodexEnabled;
+    if (projectSettings.quotaGuardCommandCodeEnabled === undefined) delete settings.quotaGuardCommandCodeEnabled;
+    else settings.quotaGuardCommandCodeEnabled = projectSettings.quotaGuardCommandCodeEnabled;
+  }
+  const persisted = !readFailed && saveSettings(settings, cwd);
+  emit("subagents:settings_changed", { settings, persisted });
   return persistToastFor(successMsg, persisted);
 }
 
@@ -737,18 +748,24 @@ export function saveQuotaGuardProviderSetting(
   const projectSettings = readSettingsFile(path, () => { readFailed = true; });
   if (readFailed) {
     const settings = readSettingsFile(globalPath());
-    const message = `Quota guard settings not saved: ${path} is malformed or unreadable; repair it and retry.`;
-    emit("subagents:settings_changed", { settings, persisted: false });
-    return { message, level: "warning", settings };
+    return {
+      message: `Quota guard ${enabled ? "on" : "off"} ${target} not saved; current session unchanged. ${path} is malformed or unreadable; repair it and retry.`,
+      level: "warning",
+      settings,
+    };
   }
   const updates: Pick<SubagentsSettings, "quotaGuardCodexEnabled" | "quotaGuardCommandCodeEnabled"> = {};
   if (target === "all" || target === "openai-codex") updates.quotaGuardCodexEnabled = enabled;
   if (target === "all" || target === "commandcode") updates.quotaGuardCommandCodeEnabled = enabled;
   const persisted = saveSettings({ ...projectSettings, ...updates }, cwd);
   const settings = loadSettings(cwd);
-  emit("subagents:settings_changed", {
-    settings: persisted ? settings : { ...settings, ...updates },
-    persisted,
-  });
-  return { ...persistToastFor(`Quota guard ${enabled ? "on" : "off"} ${target}`, persisted), settings };
+  if (!persisted) {
+    return {
+      message: `Quota guard ${enabled ? "on" : "off"} ${target} not saved; current session unchanged.`,
+      level: "warning",
+      settings,
+    };
+  }
+  emit("subagents:settings_changed", { settings, persisted: true });
+  return { ...persistToastFor(`Quota guard ${enabled ? "on" : "off"} ${target}`, true), settings };
 }

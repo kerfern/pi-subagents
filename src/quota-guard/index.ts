@@ -464,6 +464,7 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
       const controls = quotaGuardControls();
       const runtimeUnavailable = 'Quota guard: not installed; run /quota-guard on [all|codex|commandcode] and restart pi.';
       let message: string;
+      let notificationLevel: 'info' | 'warning' = 'info';
       if (invalidTarget || (sub === 'enable' && tokens.length > 1)
         || (sub === 'status' && tokens.length > 1)) {
         message = 'Quota guard: invalid target or arguments; use on|off|pause|resume [all|codex|commandcode].';
@@ -477,12 +478,16 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
             const persist = config?.persistProviderEnabled;
             if (!persist) {
               message = 'Quota guard: persistent settings changes are unavailable in this session.';
+              notificationLevel = 'warning';
               break;
             }
             const result = persist(target, sub === 'on');
-            message = result.persisted
-              ? `Quota guard ${sub} ${targetLabel} saved; restart pi for it to take effect.`
-              : result.message ?? `Quota guard ${sub} ${targetLabel} could not be saved.`;
+            if (result.persisted) {
+              message = `Quota guard ${sub} ${targetLabel} saved; restart pi for it to take effect.`;
+            } else {
+              message = result.message ?? `Quota guard ${sub} ${targetLabel} could not be saved.`;
+              notificationLevel = 'warning';
+            }
             break;
           }
           case 'enable':
@@ -518,7 +523,7 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
         }
       }
       const ui = (ctx as { ui?: { notify?: (m: string, t?: string) => void } } | undefined)?.ui;
-      if (typeof ui?.notify === 'function') ui.notify(message, 'info');
+      if (typeof ui?.notify === 'function') ui.notify(message, notificationLevel);
       else process.stdout.write(`${message}\n`);
     },
   });

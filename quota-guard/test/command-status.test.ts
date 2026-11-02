@@ -110,6 +110,26 @@ test('command-only mode refuses runtime controls instead of claiming they succee
   }
 });
 
+test('failed persistent writes notify as warnings without claiming session-only activation', async () => {
+  const { runtime, command } = setup({
+    guardedProviders: [],
+    persistProviderEnabled: () => ({
+      persisted: false,
+      message: 'Quota guard on codex not saved; current session unchanged.',
+    }),
+  }, false);
+  const handler = command();
+  assert.equal(typeof handler, 'function');
+  const notifications: Array<[string, string?]> = [];
+
+  await handler!('on codex', { ui: { notify: (message: string, level?: string) => notifications.push([message, level]) } });
+
+  assert.match(notifications[0]?.[0] ?? '', /not saved; current session unchanged/i);
+  assert.doesNotMatch(notifications[0]?.[0] ?? '', /session only/i);
+  assert.equal(notifications[0]?.[1], 'warning');
+  assert.equal(quotaGuardControls(runtime), undefined, 'a failed toggle leaves runtime unguarded as before');
+});
+
 test('commands target all, Codex, and CommandCode; omitted target aliases all and invalid targets refuse', async () => {
   const { runtime, command } = setup({ guardedProviders: ['openai-codex'] }, true);
   const handler = command();

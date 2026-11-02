@@ -909,6 +909,33 @@ test('a provider-scoped 404 quota surface refuses that attempt and leaves the fl
   assert.equal(d.fleet.snapshot().state, 'open');
 });
 
+test('successful reads clear a stale unsupported marker without clearing policy holds', async () => {
+  let routeAvailable = false;
+  let reserve = new Map<string, number | null>([['monthly', 5]]);
+  const readQuotaForRecovery = (async () => {
+    if (!routeAvailable) throw new QuotaError('unsupported');
+    return openSnapshot('provider');
+  }) as unknown as typeof readQuota;
+  const { deps: d } = deps({ readQuota: readQuotaForRecovery, reserve: () => reserve });
+  const coordinator = new GuardCoordinator(d);
+
+  await assert.rejects(() => coordinator.admit(commandcodeScope),
+    (error: unknown) => error instanceof QuotaError && error.code === 'unsupported');
+  assert.deepEqual(coordinator.unsupportedProviders(), ['commandcode']);
+
+  routeAvailable = true;
+  reserve = new Map([['monthly', null]]);
+  assert.equal(await coordinator.freshCheck('commandcode'), false, 'unknown reserve still refuses recovery');
+  assert.deepEqual(coordinator.unsupportedProviders(), [], 'a successful quota read proves route is supported');
+  assert.equal(d.fleet.snapshot('commandcode').state, 'paused', 'policy refusal keeps automatic hold latched');
+
+  reserve = new Map([['monthly', 5]]);
+  assert.equal(await d.fleet.resumeAutomatic('commandcode', () => coordinator.freshCheck('commandcode')), true);
+  const release = await coordinator.admit(commandcodeScope);
+  release();
+  assert.deepEqual(coordinator.unsupportedProviders(), []);
+});
+
 test('provider fresh check verifies every retained Codex account before clearing its hold', async () => {
   const account = (accountId: string): AttemptScope => ({ providerId: 'openai-codex', scope: 'account', accountId, credential: 'k1' });
   const { deps: d } = deps({
