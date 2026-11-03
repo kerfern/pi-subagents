@@ -312,10 +312,22 @@ test('unknown version is refused on write and read', async () => {
   assert.equal(await store.read(), null);
 });
 
-test('empty or malformed quorum and checkpoints are refused', async () => {
+test('an empty quorum is a durable hold with no automatic reopen, not a missing field', async () => {
   const dir = await sandbox();
   const store = await openStore(dir, 'root-a');
-  await assert.rejects(store.write(value(1, { quorum: [] }), null));
+  // Empty quorum records "the guard could not enumerate scope identities", so nothing may reopen the
+  // pause automatically; the record itself is still written and reads back.
+  await store.write(value(1, { quorum: [] }), null);
+  assert.deepEqual((await store.read())?.quorum, []);
+  await store.close();
+
+  const second = await openStore(await sandbox(), 'root-a');
+  await assert.rejects(second.write(value(1, { checkpoints: [] }), null), /checkpoints/);
+});
+
+test('malformed quorum and checkpoints are still refused', async () => {
+  const dir = await sandbox();
+  const store = await openStore(dir, 'root-a');
   await assert.rejects(store.write(value(1, { checkpoints: [] }), null));
   await assert.rejects(store.write(value(1, { quorum: [''] }), null));
   await assert.rejects(store.write(value(1, { quorum: 'x' as unknown as string[] }), null));

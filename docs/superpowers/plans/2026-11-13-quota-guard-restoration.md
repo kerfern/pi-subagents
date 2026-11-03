@@ -22,6 +22,29 @@ secret-free anchor; extension contexts hand out a **readonly** manager, and `nav
 user message's *parent* — hence anchors are non-context custom entries, and root restoration is an
 explicit command, not a decorator side effect.
 
+## Second-opinion review (advisor, after #14/#15 landed)
+
+Verdict: **justified but at diminishing returns.** Keep admission guarding, the allowlisted atomic
+checkpoints and verified navigation; stop before attaching child runtimes or reconstructing graphs.
+Three revisions follow from that, and they supersede the task text below where they conflict:
+
+1. **#16 is reduced to handle retention, not child hydration.** Keep only directly addressable,
+   persisted, top-level child descriptors. Import them as interrupted references that reopen a saved
+   conversation on an explicit new prompt; drop `openGuardedChild`, eager session creation, completion
+   replay, queues, and nested/workflow/worktree adoption. Nonpersistent children stay explicitly lost.
+2. **#17 is dropped.** Restoring queue order, deadlines, ownership and result-consumption protects
+   scheduling continuity for work that no longer exists; notification delivery would stay ambiguous.
+   Root transcript and holds survive, and workflows are reported interrupted for the operator to
+   re-run deliberately.
+3. **Fresh pauses must actually be recorded.** The review found that a pause occurring in this process
+   never reached the wake machine, so the checkpoint the restore path needs was never written. Wiring
+   now records an automatic hold directly (`RootWake.recordPause`), with an empty quorum meaning "no
+   automatic reopen - explicit resume only", and skips manual intent.
+
+Deletion trigger recorded with it: if saved transcript positions and child handles stop saving
+meaningful operator effort over Pi's existing navigation and fresh turns, delete restoration and keep
+admission guarding only.
+
 ## Global constraints
 
 - Provider-local admission, manual holds, identity fail-closed behaviour, and the harness startup

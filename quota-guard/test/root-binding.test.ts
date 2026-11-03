@@ -746,3 +746,42 @@ test('reserve seed: the seed value is never logged or written to the durable sto
   assert.equal(raw.includes(String(marker)), false, 'the seed must not be written to the durable store');
   assert.equal(output.join('\n').includes(String(marker)), false, 'the seed must not be logged');
 });
+
+// --- a fresh pause is recorded through the real wiring (#14) ------------------------------------
+// The wake machine's checkpoint callback existed but nothing invoked it for a pause that happened in
+// this process, so the durable record the restore path needs was never written.
+
+test('a fresh automatic pause reaches the durable store through the real binding', async () => {
+  const dir = await tmpDir();
+  const requested: number[] = [];
+  const host: QuotaGuardHost = {
+    rootId: ROOT_ID,
+    stateDir: dir,
+    hookSource: hookSource(fakeRuntime().prototype),
+  };
+  setQuotaGuardEnabled(true);
+  quotaGuardExtension(host, {
+    checkpoint: async (generation: number) => {
+      requested.push(generation);
+      return [{ id: 'a'.repeat(64), digest: 'a'.repeat(64) }];
+    },
+  });
+  await flush();
+  await settle(() => host.wake !== undefined);
+
+  const binding = quotaGuardRootBinding();
+  assert.ok(binding);
+  binding.fleet.pauseAutomatic('commandcode', 'reserve');
+  await flush();
+  await settle(() => requested.length > 0 && host.wake?.status()?.durable === true);
+
+  assert.equal(requested.length, 1, 'one pause asks for exactly one checkpoint');
+  const manifest = await (async () => {
+    const store = await openStore(dir, ROOT_ID);
+    try { return await store.read(); } finally { await store.close(); }
+  })();
+  assert.equal(manifest?.state, 'paused');
+  assert.equal(manifest?.reason, 'reserve');
+  assert.deepEqual(manifest?.checkpoints.map(entry => entry.id), ['a'.repeat(64)]);
+  assert.equal(host.wake?.status()?.durable, true);
+});

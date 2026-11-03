@@ -157,6 +157,71 @@ export class RootWake {
     this.#arm(wakeAt === undefined ? backoffDelay(manifest.backoffIndex) : Math.max(0, wakeAt - now));
   }
 
+  /**
+   * Record a pause that just happened in this process.
+   *
+   * Without this, only a pause that already had a manifest was durable: a fresh pause wrote nothing,
+   * so the checkpoint the restore path needs was never created. A manual hold is skipped on purpose -
+   * it is operator intent, not an automatic recovery candidate, and recording it as one would invite
+   * exactly the silent reopening the latch refuses.
+   *
+   * The record's quorum stays empty because the guard cannot enumerate scope identities here, which
+   * means `quorumComplete` is false for every candidate: the record is durable, and only an explicit
+   * resume can clear it.
+   */
+  async recordPause(): Promise<boolean> {
+    if (this.disposed || this.running) return false;
+    this.running = true;
+    try {
+      const current = this.manifest ?? await this.deps.store.read();
+      // Holds are resolved AFTER the read: a pause that lands while the store is still loading must be
+      // recorded too, and resolving earlier would silently drop exactly that pause. A hold can also be
+      // provider-local while the ROOT snapshot still reads open, so the reason comes from whichever
+      // provider is actually held.
+      const root = this.deps.fleet.snapshot();
+      const held = (['openai-codex', 'commandcode'] as const)
+        .map(providerId => this.deps.fleet.snapshot(providerId))
+        .find(provider => provider.state !== 'open');
+      const reason = held?.automaticReason ?? held?.reason ?? root.reason;
+      if (held === undefined || reason === undefined) return false;
+      // A manual hold is operator intent, not an automatic recovery candidate.
+      if (reason === 'manual') return false;
+      const base: Manifest = current ?? {
+        version: 1,
+        rootId: root.rootId,
+        generation: 0,
+        state: 'paused',
+        updatedAt: new Date(this.deps.now()).toISOString(),
+        backoffIndex: 0,
+        quorum: [],
+        checkpoints: [],
+        digest: '',
+      };
+      let checkpoints: readonly Checkpoint[];
+      try {
+        checkpoints = await this.deps.checkpoint(base.generation);
+      } catch (error) {
+        return this.#refuseUnrecorded(error);
+      }
+      if (checkpoints.length === 0) {
+        return this.#refuseUnrecorded(new CheckpointUnavailableError(
+          `No durable checkpoints for root ${base.rootId}: a pause that names none cannot be restored, so none is recorded`,
+        ));
+      }
+      const record = pauseRecord(base, checkpoints, reason, backoffDelay(0), this.deps.now());
+      await this.deps.store.write(record, current?.generation ?? null);
+      this.manifest = await this.deps.store.read();
+      this.unrecorded = false;
+      this.#arm(backoffDelay(0));
+      return true;
+    } catch (error) {
+      this.deps.onError?.(error);
+      return false;
+    } finally {
+      this.running = false;
+    }
+  }
+
   /** One runner: drain, checkpoint, fresh check, then reopen or re-arm. Refuses a parallel run. */
   async resume(): Promise<boolean> {
     if (this.disposed || this.running) return false;

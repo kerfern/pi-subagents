@@ -276,6 +276,8 @@ let rootBinding: RootBinding | undefined;
 let rootWake: RootWake | undefined;
 /** The one in-flight wake construction, so a second enabled call does not race a second store. */
 let rootWakeInit: Promise<void> | undefined;
+/** Detaches the pause watcher when the root is reset (tests) or the wake machine is replaced. */
+let stopWakeWatch: (() => void) | undefined;
 
 function resolveCoordinator(host: QuotaGuardHost, config?: QuotaGuardConfig): GatedCoordinator | undefined {
   if (host.coordinator && typeof host.coordinator.gatedFetch === 'function') return host.coordinator;
@@ -400,7 +402,25 @@ function resolveWake(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
       });
       rootWake = wake;
       host.wake ??= wake;
+      // Installed before `start()` so a pause that lands while the store is still loading is caught,
+      // but inert until the restore has finished: a reinstated pause must not be rewritten as a fresh
+      // one. The listener is deliberately narrow - an automatic hold only - and the wake machine's
+      // running latch collapses repeats.
+      let watching = false;
+      // The ROOT snapshot reads `open` for a provider-local hold, so the trigger is the provider
+      // states; `recordPause` then decides whether the hold is worth recording (manual intent is not).
+      const heldNow = () => (['openai-codex', 'commandcode'] as const).some((providerId) => {
+        const provider = fleet.snapshot(providerId);
+        return provider.state !== 'open' || provider.automaticReason !== undefined;
+      });
+      stopWakeWatch = fleet.subscribe(() => {
+        if (!watching || !heldNow()) return;
+        void wake.recordPause();
+      });
       await wake.start();
+      watching = true;
+      // Nothing was restored, so a pause that arrived during the load is still unrecorded.
+      if (wake.status() === null) void wake.recordPause();
     } catch (error) {
       // Fail closed: an enabled guard whose durability layer cannot initialise must not look healthy.
       lastInstallFailure = error instanceof Error ? error : new Error(String(error));
@@ -645,6 +665,8 @@ export function quotaGuardRootBinding(): RootBinding | undefined {
 
 /** Test seam: return the module to its import-inert state, dropping the coordinator and wake machine. */
 export async function resetQuotaGuardStateForTest(): Promise<void> {
+  stopWakeWatch?.();
+  stopWakeWatch = undefined;
   const pending = rootWakeInit;
   const wake = rootWake;
   rootWakeInit = undefined;

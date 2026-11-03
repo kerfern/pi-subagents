@@ -1228,3 +1228,64 @@ test('durability ceiling: an empty checkpoint list is the same refusal, not a wr
     await rm(dir, { recursive: true, force: true });
   }
 });
+// --- a fresh pause is recorded (#14 wiring) ----------------------------------------------------
+// Before this, only a pause that already had a manifest was durable: the checkpoint the restore path
+// needs was never written for a pause that happened in this process.
+
+test('recordPause writes a durable checkpoint for a fresh automatic pause', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wake-'));
+  const store = await openStore(dir, 'root-record');
+  const fleet = new FleetLatch('root-record');
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  const written: { id: string; digest: string }[] = [];
+
+  const wake = new RootWake({
+    fleet,
+    store,
+    policy: DEFAULT_POLICY,
+    now: () => Date.parse('2026-11-13T10:00:00.000Z'),
+    check: async () => null,
+    checkpoint: async () => {
+      written.push({ id: 'a'.repeat(64), digest: 'a'.repeat(64) });
+      return written;
+    },
+    schedule: () => ({ cancel: () => {} }),
+  });
+
+  assert.equal(await wake.recordPause(), true);
+  const manifest = await store.read();
+  assert.equal(manifest?.state, 'paused');
+  assert.equal(manifest?.reason, 'reserve');
+  assert.deepEqual(manifest?.checkpoints.map(entry => entry.id), ['a'.repeat(64)]);
+  assert.deepEqual(manifest?.quorum, [], 'an unenumerable quorum is recorded empty, so nothing reopens automatically');
+  assert.equal(wake.status()?.durable, true);
+  await wake.dispose();
+  await store.close();
+});
+
+test('recordPause refuses a manual hold, an open fleet, and a checkpoint that cannot be named', async () => {
+  const store = await openStore(await mkdtemp(join(tmpdir(), 'wake-')), 'root-refuse');
+  const fleet = new FleetLatch('root-refuse');
+  const errors: unknown[] = [];
+  const wake = new RootWake({
+    fleet,
+    store,
+    policy: DEFAULT_POLICY,
+    now: () => Date.parse('2026-11-13T10:00:00.000Z'),
+    check: async () => null,
+    checkpoint: async () => { throw new Error('no session position'); },
+    schedule: () => ({ cancel: () => {} }),
+    onError: (error: unknown) => { errors.push(error); },
+  });
+
+  assert.equal(await wake.recordPause(), false, 'an open fleet has nothing to record');
+  fleet.pauseManual('all');
+  assert.equal(await wake.recordPause(), false, 'a manual hold is operator intent, not a wake candidate');
+  fleet.clearManual('all');
+  fleet.pauseAutomatic('commandcode', 'reserve');
+  assert.equal(await wake.recordPause(), false);
+  assert.equal(wake.status(), null, 'nothing durable may be reported when nothing was written');
+  assert.equal(errors.length, 1);
+  await wake.dispose();
+  await store.close();
+});

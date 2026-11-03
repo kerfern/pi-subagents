@@ -69,9 +69,16 @@ function isUtcIso(value: unknown): value is string {
     && !Number.isNaN(Date.parse(value));
 }
 
-/** Validate a quorum array: dense, non-empty, unique, non-empty identities. */
+/**
+ * Validate a quorum array: dense, unique, non-empty identities.
+ *
+ * An EMPTY quorum is meaningful, not missing: it records a pause whose scope identities the guard
+ * could not enumerate, so nothing may reopen it automatically. `quorumComplete` in wake.ts answers
+ * `false` for every candidate, which is exactly "operator resume only" - the safe reading, because a
+ * fabricated identity list could reopen a lane nobody verified.
+ */
 function checkQuorum(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length === 0) throw new Error('quorum must be a non-empty array');
+  if (!Array.isArray(value)) throw new Error('quorum must be an array');
   const out: string[] = [];
   const seen = new Set<string>();
   for (let index = 0; index < value.length; index++) {

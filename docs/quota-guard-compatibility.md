@@ -152,7 +152,9 @@ Two other refusals are worth recognizing:
   handing over an empty list, `status.wake.durable` is `false`, `/quota-guard status` prints
   `(not durable)`, and a restart brings the root back open. Restoration never fabricates a position:
   a checkpoint from another session file, a missing anchor, a cancelled navigation, or a landing with
-  a different projection is refused and the guard stays held.
+  a different projection is refused and the guard stays held. A recorded pause always carries an
+  empty quorum until a scope identity is verified, which means nothing reopens it automatically:
+  recovery is an explicit `/quota-guard restore`, never a timer.
 - For a provider whose automatic guard is ON, a fresh check can only re-read scopes the guard has
   **actually seen**. The reserve estimator is keyed by lane and the account FIFO's lane set is
   private, so the guard retains the last scope it was handed (credential included, in memory only)
