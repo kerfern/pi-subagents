@@ -24,9 +24,9 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=1.0.4",
-    "@earendil-works/pi-coding-agent": ">=1.0.4",
-    "@earendil-works/pi-tui": ">=1.0.4",
+    "@earendil-works/pi-ai": ">=1.5.0",
+    "@earendil-works/pi-coding-agent": ">=1.5.0",
+    "@earendil-works/pi-tui": ">=1.5.0",
     "@sinclair/typebox": "*",
     "typebox": "*"
   },
@@ -54,9 +54,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@earendil-works/pi-ai": "1.0.4",
-    "@earendil-works/pi-coding-agent": "1.0.4",
-    "@earendil-works/pi-tui": "1.0.4",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@types/node": "^25.5.0",
     "@vitest/coverage-istanbul": "^4.1.11",
     "typescript": "^6.0.0",

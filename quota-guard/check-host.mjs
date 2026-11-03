@@ -13,7 +13,6 @@
 // and no request leaves the machine.
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -21,14 +20,28 @@ const KNOWN_GLOBAL_HOST = '/Users/kerf/.local/lib/node_modules/@earendil-works/p
 const SYNTHETIC_KEY = 'synthetic-not-a-real-key';
 const REQUIRED_APIS = ['openai-codex-responses', 'openai-completions', 'anthropic-messages'];
 
-/** Resolve the installed host: explicit PI_HOST_PATH, then resolution, then the well-known global path. */
+/** Resolve explicit PI_HOST_PATH first, then the known global host, then the local dev dependency. */
 export async function resolveHost() {
   const candidates = [];
   if (process.env.PI_HOST_PATH) candidates.push(process.env.PI_HOST_PATH);
+  const globalPackagePath = join(KNOWN_GLOBAL_HOST, 'package.json');
+  candidates.push(globalPackagePath);
   try {
-    candidates.push(createRequire(import.meta.url).resolve('@earendil-works/pi-coding-agent/package.json'));
-  } catch { /* not a local dependency; the global path below is the normal case */ }
-  candidates.push(join(KNOWN_GLOBAL_HOST, 'package.json'));
+    let directory = dirname(fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')));
+    while (true) {
+      const packagePath = join(directory, 'package.json');
+      if (existsSync(packagePath)) {
+        const pkg = JSON.parse(await readFile(packagePath, 'utf8'));
+        if (pkg.name === '@earendil-works/pi-coding-agent') {
+          candidates.push(packagePath);
+          break;
+        }
+      }
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  } catch { /* local dev dependency unavailable */ }
 
   for (const candidate of candidates) {
     const packagePath = candidate.endsWith('package.json') ? candidate : join(candidate, 'package.json');
@@ -38,9 +51,23 @@ export async function resolveHost() {
     // pi-ai physically nests under the host package (and may also exist at the top level).
     const nested = join(root, 'node_modules', '@earendil-works', 'pi-ai');
     const piAiRoot = existsSync(nested) ? nested : join(dirname(root), 'pi-ai');
-    return { packagePath, root, piAiRoot, name: pkg.name, version: pkg.version };
+    let source = 'local';
+    if (process.env.PI_HOST_PATH && candidate === process.env.PI_HOST_PATH) source = 'explicit';
+    else if (candidate === globalPackagePath) source = 'global';
+    return { packagePath, root, piAiRoot, name: pkg.name, version: pkg.version, source };
   }
   throw new Error(`host not found: set PI_HOST_PATH, or install @earendil-works/pi-coding-agent (tried ${candidates.join(', ')})`);
+}
+
+/** Load the resolved host runtime and real provider adapters for node:test conformance. */
+export async function loadHostContractModules(resolvedHost) {
+  const host = resolvedHost ?? await resolveHost();
+  const [{ ModelRuntime }, { stream: completions }, { stream: codex }] = await Promise.all([
+    import(pathToFileURL(join(host.root, 'dist', 'index.js')).href),
+    import(pathToFileURL(join(host.piAiRoot, 'dist', 'api', 'openai-completions.js')).href),
+    import(pathToFileURL(join(host.piAiRoot, 'dist', 'api', 'openai-codex-responses.js')).href),
+  ]);
+  return { host, ModelRuntime, completions, codex };
 }
 
 const result = (name, ok, detail, kind = 'runtime') => ({ name, ok: ok === true, detail, kind });
@@ -367,8 +394,19 @@ export async function checkDispatchNegativeControl(host) {
     broken.ok ? 'the dispatch check PASSED a transport that cannot work - it is unsound' : 'a broken transport fails the dispatch check', 'static');
 }
 
+/** Prevent adapter drift from falling back to live global fetch during this offline probe. */
+export async function withBlockedGlobalFetch(operation) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('quota-guard host checker blocked unexpected global fetch'); };
+  try {
+    return await operation();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 export async function runChecks(host) {
-  return [
+  return await withBlockedGlobalFetch(async () => [
     await checkFetchReachesFinalRequest(host),
     await checkRuntimeDispatchReachesInjectedFetch(host),
     await checkDispatchNegativeControl(host),
@@ -379,7 +417,7 @@ export async function runChecks(host) {
     await checkRequiredApis(host),
     await checkPublicGetAuth(host),
     await checkNegativeControl(host),
-  ];
+  ]);
 }
 
 async function main() {
