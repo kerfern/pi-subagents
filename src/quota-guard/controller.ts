@@ -81,6 +81,16 @@ export interface ProviderFleetSnapshot extends FleetSnapshot {
   manual: boolean;
   manualTarget?: GuardTarget;
 }
+/** Durable part of the latch: holds and intent only, never counters or leases. */
+export interface FleetStateExport {
+  legacyReason?: PauseReason;
+  manualAll: boolean;
+  manualProviders: readonly GuardedProvider[];
+  automatic: readonly { providerId: GuardedProvider; reason: PauseReason }[];
+}
+
+const REASONS: ReadonlySet<PauseReason> = new Set(['threshold', 'reserve', 'unavailable', 'identity', 'manual']);
+
 interface Waiter { provider?: GuardedProvider; resume: () => void; detach: () => void }
 
 /** One original-root fleet. Orchestration dependencies use wait(), never a coding lease. */
@@ -351,6 +361,72 @@ export class FleetLatch {
     this.legacyReason = reason;
     if (reason === 'manual') this.manualAllGeneration++;
     this.notify();
+  }
+
+  /**
+   * Export the parts of the latch that survive a restart: root hold, per-provider holds, and manual
+   * intent. Counters and leases are deliberately absent - no work is in flight in a new process, and a
+   * restored count would be a claim about an attempt that no longer exists.
+   */
+  exportState(): FleetStateExport {
+    return {
+      ...(this.legacyReason !== undefined ? { legacyReason: this.legacyReason } : {}),
+      manualAll: this.manualAll,
+      manualProviders: [...this.manualProviders],
+      automatic: [...this.automatic].map(([providerId, reason]) => ({ providerId, reason })),
+    };
+  }
+
+  /**
+   * Reapply an exported state to a freshly constructed latch. Holds only ever close, so restoration can
+   * never open a fleet that a record says was held. Refuses while work is admitted, and refuses a state
+   * that is not internally consistent rather than repairing it.
+   */
+  restoreState(state: FleetStateExport): void {
+    if (this.inferences !== 0 || this.coding !== 0) {
+      throw new Error('Fleet restoration refused while work is admitted');
+    }
+    if (state === null || typeof state !== 'object') throw new Error('Fleet restoration requires a state object');
+    if (typeof state.manualAll !== 'boolean') throw new Error('Fleet restoration requires manualAll');
+    if (state.legacyReason !== undefined && !REASONS.has(state.legacyReason)) {
+      throw new Error('Fleet restoration refuses an unknown root reason');
+    }
+    if (!Array.isArray(state.manualProviders)) throw new Error('Fleet restoration requires manualProviders');
+    if (!Array.isArray(state.automatic)) throw new Error('Fleet restoration requires automatic holds');
+
+    const providers: GuardedProvider[] = ['openai-codex', 'commandcode'];
+    for (const providerId of state.manualProviders) {
+      if (!providers.includes(providerId)) throw new Error(`Fleet restoration refuses unknown provider ${String(providerId)}`);
+    }
+    for (const entry of state.automatic) {
+      if (!entry || !providers.includes(entry.providerId)) throw new Error('Fleet restoration refuses an unknown automatic provider');
+      // `manual` is intent, not an automatic pause: a persisted record may not smuggle it in here.
+      if (entry.reason === 'manual') throw new Error('Fleet restoration refuses manual as an automatic reason');
+      if (!REASONS.has(entry.reason)) throw new Error('Fleet restoration refuses an unknown automatic reason');
+    }
+
+    if (state.legacyReason !== undefined) {
+      this.legacyReason = state.legacyReason;
+      this.rootGeneration++;
+      if (state.legacyReason === 'manual') this.manualAllGeneration++;
+    }
+    if (state.manualAll) {
+      this.manualAll = true;
+      this.rootGeneration++;
+      this.manualAllGeneration++;
+    }
+    for (const providerId of state.manualProviders) {
+      this.manualProviders.add(providerId);
+      this.bumpManualProvider(providerId);
+    }
+    for (const entry of state.automatic) {
+      if (entry.reason === 'manual') continue;
+      this.automatic.set(entry.providerId, entry.reason);
+    }
+    for (const providerId of providers) this.bumpProvider(providerId);
+    if (this.legacyReason !== undefined || state.manualAll || state.manualProviders.length || state.automatic.length) {
+      this.notify();
+    }
   }
 
   async tryResume(freshCheck: () => Promise<boolean>): Promise<boolean> {

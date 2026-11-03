@@ -140,18 +140,19 @@ Two other refusals are worth recognizing:
   `quotaGuardCommandCodeEnabled` is OFF, dispatch is intentionally unguarded (manual pause still
   applies). This is deliberate and dated, not a silent bypass: see
   [CommandCode's quota surface](#commandcodes-quota-surface-live-status).
-- **Durability ceiling: a *fresh* pause is not recorded at all.** A pause reaches the durable store
-  only when it can name at least one checkpoint, and nothing in the guard can enumerate pending
-  effects yet. The store refuses a checkpoint-less pause by design, so the guard raises
-  `CheckpointUnavailableError` and records nothing, rather than handing over an empty checkpoint list
-  and letting the store's validation reject it — the refusal is deliberate, not incidental. Concretely,
-  **after a restart a fresh pause is lost: its reason, its generation and its resume deadline are
-  gone, no pending continuation is restored, and a paused root comes back open rather than paused.**
-  Only a pause already present in a manifest (with a checkpoint in it) is reinstated, exactly as
-  before. Where the wake machine refuses to record a pause, `status.wake.durable` is `false` and
-  `/quota-guard status` prints `(not durable)`; with no manifest at all it reports `wake: null`. The
-  guard deliberately does not fabricate a checkpoint id to make a pause look restorable: a reinstated
-  pause that cannot name the work it was waiting for would be worse than the honest gap.
+- **Durability: what a pause records, and what it cannot resume.** With `quotaGuardStateDir` set and
+  a persisted session bound, a pause writes a checkpoint naming the session position (file, anchor
+  entry, entry count, projection digest) plus the holds and manual intent. `/quota-guard checkpoints`
+  lists them and `/quota-guard restore <id>` moves the session to that anchor through Pi's own tree
+  navigation and reapplies the holds, then proves the landing by projection digest. **What that does
+  not do is resume work:** an interrupted inference, a tool side effect already committed, and a
+  subagent process stay lost, and the checkpoint says so in its `lost` list, which the restore message
+  repeats. Without `stateDir`, or when the session is not persisted (no file on disk, no entry to
+  anchor), no checkpoint can be written: the guard raises `CheckpointUnavailableError` rather than
+  handing over an empty list, `status.wake.durable` is `false`, `/quota-guard status` prints
+  `(not durable)`, and a restart brings the root back open. Restoration never fabricates a position:
+  a checkpoint from another session file, a missing anchor, a cancelled navigation, or a landing with
+  a different projection is refused and the guard stays held.
 - For a provider whose automatic guard is ON, a fresh check can only re-read scopes the guard has
   **actually seen**. The reserve estimator is keyed by lane and the account FIFO's lane set is
   private, so the guard retains the last scope it was handed (credential included, in memory only)
@@ -496,7 +497,7 @@ dispatch until it hears one — silence is not OFF.
 
 **Three optional keys, and what happens without them:**
 
-- `quotaGuardStateDir` — an absolute path the guard may keep its durable pause/wake record in (created `0700` / `0600`, secret-free). Supplied, a pause **already recorded** in that directory is reinstated across a restart, and its deadline, backoff index and checkpoints are what `status.wake` reports. A **fresh** pause made in this session is not recorded, because it cannot name a checkpoint (see the durability ceiling under [Honest limits](#honest-limits)), so it is gone after a restart. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. That is a documented limitation, not a silent failure. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
+- `quotaGuardStateDir` — an absolute path the guard keeps its durable pause, wake and checkpoint records in (created `0700` / `0600`, secret-free). Supplied, a pause records a checkpoint naming the session position and the holds, and `/quota-guard checkpoints` / `/quota-guard restore <id>` reinstate them after a restart; its deadline, backoff index and checkpoint ids are what `status.wake` reports. Two things still stop a record being written: a session with no persisted file or no entry to anchor, and an unset directory. Where nothing is recorded, `status.wake.durable` is `false` and a restart brings the root back open. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
 - `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number strictly greater than `0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. A seed of `0` is refused for the same reason an unknown reserve is never treated as zero: for a metered window no dispatch burns nothing, so accepting `0` would silently disable the protection this number exists to provide. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
 

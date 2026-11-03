@@ -375,20 +375,17 @@ function resolveWake(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
         // confirmed from a single read. `null` is the honest answer and keeps the root closed;
         // fabricating a quorum could reopen it on evidence nobody verified.
         check: async (): Promise<WakeCheck | null> => null,
-        // Durability ceiling, stated rather than implied: the guard cannot enumerate pending effects
-        // yet, so it has no checkpoint to name, and the store refuses a checkpoint-less pause by design
-        // (a pause whose interrupted work cannot be named cannot be restored). Returning an empty list
-        // would leave that refusal for the store's validation to discover; this raises the reason
-        // itself, and the wake machine records it as an unrecorded pause (`status.wake.durable: false`)
-        // instead of writing anything. A fresh pause is therefore not durable: after a restart its
-        // reason, generation and resume deadline are gone and no pending continuation is restored.
-        // See docs/quota-guard-compatibility.md.
-        checkpoint: async (): Promise<readonly { id: string; digest: string }[]> => {
+        // A host that can name the session position supplies the checkpoints; without one there is
+        // nothing durable to write, and the store refuses a checkpoint-less pause by design (a pause
+        // whose interrupted work cannot be named cannot be restored). Raising the reason itself keeps
+        // the wake machine honest: it records the pause as unrecorded (`status.wake.durable: false`)
+        // instead of writing something it cannot restore.
+        checkpoint: config?.checkpoint ?? (async (): Promise<readonly { id: string; digest: string }[]> => {
           throw new CheckpointUnavailableError(
-            `Quota guard: no durable checkpoints for root ${rootId} - the owning component cannot yet `
-            + 'enumerate pending effects, so a pause is not recorded and does not survive a restart',
+            `Quota guard: no durable checkpoints for root ${rootId} - nothing bound a session position, `
+            + 'so a pause is not recorded and does not survive a restart',
           );
-        },
+        }),
         // The real timer in production. `unref` keeps a pending deadline from pinning a process that
         // has nothing else to do; RootWake owns cancellation through the returned handle.
         schedule: (delayMs: number, run: () => void) => {
@@ -453,7 +450,7 @@ function describe(status: QuotaGuardStatus): string {
 function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void {
   if (typeof host.registerCommand !== 'function') return;
   host.registerCommand('quota-guard', {
-    description: 'Quota guard: on|off|pause|resume [all|codex|commandcode], or show status',
+    description: 'Quota guard: on|off|pause|resume [all|codex|commandcode] | restore <id> | checkpoints, or show status',
     handler: async (args: string, ctx?: unknown) => {
       const tokens = (args ?? '').trim().split(/\s+/).filter(Boolean);
       const sub = tokens[0] ?? 'status';
@@ -461,13 +458,16 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
       const validTargets: readonly string[] = ['all', 'codex', 'commandcode'];
       const invalidTarget = (sub === 'pause' || sub === 'resume' || sub === 'on' || sub === 'off')
         && (tokens.length > 2 || (targetToken !== undefined && !validTargets.includes(targetToken)));
+      const invalidRestore = sub === 'restore' && tokens.length !== 2;
       const controls = quotaGuardControls();
       const runtimeUnavailable = 'Quota guard: not installed; run /quota-guard on [all|codex|commandcode] and restart pi.';
       let message: string;
       let notificationLevel: 'info' | 'warning' = 'info';
-      if (invalidTarget || (sub === 'enable' && tokens.length > 1)
+      if (invalidRestore) {
+        message = 'Quota guard: restore needs exactly one checkpoint id; run /quota-guard checkpoints to list them.';
+      } else if (invalidTarget || (sub === 'enable' && tokens.length > 1)
         || (sub === 'status' && tokens.length > 1)) {
-        message = 'Quota guard: invalid target or arguments; use on|off|pause|resume [all|codex|commandcode].';
+        message = 'Quota guard: invalid target or arguments; use on|off|pause|resume [all|codex|commandcode] | restore <id> | checkpoints.';
       } else {
         const publicTarget = (targetToken ?? 'all') as GuardTarget;
         const target = fleetTarget(publicTarget);
@@ -518,6 +518,31 @@ function registerCommand(host: QuotaGuardHost, config?: QuotaGuardConfig): void 
           case 'status':
             message = controls ? describe(controls.status()) : 'Quota guard: not installed.';
             break;
+          case 'restore': {
+            const restore = config?.restore;
+            if (!restore) {
+              message = 'Quota guard: restoration is unavailable in this session.';
+              notificationLevel = 'warning';
+              break;
+            }
+            const result = await restore(tokens[1] as string, ctx);
+            message = result.message;
+            if (!result.ok) notificationLevel = 'warning';
+            break;
+          }
+          case 'checkpoints': {
+            const list = config?.checkpoints;
+            if (!list) {
+              message = 'Quota guard: no checkpoint source is bound in this session.';
+              notificationLevel = 'warning';
+              break;
+            }
+            const found = await list(ctx);
+            message = found.length
+              ? `Quota guard checkpoints (newest first): ${found.map(entry => `${entry.id.slice(0, 12)}… @ ${entry.createdAt}`).join(', ')}`
+              : 'Quota guard: no checkpoints recorded for this root.';
+            break;
+          }
           default:
             message = controls ? describe(controls.status()) : 'Quota guard: not installed.';
         }
@@ -551,6 +576,16 @@ export interface QuotaGuardConfig {
   reserveUnits?: ReadonlyMap<string, number>;
   /** Providers with automatic quota guarding enabled; omitted preserves legacy both-on behavior. */
   guardedProviders?: readonly GuardedProvider[];
+  /**
+   * Durable checkpoints for a pause: a host that can name the session position supplies these, and the
+   * wake machine then records a real, restorable pause. Absent, a fresh pause stays explicitly
+   * unrecorded rather than writing a checkpoint nothing could apply.
+   */
+  checkpoint?: (generation: number) => Promise<readonly { id: string; digest: string }[]>;
+  /** Apply a checkpoint by id: move the session to its anchor and reinstate its holds. */
+  restore?: (id: string, ctx?: unknown) => Promise<{ ok: boolean; message: string }>;
+  /** Checkpoints that could be applied here, newest first. */
+  checkpoints?: (ctx?: unknown) => Promise<readonly { id: string; createdAt: string }[]>;
 }
 
 /**

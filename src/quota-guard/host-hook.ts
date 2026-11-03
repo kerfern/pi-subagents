@@ -8,6 +8,14 @@ import type { GuardedProvider } from './types.ts';
 /** The harness publishes this on globalThis after scrubbing credentials and before pi starts. */
 export const RUNTIME_HOOK_KEY = Symbol.for('pi-harness:runtime-hook-v1');
 
+/** The host the harness handed over at install time, for records that name what was running. */
+let boundHost: { name?: string; version?: string } | undefined;
+
+/** `undefined` means no install happened, so nothing may claim a host identity. */
+export function hostIdentity(): { name?: string; version?: string } | undefined {
+  return boundHost;
+}
+
 export interface HarnessHookTarget {
   prototype: object;
   host: { name: string; version: string; packagePath: string };
@@ -103,6 +111,7 @@ export async function installGuardedRuntimeViaHook(options: HookInstallOptions):
   // hook would refuse the install. A rejected declaration aborts before any decoration.
   await declareStartupViaHook(declaredProviders(options.guardedProviders), options.source ?? globalThis);
   return hook.install(async ({ prototype, host: hostInfo }) => {
+    boundHost = { ...(hostInfo?.name !== undefined ? { name: hostInfo.name } : {}), ...(hostInfo?.version !== undefined ? { version: hostInfo.version } : {}) };
     // Gate activation on what can actually be seen. A missing seam must stop an enabled guard here,
     // not surface later as traffic that is quietly not being gated.
     const shape = prototype as { stream?: unknown; streamSimple?: unknown; getAuth?: unknown };

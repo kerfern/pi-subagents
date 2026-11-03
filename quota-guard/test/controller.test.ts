@@ -344,3 +344,36 @@ test('a restored pause still requires a fresh check before it reopens', async ()
   assert.equal(fleet.snapshot().state, 'open');
   assert.equal(checked, 2);
 });
+
+// --- durable state export/restore (#14) -------------------------------------------------------
+// A restart must be able to reinstate holds without inventing counters, and must never open a fleet
+// a record says was closed.
+
+test('exportState/restoreState reinstate holds and manual intent, never counters', () => {
+  const source = new FleetLatch('root-export');
+  source.pause('threshold');
+  source.pauseManual('commandcode');
+  source.pauseAutomatic('openai-codex', 'reserve');
+
+  const exported = source.exportState();
+  assert.equal('inferences' in exported, false, 'no counter may survive a restart');
+  assert.equal('coding' in exported, false);
+
+  const restored = new FleetLatch('root-export');
+  restored.restoreState(exported);
+  assert.equal(restored.snapshot().state, 'paused');
+  assert.equal(restored.snapshot().reason, 'threshold');
+  assert.equal(restored.snapshot('commandcode').manualTarget, 'commandcode');
+  assert.equal(restored.snapshot('openai-codex').automaticReason, 'reserve');
+  assert.deepEqual(restored.exportState(), exported, 'export is a fixed point');
+});
+
+test('restoreState refuses work in flight, unknown providers and smuggled manual intent', () => {
+  const state = { legacyReason: undefined, manualAll: true, manualProviders: [], automatic: [] } as const;
+
+  assert.throws(() => new FleetLatch('root-x').restoreState({ ...state, manualProviders: ['nope'] as never }), /unknown provider/);
+  assert.throws(() => new FleetLatch('root-x').restoreState({ ...state, automatic: [{ providerId: 'commandcode', reason: 'manual' }] }), /refuses manual/);
+  assert.throws(() => new FleetLatch('root-x').restoreState({ ...state, automatic: [{ providerId: 'commandcode', reason: 'bogus' as never }] }), /unknown automatic reason/);
+  assert.throws(() => new FleetLatch('root-x').restoreState({ ...state, legacyReason: 'bogus' as never }), /unknown root reason/);
+  assert.throws(() => new FleetLatch('root-x').restoreState(null as never), /requires a state object/);
+});

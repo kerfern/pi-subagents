@@ -46,7 +46,8 @@ import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import type { CodexLimit } from "./quota-guard/adapters.js";
-import { isQuotaGuardEnabled, quotaGuardExtension, setQuotaGuardEnabled } from "./quota-guard/index.js";
+import { isQuotaGuardEnabled, quotaGuardExtension, quotaGuardRootBinding, setQuotaGuardEnabled } from "./quota-guard/index.js";
+import { captureCheckpoint, type NavigableSession, pruneRestorePoints, restoreCandidates, restoreCheckpoint, type SessionSource } from "./quota-guard/session-checkpoint.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, saveQuotaGuardProviderSetting, snapshotQuotaGuardSettings, type ToolDescriptionMode } from "./settings.js";
@@ -4451,6 +4452,46 @@ Write the file using the write tool. Only write the file, nothing else.`;
     ...(quotaGuardStateDir !== undefined ? { stateDir: quotaGuardStateDir } : {}),
     ...(quotaGuardCodexLimits !== undefined ? { codexLimits: quotaGuardCodexLimits } : {}),
     ...(quotaGuardReserveUnits !== undefined ? { reserveUnits: new Map(Object.entries(quotaGuardReserveUnits)) } : {}),
+    // Durability is bound to the live session: a pause is only recorded when a real position can be
+    // named, and restoration is a command-time navigation, never something a decorator performs.
+    ...(quotaGuardStateDir !== undefined ? {
+      checkpoint: async () => {
+        const binding = quotaGuardRootBinding();
+        const ctx = currentCtx;
+        if (!binding || !ctx) {
+          throw new Error("Quota guard: no session-bound checkpoint source for this root");
+        }
+        try {
+          const written = await captureCheckpoint({
+            stateDir: quotaGuardStateDir as string,
+            rootId: binding.fleet.snapshot().rootId,
+            fleet: binding.fleet,
+            session: ctx.sessionManager as unknown as SessionSource,
+          });
+          await pruneRestorePoints(quotaGuardStateDir as string);
+          return written;
+        } catch (error) {
+          // An unpaused, empty or unpersisted session has nothing to anchor: the wake machine records
+          // the pause as unrecorded rather than writing a checkpoint nothing could apply.
+          throw error instanceof Error ? error : new Error(String(error));
+        }
+      },
+      restore: async (id, ctx) => {
+        const binding = quotaGuardRootBinding();
+        const command = ctx as unknown as NavigableSession | undefined;
+        if (!binding || !command?.navigateTree) {
+          return { ok: false, message: "Quota guard: restoration needs a command session; run it from /quota-guard restore <id>." };
+        }
+        return restoreCheckpoint({
+          stateDir: quotaGuardStateDir as string,
+          rootId: binding.fleet.snapshot().rootId,
+          fleet: binding.fleet,
+          session: command,
+          id,
+        });
+      },
+      checkpoints: async () => restoreCandidates(quotaGuardStateDir as string),
+    } : {}),
     persistProviderEnabled: (target, enabled) => {
       const result = saveQuotaGuardProviderSetting(
         target,

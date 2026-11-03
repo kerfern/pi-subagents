@@ -221,3 +221,35 @@ test('status does not advertise valid-looking entries from an all-or-nothing rej
   assert.doesNotMatch(message, /monthly=60|weekly=60/);
   assert.match(message, /no operator seed/i);
 });
+
+// --- restore/checkpoints command surface (#15) -------------------------------------------------
+test('restore and checkpoints are wired through the command, and refuse missing arguments', async () => {
+  const registered: { name: string; handler: (args: string, ctx?: unknown) => Promise<void> }[] = [];
+  const host = {
+    registerCommand: (name: string, options: { handler: (args: string, ctx?: unknown) => Promise<void> }) => {
+      registered.push({ name, handler: options.handler });
+    },
+  };
+  const restored: string[] = [];
+  quotaGuardExtension(host as never, {
+    guardedProviders: [],
+    persistProviderEnabled: () => ({ persisted: true }),
+    restore: async (id) => { restored.push(id); return { ok: true, message: `restored ${id.slice(0, 4)}` }; },
+    checkpoints: async () => [{ id: 'a'.repeat(64), createdAt: '2026-11-13T10:00:00.000Z' }],
+  });
+  const command = registered.find(entry => entry.name === 'quota-guard');
+  assert.ok(command);
+
+  const notify: { message: string; level?: string }[] = [];
+  const ctx = { ui: { notify: (message: string, level?: string) => { notify.push({ message, level }); } } };
+
+  await command.handler('restore', ctx as never);
+  assert.match(notify.at(-1)?.message ?? '', /restore needs exactly one checkpoint id/);
+
+  await command.handler(`restore ${'b'.repeat(64)}`, ctx as never);
+  assert.deepEqual(restored, ['b'.repeat(64)]);
+  assert.match(notify.at(-1)?.message ?? '', /restored bbbb/);
+
+  await command.handler('checkpoints', ctx as never);
+  assert.match(notify.at(-1)?.message ?? '', /aaaaaaaaaaaa…/);
+});

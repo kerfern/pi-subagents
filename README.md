@@ -742,6 +742,8 @@ The match is on the exact tool names `Workflow` (Claude Code's) and `SubagentWor
 | `/quota-guard pause [all|codex|commandcode]` | Immediately pause selected providers; admitted work finishes, new dispatch waits |
 | `/quota-guard resume [all|codex|commandcode]` | Resume — refused unless a fresh check is available |
 | `/quota-guard status` | Print the fleet snapshot (state, reason, active/inference/coding counts) and wake/backoff state |
+| `/quota-guard checkpoints` | List recorded checkpoints for this root, newest first (needs `quotaGuardStateDir`) |
+| `/quota-guard restore <id>` | Move the session to a checkpoint's anchor and reinstate its holds; refuses another session, a missing anchor, a cancelled navigation or a mismatched projection |
 
 It never force-aborts active work and never patches `globalThis.fetch`.
 
