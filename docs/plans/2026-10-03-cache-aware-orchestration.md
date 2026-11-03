@@ -254,7 +254,7 @@ Expected: faux-model paths pass deterministically; unknown modes and failed gate
 
 ## Task 7: Pilot, Compare, and Roll Back Safely
 
-**Files:** `docs/superpowers/plans/2026-10-03-cache-aware-orchestration.md`, local task snapshots/worktrees, each pilot task’s `.pi/workflow/<taskId>/` artifacts. Do not add real user task text or sensitive data to checked-in fixtures.
+**Files:** `docs/plans/2026-10-03-cache-aware-orchestration.md`, local task snapshots/worktrees, each pilot task’s `.pi/workflow/<taskId>/` artifacts. Do not add real user task text or sensitive data to checked-in fixtures.
 
 - [ ] Before runs, record the effective baseline models/efforts and current auth/account routing without credentials. Set `/subagent-model` to the verified reviewer/shared routes; preserve old session selections and a text-only rollback checklist.
 - [ ] Prepare 20–30 representative, non-sensitive tasks across routine edits, API changes, debugging, coupled refactors, and ambiguous/high-risk work. Define acceptance before execution; repeat runs where practical; use identical repository snapshots and isolated worktrees.

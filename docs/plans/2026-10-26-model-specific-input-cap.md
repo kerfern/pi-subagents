@@ -32,7 +32,7 @@ The config override and offline metadata checks are complete. Restart/reload alr
 
 - `~/.pi/agent/models.json` — runtime configuration.
 - `~/.pi/agent/models.json.before-haiku-context-20261026` — private pre-change backup.
-- `docs/superpowers/specs/2026-10-26-model-specific-input-cap-design.md` — approved behavior and limitations.
+- `docs/specs/2026-10-26-model-specific-input-cap-design.md` — approved behavior and limitations.
 - This plan.
 
 ## Verification evidence captured during implementation

@@ -89,7 +89,7 @@ storage (`store.read()` currently collapses both to `null`, which is not good en
 **Files:** `src/quota-guard/checkpoint.ts` (new), `store.ts`, `controller.ts`, `wake.ts`.
 **Interfaces:** `validateCheckpoint`, `readCheckpoint`, `writeCheckpoint`,
 `FleetLatch.exportState()/restoreState()`, `RootWake.recordPause()`.
-**Tests:** `quota-guard/test/checkpoint.test.ts` (new), `store.test.ts`, `wake.test.ts`.
+**Tests:** `test/quota-guard/checkpoint.test.ts` (new), `store.test.ts`, `wake.test.ts`.
 **Acceptance (offline):** write/read roundtrip across process reopen; file modes; unknown keys and
 secret-shaped values absent from disk; crash-boundary fault injection leaves either the old or the new
 checkpoint, never a partial one; stale generation rejected; historical session entries unchanged.
@@ -101,7 +101,7 @@ checkpoint, never a partial one; stale generation rejected; historical session e
 `restoreLanes/checkQuorum`; `/quota-guard restore <id>` reporting truthful recovery status.
 **Constraints:** do not await `session_start` inside decorator installation; do not weaken the startup
 barrier; refuse rebinding a root whose fleet is live.
-**Tests:** `quota-guard/test/production-wiring.test.ts`, `command-status.test.ts`,
+**Tests:** `test/quota-guard/production-wiring.test.ts`, `command-status.test.ts`,
 `test/quota-root-restore.test.ts` (new).
 **Acceptance:** premature dispatch refused; a cancelled restoration stays held; the projected context
 after `navigateTree` equals the checkpoint's projection digest.

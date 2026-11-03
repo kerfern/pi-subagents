@@ -191,8 +191,8 @@ Do not regress:
 Created this session, unstaged:
 
 ```text
-docs/superpowers/specs/2026-09-14-shared-subagent-model-routing-design.md
-docs/superpowers/handovers/2026-09-14-shared-subagent-model-routing-next-session.md
+docs/specs/2026-09-14-shared-subagent-model-routing-design.md
+docs/handovers/2026-09-14-shared-subagent-model-routing-next-session.md
 ```
 
 No implementation plan exists yet. Create it only after written-spec review using `writing-plans`.

@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Vitest, Node.js `node:test`, existing pi-harness runtime hook; no new dependencies.
 
-**Spec:** `docs/superpowers/specs/2026-10-11-quota-guard-provider-controls-design.md`
+**Spec:** `docs/specs/2026-10-11-quota-guard-provider-controls-design.md`
 
 ## Global Constraints
 
@@ -53,7 +53,7 @@
 
 **Files:**
 - Modify: `src/quota-guard/controller.ts`, `src/quota-guard/coordinator.ts`, `src/quota-guard/root-binding.ts`, and `src/quota-guard/root.ts` (`failIdentity`, `pauseAndThrow`, `resolveScope`).
-- Test: `quota-guard/test/controller.test.ts`, `coordinator.test.ts`, `root-binding.test.ts`, and `root.test.ts`.
+- Test: `test/quota-guard/controller.test.ts`, `coordinator.test.ts`, `root-binding.test.ts`, and `root.test.ts`.
 
 **Interfaces:**
 - Keep provider identities restricted to `openai-codex` and `commandcode`.
@@ -71,7 +71,7 @@
 
 **Files:**
 - Modify: `src/quota-guard/root.ts`, `index.ts`, `wake.ts`, `host-hook.ts`, `coordinator.ts`, and `controller.ts`.
-- Test: `quota-guard/test/root.test.ts`, `wake.test.ts`, `host-hook.test.ts`, `production-wiring.test.ts`, `root-binding.test.ts`, `loader.test.mjs`, `coordinator.test.ts`, and `controller.test.ts`.
+- Test: `test/quota-guard/root.test.ts`, `wake.test.ts`, `host-hook.test.ts`, `production-wiring.test.ts`, `root-binding.test.ts`, `loader.test.mjs`, `coordinator.test.ts`, and `controller.test.ts`.
 - Scope correction: `guardedProviders` must travel through the hook so Task 3 can select OFF providers without changing runtime interception; coordinator exposes synchronous manual-hold refusal for that OFF path. Legacy persisted `manual` is operator-owned, not an automatic wake candidate; explicit `resume all` may clear it and must atomically converge its stored manifest to open.
 
 **Interfaces:**
@@ -83,14 +83,14 @@
 - Add failing runtime/control tests for provider identity routing, OFF-provider manual holds, target-specific and all-target resume checks, and legacy wake safety.
 - From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/root.test.ts test/wake.test.ts test/host-hook.test.ts test/production-wiring.test.ts`; confirm red.
 - Implement only runtime control and wake integration. Do not add Task 3 command syntax or status formatting.
-- Run those focused tests and `node quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 2B.
+- Run those focused tests and `node scripts/quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 2B.
 
 ### Task 3: Wire provider controls, commands, and truthful status
 
 **Files:**
 - Modify: `src/quota-guard/index.ts` — `QuotaGuardConfig`, `QuotaGuardControls`, installation, command parser, status.
 - Modify: `src/index.ts` — pass resolved provider controls into the guard extension.
-- Test: `quota-guard/test/host-hook.test.ts`, `quota-guard/test/production-wiring.test.ts`, and new focused command/status tests if those files cannot express the cases clearly.
+- Test: `test/quota-guard/host-hook.test.ts`, `test/quota-guard/production-wiring.test.ts`, and new focused command/status tests if those files cannot express the cases clearly.
 
 **Interfaces:**
 - Add `GuardTarget = 'all' | 'codex' | 'commandcode'`; map `codex` to provider ID `openai-codex`.
@@ -102,7 +102,7 @@
 - From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/command-status.test.ts`; confirm the new command/status regressions fail before implementation.
 - Wire resolved settings into `quotaGuardExtension`. Register the command and runtime seam whenever at least one provider is guarded; while installed, apply manual holds to either known provider, including one whose automatic guard is OFF. If both providers resolve OFF, preserve inert default-OFF behavior and register no command or hook.
 - Implement target parsing, targeted pause/resume, and per-provider status; do not make unsupported CommandCode look admitted when its guard is ON.
-- From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/host-hook.test.ts test/production-wiring.test.ts test/command-status.test.ts`; run `node quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 3.
+- From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/host-hook.test.ts test/production-wiring.test.ts test/command-status.test.ts`; run `node scripts/quota-guard/check-host.mjs` from `pi-subagents`; confirm green, then commit Task 3.
 
 ### Task 4: Prove real main and subagent dispatch coverage
 
@@ -137,7 +137,7 @@
 
 - Run `npx vitest run test/settings.test.ts test/quota-subagent-runtime.test.ts` in `pi-subagents`.
 - From `pi-subagents/quota-guard`, run `node --test --test-timeout=10000 test/coordinator.test.ts test/controller.test.ts test/host-hook.test.ts test/production-wiring.test.ts`.
-- Run `npm run typecheck:quota`, `npx tsc --noEmit`, `node quota-guard/check-host.mjs`, and `npm run check` in `pi-subagents`.
+- Run `npm run typecheck:quota`, `npx tsc --noEmit`, `node scripts/quota-guard/check-host.mjs`, and `npm run check` in `pi-subagents`.
 - Run `npm test` in `pi-harness`.
 - Run `git diff --check`; confirm `git status --short` contains only intended files and report commits for each repo.
 - Request one reviewer pass over provider isolation, legacy precedence, manual pause composition, and real subagent-path proof; fix blocking findings and rerun affected checks.
@@ -145,5 +145,5 @@
 Verified 2026-10-17 on `main` (`2bdd0e8`): 104 tests (settings + subagent-runtime) and 91 tests
 (the four quota-guard files) passed, `npm run check` exited 0 with 287 quota-suite tests, `pi-harness`
 `npm test` passed 63, `npx tsc --noEmit` and `npm run typecheck:quota` both exited 0,
-`node quota-guard/check-host.mjs` passed 10/10, and one reviewer pass over provider isolation,
+`node scripts/quota-guard/check-host.mjs` passed 10/10, and one reviewer pass over provider isolation,
 legacy precedence, manual pause composition and real subagent-path proof returned ship.

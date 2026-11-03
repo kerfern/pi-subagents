@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript 6 (ES2022, strict), vitest 4, biome 2, Pi extension API (`@earendil-works/pi-coding-agent` 0.84.2, `@earendil-works/pi-tui`).
 
-**Spec:** `docs/superpowers/specs/2026-09-14-shared-subagent-model-routing-design.md`
+**Spec:** `docs/specs/2026-09-14-shared-subagent-model-routing-design.md`
 
 ## Global Constraints
 
