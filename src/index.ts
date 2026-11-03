@@ -4469,7 +4469,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
             session: ctx.sessionManager as unknown as SessionSource,
             // Handles only: an interrupted child's saved conversation stays addressable across the
             // restart. Nothing here opens a session or resumes a turn.
-            children: manager.listTombstones(),
+            children: manager.listReopenableChildren(16),
           });
           await pruneRestorePoints(quotaGuardStateDir as string);
           return written;

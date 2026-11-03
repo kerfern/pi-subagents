@@ -1681,8 +1681,11 @@ export class AgentManager {
     let adopted = 0;
     let skipped = 0;
     for (const entry of entries) {
-      const taken = this.takenHandles().has(entry.handle);
-      if (!entry.handle || !entry.sessionFile || taken || !isExistingFile(entry.sessionFile)) {
+      // Both names share one namespace, so an alias collision shadows a conversation just as a handle
+      // collision would - the mention would resolve to whichever the manager already had.
+      const taken = this.takenHandles();
+      if (!entry.handle || !entry.sessionFile || taken.has(entry.handle)
+        || (entry.alias !== undefined && taken.has(entry.alias)) || !isExistingFile(entry.sessionFile)) {
         skipped++;
         continue;
       }
@@ -1698,12 +1701,48 @@ export class AgentManager {
       adopted++;
     }
     // The same bound `tombstone()` applies: an adopted set must not be able to
-    // outgrow what a long session accumulates on its own.
+    // outgrow what a long session accumulates on its own. An entry evicted
+    // immediately is reported as skipped, not adopted - it is not addressable.
     while (this.tombstones.size > MAX_TOMBSTONES) {
       const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
       this.tombstones.delete(oldest.handle);
+      if (entries.some(entry => entry.handle === oldest.handle)) {
+        adopted--;
+        skipped++;
+      }
     }
     return { adopted, skipped };
+  }
+
+  /**
+   * Children a checkpoint can keep addressable: evicted conversations plus the
+   * top-level agents that are still in memory, because an interrupted child is
+   * an ordinary record at pause time, not a tombstone yet. Most recent first and
+   * already deduplicated by handle; checkpoints cap what they store.
+   */
+  listReopenableChildren(limit: number): AgentTombstone[] {
+    const seen = new Set<string>();
+    const out: AgentTombstone[] = [];
+    const push = (entry: AgentTombstone) => {
+      if (seen.has(entry.handle)) return;
+      seen.add(entry.handle);
+      out.push(entry);
+    };
+    for (const entry of [...this.tombstones.values()].sort((a, b) => b.completedAt - a.completedAt)) push(entry);
+    for (const record of this.listAgents()) {
+      if (record.parentAgentId !== undefined) continue;
+      if (!record.handle || !record.sessionFile || record.status === "queued") continue;
+      push({
+        handle: record.handle,
+        ...(record.alias !== undefined ? { alias: record.alias } : {}),
+        id: record.id,
+        type: record.type,
+        description: record.description,
+        sessionFile: record.sessionFile,
+        completedAt: record.completedAt ?? record.startedAt,
+      });
+    }
+    return out.slice(0, Math.max(0, limit));
   }
 
   listAgents(): AgentRecord[] {

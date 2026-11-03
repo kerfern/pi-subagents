@@ -143,7 +143,7 @@ export async function restoreCheckpoint(options: {
   const sessionId = view.getSessionId();
   const read = await readCheckpoint(stateDir, id, { rootId, sessionId });
   if (!read.ok) {
-    return { ok: false, message: `Quota guard: checkpoint ${id.slice(0, 12)}… cannot be applied (${read.reason}).` };
+    return { ok: false, message: `Quota guard: checkpoint ${id.slice(0, 12)}… cannot be applied (${read.reason}); nothing was changed.` };
   }
   const checkpoint = read.checkpoint;
   const file = view.getSessionFile();
@@ -154,11 +154,11 @@ export async function restoreCheckpoint(options: {
     return { ok: false, message: 'Quota guard: the checkpoint anchor is no longer in this session; refusing to guess a position.' };
   }
   if (fleet.snapshot().active !== 0) {
-    return { ok: false, message: 'Quota guard: refusing to restore while work is admitted; pause first and retry when idle.' };
+    return { ok: false, message: 'Quota guard: refusing to restore while work is admitted; wait for it to finish and retry.' };
   }
   const navigation = await session.navigateTree(checkpoint.session.anchorId, { summarize: false });
   if (navigation.cancelled) {
-    return { ok: false, message: 'Quota guard: navigation was cancelled; nothing was restored and the guard stays held.' };
+    return { ok: false, message: 'Quota guard: navigation was cancelled; nothing was restored.' };
   }
   const landed = projectionDigest(view.buildSessionProjection());
   if (landed !== checkpoint.session.projectionDigest) {

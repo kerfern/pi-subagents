@@ -179,9 +179,11 @@ export class RootWake {
       // provider-local while the ROOT snapshot still reads open, so the reason comes from whichever
       // provider is actually held.
       const root = this.deps.fleet.snapshot();
-      const held = (['openai-codex', 'commandcode'] as const)
-        .map(providerId => this.deps.fleet.snapshot(providerId))
-        .find(provider => provider.state !== 'open');
+      const providers = (['openai-codex', 'commandcode'] as const).map(providerId => this.deps.fleet.snapshot(providerId));
+      // An automatic hold wins over a manual one: otherwise a manually held Codex would mask an
+      // automatically paused CommandCode and the automatic hold would never be recorded.
+      const held = providers.find(provider => provider.automaticReason !== undefined)
+        ?? providers.find(provider => provider.state !== 'open');
       const reason = held?.automaticReason ?? held?.reason ?? root.reason;
       if (held === undefined || reason === undefined) return false;
       // A manual hold is operator intent, not an automatic recovery candidate.

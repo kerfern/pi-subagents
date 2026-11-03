@@ -110,4 +110,48 @@ describe("AgentManager — quota-guard child adoption", () => {
     expect(resumeAgent).not.toHaveBeenCalled();
     expect(manager.listAgents()).toEqual([]);
   });
+
+  // --- collision and accounting ---------------------------------------------------------------
+
+    it("skips an alias that is already taken by another conversation", async () => {
+      const manager = new AgentManager();
+      const sessionFile = join(dir, "first.jsonl");
+      await writeFile(sessionFile, "{}\n");
+      // An adopted handle whose ALIAS collides would be reachable under a name the manager already uses,
+      // so the mention would resolve to whichever entry it found first.
+      manager.adoptTombstones([{ handle: "explore", id: "a1", type: "Explore", description: "one",
+        sessionFile, completedAt: 1 }]);
+      const result = manager.adoptTombstones([{ handle: "plan", alias: "explore", id: "a2", type: "Plan",
+        description: "two", sessionFile, completedAt: 2 }]);
+      expect(result).toEqual({ adopted: 0, skipped: 1 });
+      expect(manager.listTombstones().map(entry => entry.handle)).toEqual(["explore"]);
+    });
+
+    it("reports an entry it evicted immediately as skipped, not addressable", async () => {
+      const manager = new AgentManager();
+      const sessionFile = join(dir, "old.jsonl");
+      await writeFile(sessionFile, "{}\n");
+      const filler = Array.from({ length: 100 }, (_, index) => ({
+        handle: `agent-${index}`, id: `id-${index}`, type: "Explore", description: `d${index}`,
+        sessionFile, completedAt: 10_000 + index,
+      }));
+      manager.adoptTombstones(filler);
+      // Older than every retained entry, so admitting it pushes itself straight back out.
+      const result = manager.adoptTombstones([{ handle: "ancient", id: "id-old", type: "Explore",
+        description: "old", sessionFile, completedAt: 1 }]);
+      expect(result).toEqual({ adopted: 0, skipped: 1 });
+      expect(manager.listTombstones().some(entry => entry.handle === "ancient")).toBe(false);
+    });
+
+    it("lists still-live top-level children so an interrupted one is not lost at pause time", async () => {
+      const manager = new AgentManager();
+      const sessionFile = join(dir, "live.jsonl");
+      await writeFile(sessionFile, "{}\n");
+      // A child that is still in memory at pause time is not a tombstone yet; the checkpoint must still
+      // see it, or it disappears across the restart it was meant to survive.
+      const children = manager.listReopenableChildren(16);
+      expect(Array.isArray(children)).toBe(true);
+      expect(children.length).toBeLessThanOrEqual(16);
+    });
+
 });

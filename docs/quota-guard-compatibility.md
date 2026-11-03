@@ -158,8 +158,14 @@ Two other refusals are worth recognizing:
   handles of interrupted **top-level** children whose transcripts still exist; a successful restore
   re-registers them so `@handle` can reopen that saved conversation on a new prompt. Adoption opens
   no session, sends no prompt and replays no completion, and an entry whose transcript is gone, or
-  whose handle is already live, is skipped and counted in the restore message. Nested, workflow and
-  worktree children are not retained.
+  whose handle is already live or aliased, is skipped and counted in the restore message. Nested,
+  workflow and worktree children are not retained.
+
+  One limitation is deliberate and documented rather than papered over: Pi's own tree navigation
+  resolves a **user or custom message** target to its parent. A checkpoint whose anchor is such an
+  entry therefore lands one step earlier, fails the projection comparison, and refuses the restore -
+  leaving the guard as it was. That is the safe outcome, not a silent off-by-one, and the message
+  says nothing was restored.
 - For a provider whose automatic guard is ON, a fresh check can only re-read scopes the guard has
   **actually seen**. The reserve estimator is keyed by lane and the account FIFO's lane set is
   private, so the guard retains the last scope it was handed (credential included, in memory only)
