@@ -44,7 +44,7 @@
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/",
     "check": "npm run lint && npm run typecheck && npm run typecheck:quota && npm run test && npm run test:quota",
-    "test:quota": "node --test --test-timeout=10000 test/quota-guard/*.test.ts",
+    "test:quota": "node --test --test-timeout=10000 test/quota-guard/*.test.ts test/quota-guard/*.test.mjs",
     "typecheck:quota": "tsc --noEmit -p tsconfig.quota.json",
     "mutate:quota": "node scripts/quota-guard/mutate-coordinator.mjs",
     "check:quota-host": "node scripts/quota-guard/check-host.mjs",

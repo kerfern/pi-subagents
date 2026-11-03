@@ -268,7 +268,7 @@ export interface SubagentsSettings {
    * closed forever. This seed is how the operator unblocks that first run: it is consulted ONLY where
    * the estimator has no observation, never as a default, and never blends with a calibrated number.
    *
-   * Window ids are visible from `node quota-guard/certify-live.mjs --dry-run`. A value that is too
+   * Window ids are visible from `node scripts/quota-guard/certify-live.mjs --dry-run`. A value that is too
    * small under-protects - the operator owns that risk.
    *
    * Entries must be finite numbers > 0 with non-empty ids (a zero reserve would be an unknown cost

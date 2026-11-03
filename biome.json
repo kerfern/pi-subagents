@@ -20,9 +20,7 @@
 	"files": {
 		"includes": [
 			"src/**/*.ts",
-			"test/**/*.ts",
-			"quota-guard/certify-live.mjs",
-			"quota-guard/test/certify-live.test.ts"
+			"test/**/*.ts"
 		]
 	}
 }
