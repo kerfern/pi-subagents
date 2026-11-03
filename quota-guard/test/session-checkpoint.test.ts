@@ -143,3 +143,83 @@ test('candidates are listed newest-first for the operator', async () => {
   assert.deepEqual(listed.map(entry => entry.id), [second[0].id, first[0].id]);
   assert.equal((await readCheckpoint(dir, first[0].id)).ok, true);
 });
+
+const CHILD = {
+  handle: 'explore',
+  id: 'agent-1',
+  type: 'Explore',
+  description: 'map the reader',
+  sessionFile: '/tmp/pi-child.jsonl',
+  completedAt: 1_700_000_000_000,
+};
+
+test('capture records child handles and restore adopts them once, reporting the counts', async () => {
+  const dir = await stateDir();
+  const fleet = new FleetLatch('root-1');
+  fleet.pause('threshold');
+  const [written] = await captureCheckpoint({
+    stateDir: dir,
+    rootId: 'root-1',
+    fleet,
+    session: session(),
+    // A child with no handle or no file leaves nothing to address, so capture keeps neither.
+    children: [CHILD, { ...CHILD, handle: '', sessionFile: '/tmp/pi-child-2.jsonl' }],
+  });
+
+  const recorded = await readCheckpoint(dir, written.id);
+  assert.equal(recorded.ok, true);
+  assert.deepEqual(recorded.ok && recorded.checkpoint.children, [CHILD]);
+
+  const live = session({ projection: { path: ['e1', 'e2', 'later'] } });
+  const command = {
+    sessionManager: live,
+    async navigateTree() {
+      live.setProjection({ path: ['e1', 'e2'] });
+      return { cancelled: false };
+    },
+  };
+  const calls: (readonly typeof CHILD[])[] = [];
+  const result = await restoreCheckpoint({
+    stateDir: dir,
+    rootId: 'root-1',
+    fleet: new FleetLatch('root-1'),
+    session: command,
+    id: written.id,
+    adopt: (children) => {
+      calls.push(children);
+      return { adopted: children.length, skipped: 0 };
+    },
+  });
+
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(calls, [[CHILD]], 'adopted exactly once, with the captured children');
+  assert.match(result.message, /Children: 1 addressable by @handle, 0 skipped\./);
+});
+
+test('a refused restore adopts nothing', async () => {
+  const dir = await stateDir();
+  const fleet = new FleetLatch('root-1');
+  const [written] = await captureCheckpoint({ stateDir: dir, rootId: 'root-1', fleet, session: session(), children: [CHILD] });
+
+  let adopted = 0;
+  const adopt = () => {
+    adopted++;
+    return { adopted, skipped: 0 };
+  };
+
+  const cancelled = { sessionManager: session(), navigateTree: async () => ({ cancelled: true }) };
+  const cancelledResult = await restoreCheckpoint({ stateDir: dir, rootId: 'root-1', fleet: new FleetLatch('root-1'), session: cancelled, id: written.id, adopt });
+  assert.equal(cancelledResult.ok, false);
+  assert.match(cancelledResult.message, /cancelled/);
+
+  const drifted = session({ projection: { path: ['elsewhere'] } });
+  const wrongLanding = { sessionManager: drifted, navigateTree: async () => ({ cancelled: false }) };
+  const driftedResult = await restoreCheckpoint({ stateDir: dir, rootId: 'root-1', fleet: new FleetLatch('root-1'), session: wrongLanding, id: written.id, adopt });
+  assert.equal(driftedResult.ok, false);
+  assert.match(driftedResult.message, /different projection/);
+
+  const unknown = await restoreCheckpoint({ stateDir: dir, rootId: 'root-1', fleet: new FleetLatch('root-1'), session: cancelled, id: 'f'.repeat(64), adopt });
+  assert.match(unknown.message, /absent/);
+
+  assert.equal(adopted, 0, 'no refusal path hands a child to the manager');
+});

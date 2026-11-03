@@ -154,7 +154,12 @@ Two other refusals are worth recognizing:
   a checkpoint from another session file, a missing anchor, a cancelled navigation, or a landing with
   a different projection is refused and the guard stays held. A recorded pause always carries an
   empty quorum until a scope identity is verified, which means nothing reopens it automatically:
-  recovery is an explicit `/quota-guard restore`, never a timer.
+  recovery is an explicit `/quota-guard restore`, never a timer. A checkpoint also carries the
+  handles of interrupted **top-level** children whose transcripts still exist; a successful restore
+  re-registers them so `@handle` can reopen that saved conversation on a new prompt. Adoption opens
+  no session, sends no prompt and replays no completion, and an entry whose transcript is gone, or
+  whose handle is already live, is skipped and counted in the restore message. Nested, workflow and
+  worktree children are not retained.
 - For a provider whose automatic guard is ON, a fresh check can only re-read scopes the guard has
   **actually seen**. The reserve estimator is keyed by lane and the account FIFO's lane set is
   private, so the guard retains the last scope it was handed (credential included, in memory only)

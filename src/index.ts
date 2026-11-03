@@ -4467,6 +4467,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             rootId: binding.fleet.snapshot().rootId,
             fleet: binding.fleet,
             session: ctx.sessionManager as unknown as SessionSource,
+            // Handles only: an interrupted child's saved conversation stays addressable across the
+            // restart. Nothing here opens a session or resumes a turn.
+            children: manager.listTombstones(),
           });
           await pruneRestorePoints(quotaGuardStateDir as string);
           return written;
@@ -4488,6 +4491,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
           fleet: binding.fleet,
           session: command,
           id,
+          // Adopted only once the position and holds are back, so a refused restore leaves no
+          // half-restored address book behind.
+          adopt: children => manager.adoptTombstones(children),
         });
       },
       checkpoints: async () => restoreCandidates(quotaGuardStateDir as string),

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -14,6 +15,7 @@ import {
   validateCheckpoint,
   writeCheckpoint,
 } from '../../src/quota-guard/checkpoint.ts';
+import type { AgentTombstone } from '../../src/types.ts';
 
 const dirs: string[] = [];
 async function stateDir(): Promise<string> {
@@ -115,4 +117,95 @@ test('listing is newest-first and ignores temp or foreign files', async () => {
 
   assert.deepEqual(await pruneCheckpoints(dir, 1), [older.id]);
   assert.deepEqual((await readdir(checkpointDirectory(dir))).sort(), [`${newer.id}.json`, 'notes.txt']);
+});
+
+const child = (overrides: Partial<AgentTombstone> = {}): AgentTombstone => ({
+  handle: 'explore',
+  id: 'agent-1',
+  type: 'Explore',
+  description: 'map the reader',
+  sessionFile: '/tmp/child-1.jsonl',
+  completedAt: 1_700_000_000_000,
+  ...overrides,
+});
+
+test('children round-trip, and the digest covers them', async () => {
+  const dir = await stateDir();
+  const children = [
+    child({ alias: 'auth-audit' }),
+    child({ handle: 'plan-2', id: 'agent-2', type: 'Plan', description: 'sketch the change', sessionFile: '/tmp/child-2.jsonl' }),
+  ];
+  const checkpoint = createCheckpoint({ ...base(), children });
+  await writeCheckpoint(dir, checkpoint);
+
+  const read = await readCheckpoint(dir, checkpoint.id, { rootId: 'root-1', sessionId: 'session-1' });
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.ok && read.checkpoint.children, children);
+  assert.notEqual(checkpoint.digest, createCheckpoint(base()).digest, 'children are part of the digest');
+
+  const edited = { ...checkpoint, children: [{ ...children[0], description: 'something else' }, children[1]] };
+  await writeFile(checkpointPath(dir, checkpoint.id), JSON.stringify(edited));
+  const editedRead = await readCheckpoint(dir, checkpoint.id);
+  assert.equal(editedRead.ok, false);
+  assert.match((editedRead as { reason: string }).reason, /digest mismatch/);
+});
+
+test('a checkpoint written before children existed still validates, as having none', async () => {
+  const dir = await stateDir();
+  // The pre-children canonical form, rebuilt here by hand so this pins the format rather than
+  // whatever `canonical()` now emits: same keys, same order, no `children` at all.
+  const session = { id: 'session-1', file: '/tmp/session-1.jsonl', anchorId: 'entry-anchor', leafId: 'entry-leaf', entryCount: 12, projectionDigest: 'a'.repeat(64) };
+  const fleet = { state: 'paused', legacyReason: null, manualAll: false, providers: [{ id: 'commandcode', manual: true, automaticReason: null }] };
+  const lanes = ['commandcode:provider'];
+  const lost = ['inflight-inference'];
+  const oldCanonical = (id: string) => JSON.stringify({
+    version: 1,
+    id,
+    rootId: 'root-1',
+    createdAt: '2026-11-13T10:00:00.000Z',
+    sdk: { piVersion: '1.5.0', sessionFormatVersion: 3 },
+    session,
+    fleet,
+    lanes,
+    lost,
+  });
+  const id = createHash('sha256').update(oldCanonical('')).digest('hex');
+  const legacy = {
+    version: 1,
+    id,
+    rootId: 'root-1',
+    createdAt: '2026-11-13T10:00:00.000Z',
+    sdk: { piVersion: '1.5.0', sessionFormatVersion: 3 },
+    session,
+    fleet: { state: 'paused', manualAll: false, providers: [{ id: 'commandcode', manual: true }] },
+    lanes,
+    lost,
+    digest: createHash('sha256').update(oldCanonical(id)).digest('hex'),
+  };
+
+  const validated = validateCheckpoint(legacy, { rootId: 'root-1', sessionId: 'session-1' });
+  assert.deepEqual(validated.children, []);
+  assert.equal(validated.id, id);
+  assert.equal(validated.digest, legacy.digest, 'the record keeps the digest it was written with');
+  assert.equal(createCheckpoint(base()).id, id, 'the same content still derives the same id');
+
+  await mkdir(checkpointDirectory(dir), { recursive: true });
+  await writeFile(join(checkpointDirectory(dir), `${id}.json`), `${JSON.stringify(legacy, null, 2)}\n`);
+  const read = await readCheckpoint(dir, id);
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.ok && read.checkpoint.children, []);
+});
+
+test('a malformed child is refused rather than half-understood', () => {
+  const checkpoint = createCheckpoint(base());
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: {} }), /children must be an array/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ sessionFile: 'relative.jsonl' })] }), /absolute path/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ type: 'not a type' })] }), /agent type name/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ handle: '' })] }), /handle must be a non-empty string/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ completedAt: -1 })] }), /completedAt/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child(), child()] }), /duplicate child handle/);
+  assert.throws(
+    () => validateCheckpoint({ ...checkpoint, children: Array.from({ length: 17 }, (_, index) => child({ handle: `explore-${index}` })) }),
+    /more than 16/,
+  );
 });

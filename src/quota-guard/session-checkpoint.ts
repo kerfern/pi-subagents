@@ -12,6 +12,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { AgentTombstone } from '../types.ts';
 import {
   type Checkpoint,
   type CheckpointFleet,
@@ -81,6 +82,8 @@ export async function captureCheckpoint(options: {
   session: SessionSource;
   lanes?: readonly string[];
   lost?: readonly string[];
+  /** Children whose saved conversation should stay addressable after a restore. Handles only. */
+  children?: readonly AgentTombstone[];
   now?: number;
 }): Promise<{ id: string; digest: string }[]> {
   const { stateDir, rootId, fleet, session } = options;
@@ -105,6 +108,9 @@ export async function captureCheckpoint(options: {
     fleet: fleetStateOf(fleet),
     lanes: options.lanes ?? [],
     lost: options.lost ?? ['inflight-inference', 'committed-tool-side-effects'],
+    // Pass-through: capture stats nothing. A transcript that has since gone is the restoring manager's
+    // decision to make, so capture stays free of a filesystem check it cannot own the meaning of.
+    children: (options.children ?? []).filter(child => child.handle.length > 0 && child.sessionFile.length > 0),
   });
   const written = await writeCheckpoint(stateDir, checkpoint);
   return [{ id: written.id, digest: written.digest }];
@@ -126,6 +132,11 @@ export async function restoreCheckpoint(options: {
   fleet: FleetLatch;
   session: NavigableSession;
   id: string;
+  /**
+   * Hand the checkpoint's interrupted children to whoever can make them addressable again. Called once,
+   * only after the position and the holds are back — a refused restore adopts nothing.
+   */
+  adopt?: (children: readonly AgentTombstone[]) => { adopted: number; skipped: number };
 }): Promise<RestoreResult> {
   const { stateDir, rootId, fleet, session, id } = options;
   const view = session.sessionManager;
@@ -167,10 +178,14 @@ export async function restoreCheckpoint(options: {
       .filter(provider => provider.automaticReason !== undefined)
       .map(provider => ({ providerId: provider.id as GuardedProvider, reason: provider.automaticReason as PauseReason })),
   });
+  const adoption = options.adopt?.(checkpoint.children);
+  const children = adoption && (adoption.adopted > 0 || adoption.skipped > 0)
+    ? ` Children: ${adoption.adopted} addressable by @handle, ${adoption.skipped} skipped.`
+    : '';
   const lost = checkpoint.lost.length ? ` Lost and not resumed: ${checkpoint.lost.join(', ')}.` : '';
   return {
     ok: true,
-    message: `Quota guard: restored checkpoint ${id.slice(0, 12)}… (${checkpoint.session.entryCount} entries).${lost}`,
+    message: `Quota guard: restored checkpoint ${id.slice(0, 12)}… (${checkpoint.session.entryCount} entries).${children}${lost}`,
     checkpoint,
   };
 }

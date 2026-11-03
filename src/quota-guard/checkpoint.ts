@@ -9,12 +9,17 @@
  * Files are `0700` directory / `0600` file, written atomically (unique temp → fsync → rename → fsync
  * dir), self-digested, and rebuilt from an allowlist on read. A corrupt, truncated, foreign,
  * version-mismatched or digest-mismatched file resolves to a reason, never to a guess.
+ *
+ * `children` records the interrupted children whose saved conversations an operator could still address
+ * by `@handle`. That is retention of a name and a transcript path, never hydration: no session is
+ * opened, nothing is spawned, and no completion is replayed.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { AgentTombstone, SubagentType } from '../types.ts';
 import type { PauseReason } from './controller.ts';
 import type { GuardedProvider } from './types.ts';
 
@@ -24,6 +29,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const MAX_LOST = 16;
 const MAX_LANES = 32;
+const MAX_CHILDREN = 16;
 
 const REASONS: ReadonlySet<PauseReason> = new Set(['threshold', 'reserve', 'unavailable', 'identity', 'manual']);
 const PROVIDERS: ReadonlySet<string> = new Set(['openai-codex', 'commandcode']);
@@ -62,6 +68,12 @@ export interface Checkpoint {
   lanes: readonly string[];
   /** Effects this checkpoint cannot reinstate, stated explicitly so recovery cannot overclaim. */
   lost: readonly string[];
+  /**
+   * Children whose conversation a restore makes enterable again by `@handle`. A handle and a transcript
+   * path only: a restored child is not running, has no queue, and continues from a new prompt or not at
+   * all. Absent in checkpoints written before children were recorded, which read as none.
+   */
+  children: readonly AgentTombstone[];
   digest: string;
 }
 
@@ -82,6 +94,54 @@ function isHex64(value: unknown): value is string {
 function nonEmpty(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new Error(`${field} must be a non-empty string`);
   return value;
+}
+
+/**
+ * A child's agent type. `SubagentType` is `string` — a user-defined agent is named at runtime, so there
+ * is no union to enumerate — but a name no registry could have produced (spaces, separators, unbounded
+ * length) is refused, so a hand-edited checkpoint cannot smuggle a path or a sentence into a handle.
+ */
+function agentType(value: unknown, field: string): SubagentType {
+  const type = nonEmpty(value, field);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(type)) throw new Error(`${field} must be an agent type name`);
+  return type;
+}
+
+/**
+ * Rebuild the children list from known fields only. A missing list is legacy (nothing was recorded);
+ * one that is present but malformed is an error, because a partially understood child cannot be
+ * addressed safely.
+ */
+function childList(value: unknown): AgentTombstone[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error('children must be an array');
+  if (value.length > MAX_CHILDREN) throw new Error(`children has more than ${MAX_CHILDREN} entries`);
+  const seen = new Set<string>();
+  const out: AgentTombstone[] = [];
+  for (let index = 0; index < value.length; index++) {
+    if (!Object.hasOwn(value, index)) throw new Error('children must not be sparse');
+    const child = value[index] as Record<string, unknown> | null;
+    if (child === null || typeof child !== 'object') throw new Error(`children[${index}] must be an object`);
+    const handle = nonEmpty(child.handle, `children[${index}].handle`);
+    if (seen.has(handle)) throw new Error(`duplicate child handle ${handle}`);
+    seen.add(handle);
+    const sessionFile = nonEmpty(child.sessionFile, `children[${index}].sessionFile`);
+    if (!sessionFile.startsWith('/')) throw new Error(`children[${index}].sessionFile must be an absolute path`);
+    if (child.alias !== undefined) nonEmpty(child.alias, `children[${index}].alias`);
+    if (!Number.isSafeInteger(child.completedAt) || (child.completedAt as number) < 0) {
+      throw new Error(`children[${index}].completedAt must be a non-negative integer`);
+    }
+    out.push({
+      handle,
+      ...(child.alias !== undefined ? { alias: child.alias as string } : {}),
+      id: nonEmpty(child.id, `children[${index}].id`),
+      type: agentType(child.type, `children[${index}].type`),
+      description: nonEmpty(child.description, `children[${index}].description`),
+      sessionFile,
+      completedAt: child.completedAt as number,
+    });
+  }
+  return out;
 }
 
 function boundedList(value: unknown, field: string, max: number): string[] {
@@ -123,6 +183,19 @@ function canonical(value: Omit<Checkpoint, 'digest'>): string {
     },
     lanes: [...value.lanes],
     lost: [...value.lost],
+    // Omitted when empty rather than written as `[]`, so a digest computed before children existed is
+    // still the digest of the same record: an already stored checkpoint stays restorable across this change.
+    ...(value.children.length === 0 ? {} : {
+      children: value.children.map(child => ({
+        handle: child.handle,
+        alias: child.alias ?? null,
+        id: child.id,
+        type: child.type,
+        description: child.description,
+        sessionFile: child.sessionFile,
+        completedAt: child.completedAt,
+      })),
+    }),
   });
 }
 
@@ -213,6 +286,7 @@ export function validateCheckpoint(value: unknown, expected?: { rootId?: string;
     },
     lanes: boundedList(raw.lanes, 'lanes', MAX_LANES),
     lost: boundedList(raw.lost, 'lost', MAX_LOST),
+    children: childList(raw.children),
   };
   if (!isHex64(base.id)) throw new Error('id must be a sha256 hex digest');
   const digest = checkpointDigest(base);
@@ -224,10 +298,13 @@ export function validateCheckpoint(value: unknown, expected?: { rootId?: string;
  * Build a validated checkpoint. The id is derived from the content, so a caller cannot choose one that
  * collides with a different record; the digest then covers the id as well.
  */
-export function createCheckpoint(value: Omit<Checkpoint, 'digest' | 'id'>): Checkpoint {
-  const id = checkpointDigest({ ...value, id: '' } as Omit<Checkpoint, 'digest'>);
-  const digest = checkpointDigest({ ...value, id } as Omit<Checkpoint, 'digest'>);
-  return validateCheckpoint({ ...value, id, digest });
+export function createCheckpoint(
+  value: Omit<Checkpoint, 'digest' | 'id' | 'children'> & { children?: readonly AgentTombstone[] },
+): Checkpoint {
+  const complete = { ...value, children: value.children ?? [] };
+  const id = checkpointDigest({ ...complete, id: '' });
+  const digest = checkpointDigest({ ...complete, id });
+  return validateCheckpoint({ ...complete, id, digest });
 }
 
 async function fsyncDirectory(directory: string): Promise<void> {

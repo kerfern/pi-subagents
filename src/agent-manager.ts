@@ -113,6 +113,19 @@ const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
 const MAX_TOMBSTONES = 100;
 
 /**
+ * Whether this path names an existing regular file. A checkpoint records where a
+ * child's transcript was, not that it survived; a path that no longer exists is
+ * skipped rather than adopted into a name nothing can reopen.
+ */
+function isExistingFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
  * (parent cwd). Anything else must be an absolute path to an existing
  * directory — curated errors instead of TypeErrors from path/fs internals
@@ -1651,6 +1664,46 @@ export class AgentManager {
   /** Evicted agents whose conversation can still be reopened, newest first. */
   listTombstones(): AgentTombstone[] {
     return [...this.tombstones.values()].sort((a, b) => b.completedAt - a.completedAt);
+  }
+
+  /**
+   * Re-import child handles recorded in a quota-guard checkpoint, so a child that
+   * was interrupted stays addressable by `@handle` once the guard is restored.
+   *
+   * Retention, not hydration: no session is opened, nothing is spawned, no prompt
+   * is sent and no completion is replayed — a reopened child starts from a new
+   * turn or not at all. An entry is skipped when its transcript is gone (the
+   * mention could only ever fail, while still holding the name against a fresh
+   * agent of that type) or when its handle is already live or tombstoned
+   * (adopting it would shadow a conversation the operator can already reach).
+   */
+  adoptTombstones(entries: readonly AgentTombstone[]): { adopted: number; skipped: number } {
+    let adopted = 0;
+    let skipped = 0;
+    for (const entry of entries) {
+      const taken = this.takenHandles().has(entry.handle);
+      if (!entry.handle || !entry.sessionFile || taken || !isExistingFile(entry.sessionFile)) {
+        skipped++;
+        continue;
+      }
+      this.tombstones.set(entry.handle, {
+        handle: entry.handle,
+        alias: entry.alias,
+        id: entry.id,
+        type: entry.type,
+        description: entry.description,
+        sessionFile: entry.sessionFile,
+        completedAt: entry.completedAt,
+      });
+      adopted++;
+    }
+    // The same bound `tombstone()` applies: an adopted set must not be able to
+    // outgrow what a long session accumulates on its own.
+    while (this.tombstones.size > MAX_TOMBSTONES) {
+      const oldest = [...this.tombstones.values()].reduce((a, b) => (a.completedAt <= b.completedAt ? a : b));
+      this.tombstones.delete(oldest.handle);
+    }
+    return { adopted, skipped };
   }
 
   listAgents(): AgentRecord[] {
