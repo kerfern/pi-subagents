@@ -26,13 +26,13 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { RUNTIME_HOOK_KEY } from '../../src/quota-guard/host-hook.ts';
 import {
+  type QuotaGuardConfig,
+  type QuotaGuardHost,
   quotaGuardControls,
   quotaGuardExtension,
   quotaGuardRootBinding,
   resetQuotaGuardStateForTest,
   setQuotaGuardEnabled,
-  type QuotaGuardConfig,
-  type QuotaGuardHost,
 } from '../../src/quota-guard/index.ts';
 import { codexCredential } from './guard-fixtures.ts';
 

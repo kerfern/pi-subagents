@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { installQuotaGuard } from '../../src/quota-guard/root.ts';
 import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
+import { installQuotaGuard } from '../../src/quota-guard/root.ts';
 
 /** Stub coordinator: records pauses and never performs a network request. */
 function stubCoordinator() {
   const pauses: string[] = [];
   const gates: { scope: AttemptScope; inner: typeof fetch | undefined }[] = [];
   const gatedFetch = (scope: AttemptScope, inner?: typeof fetch): typeof fetch =>
-    async (input, _init) => {
+    async (_input, _init) => {
       gates.push({ scope, inner });
       return new Response('gated', { status: 200 });
     };

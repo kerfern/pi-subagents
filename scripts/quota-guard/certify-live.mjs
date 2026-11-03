@@ -5,9 +5,9 @@
 // normalised snapshot - never a credential, an Authorization header, or a raw response body.
 // Nothing runs it automatically: not the guard, not the test suite, not CI.
 //
-//   node quota-guard/certify-live.mjs --dry-run commandcode   # plan only: origins and paths
-//   node quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
-//   node quota-guard/certify-live.mjs codex
+//   node scripts/quota-guard/certify-live.mjs --dry-run commandcode   # plan only: origins and paths
+//   node scripts/quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
+//   node scripts/quota-guard/certify-live.mjs codex
 //
 // Credentials come from the environment of the shell that runs this, and from nowhere else. It never
 // reads auth.json, settings.json, the keychain, or anything under ~/.pi. See
@@ -20,9 +20,9 @@ import {
 	FIRST_PARTY_ORIGINS,
 	QuotaError,
 	readQuota,
-} from '../src/quota-guard/adapters.ts';
-import { laneKey } from '../src/quota-guard/coordinator.ts';
-import { assess, DEFAULT_POLICY, ReserveEstimator } from '../src/quota-guard/policy.ts';
+} from '../../src/quota-guard/adapters.ts';
+import { laneKey } from '../../src/quota-guard/coordinator.ts';
+import { assess, DEFAULT_POLICY, ReserveEstimator } from '../../src/quota-guard/policy.ts';
 
 /** Today's pin is exactly one first-party origin per provider; more than one means the pin moved. */
 function pinnedOrigin(provider) {
@@ -60,7 +60,7 @@ const PROVIDERS = {
 for (const spec of Object.values(PROVIDERS)) pinnedOrigin(spec.identity.providerId);
 
 const USAGE = [
-	'usage: node quota-guard/certify-live.mjs [--dry-run] <commandcode|codex>',
+	'usage: node scripts/quota-guard/certify-live.mjs [--dry-run] <commandcode|codex>',
 	'  --dry-run  check the environment is ready and print the pinned origins and paths, sending nothing',
 	'  the credential comes from the environment (export it), never from an argument',
 ];

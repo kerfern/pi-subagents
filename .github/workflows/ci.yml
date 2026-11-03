@@ -54,7 +54,7 @@ jobs:
       - name: Quota guard floor runtime contract
         env:
           PI_HOST_PATH: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
-        run: node --test --test-timeout=10000 quota-guard/test/host-contract.test.ts
+        run: node --test --test-timeout=10000 test/quota-guard/host-contract.test.ts
 
   # Forward canary: reinstall whatever Pi is `latest` over the pin, so a release newer than
   # the supported baseline surfaces here before it reaches users. It runs the full typecheck
@@ -88,4 +88,4 @@ jobs:
       - name: Quota guard runtime contract
         env:
           PI_HOST_PATH: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
-        run: node --test --test-timeout=10000 quota-guard/test/host-contract.test.ts
+        run: node --test --test-timeout=10000 test/quota-guard/host-contract.test.ts

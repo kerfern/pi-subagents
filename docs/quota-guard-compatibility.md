@@ -30,7 +30,7 @@ From the repository root:
 
 ```bash
 npm run check:quota-host      # does the installed pi still expose the seams the guard needs?
-npm --prefix quota-guard test # the guard's own suite (host-independent, fake transports)
+npm run test:quota # the guard's own suite (host-independent, fake transports)
 npm run test:quota            # the same suite through the repo script
 ```
 
@@ -223,7 +223,7 @@ conclusion above no longer holds for this provider.
 Nothing here is permanent, and re-enabling is a certification rather than a flag. It requires live
 certification of all three:
 
-1. **Scoped quota** — `node quota-guard/certify-live.mjs commandcode` succeeds against the live
+1. **Scoped quota** — `node scripts/quota-guard/certify-live.mjs commandcode` succeeds against the live
    endpoint and prints real windows/caps/resets for the plan the account is actually on. The monthly
    cap stays the guard's own `COMMANDCODE_MONTHLY_POOLS` entry, never a provider number.
 2. **Reserve** — the rolling windows carry enough real movement for the estimator to calibrate, or the
@@ -231,7 +231,7 @@ certification of all three:
 3. **Gate** — a full guarded dispatch through the gate, after `check:quota-host` passes, with the quota
    read happening on the real route.
 
-**All three hold as of 2026-10-17**: `node quota-guard/certify-live.mjs commandcode` prints real windows,
+**All three hold as of 2026-10-17**: `node scripts/quota-guard/certify-live.mjs commandcode` prints real windows,
 the operator supplies `quotaGuardReserveUnits` (the estimator's own values take over once they calibrate),
 and a guarded dispatch through the gate returns a real completion. CommandCode's automatic guard is ON.
 Observed on that date: `npm run check:quota-host` passed 10/10, the certifier reported `certified: yes`, and
@@ -243,7 +243,7 @@ CommandCode or pi upgrade: this record is dated, and it expires with the provide
 ## Certifying against live quotas (operator-authorised)
 
 Everything above is offline: synthetic credentials, fake transports, no request leaving the machine.
-`quota-guard/certify-live.mjs` is the one deliberate exception, and it exists because the adapters had
+`scripts/quota-guard/certify-live.mjs` is the one deliberate exception, and it exists because the adapters had
 only ever been exercised against fixtures. It is the only thing in this package that talks to a
 provider, and it is a separate command the operator runs on purpose rather than anything the guard
 does for itself.
@@ -260,7 +260,7 @@ how many requests it made.
 - **No secrets on stdout.** Never the credential, an `Authorization` header, or a raw response body —
   only normalised numbers and window ids. It reads only the variables you export: never `auth.json`,
   `settings.json`, the keychain, or anything under `~/.pi`.
-- **Never automatic.** Not by the guard, not by the test suite — `quota-guard/test/certify-live.test.ts`
+- **Never automatic.** Not by the guard, not by the test suite — `test/quota-guard/certify-live.test.ts`
   injects a fake transport and asserts that nothing is sent — not by CI, and not by `prepublishOnly`.
 - **Refuses rather than guesses.** No provider, an unknown provider, or a missing credential is a
   refusal that names the variable, never a fallback, and a malformed meter scope is refused before any
@@ -270,9 +270,9 @@ how many requests it made.
 Run it from the repository root, with the credential exported in that shell only:
 
 ```bash
-node quota-guard/certify-live.mjs --dry-run commandcode   # readiness only: prints origins/paths, sends nothing
-node quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
-node quota-guard/certify-live.mjs codex
+node scripts/quota-guard/certify-live.mjs --dry-run commandcode   # readiness only: prints origins/paths, sends nothing
+node scripts/quota-guard/certify-live.mjs commandcode             # one read-only GET per endpoint
+node scripts/quota-guard/certify-live.mjs codex
 ```
 
 | Provider | Environment required |
@@ -380,7 +380,7 @@ amount of retrying, and no amount of waiting, will free it: the only thing that 
 client spending quota in the same window. That is a deadlock, not the designed steady state, and the
 way out is `quotaGuardReserveUnits`. Set it to your best estimate of the units one dispatch burns in
 each window, and the guard opens on the first check. Get the window ids from
-`node quota-guard/certify-live.mjs --dry-run` — for CommandCode they are `monthly`, `fiveHour` and
+`node scripts/quota-guard/certify-live.mjs --dry-run` — for CommandCode they are `monthly`, `fiveHour` and
 `weekly`; for Codex, `<meter-id>.primary_window` and `<meter-id>.secondary_window`.
 
 **Codex needs its meter scope supplied.** `quotaGuardCodexLimits` is the set of verified meter ids and windows
@@ -447,6 +447,8 @@ The feature is called the **quota guard**. Two names matter:
 | CommandCode override | `quotaGuardCommandCodeEnabled` |
 | The command | `/quota-guard` (`on|off [all|codex|commandcode]`, `status`, `pause|resume [all|codex|commandcode]`) |
 | The code | `src/quota-guard/` in this repo; the harness side is `extensions/runtime-hook.mjs` |
+| Its tests | `test/quota-guard/` — `node --test`, excluded from Vitest because it drives a fake runtime; `npm run test:quota` |
+| Its tooling | `scripts/quota-guard/` — `check-host.mjs`, `certify-live.mjs`, `mutate-coordinator.mjs` |
 
 For each provider, a defined provider-specific boolean wins; otherwise it inherits the effective
 `quotaGuardEnabled` value, and if that is also unset it defaults OFF. Existing project-over-global
@@ -508,7 +510,7 @@ dispatch until it hears one — silence is not OFF.
 
 - `quotaGuardStateDir` — an absolute path the guard keeps its durable pause, wake and checkpoint records in (created `0700` / `0600`, secret-free). Supplied, a pause records a checkpoint naming the session position and the holds, and `/quota-guard checkpoints` / `/quota-guard restore <id>` reinstate them after a restart; its deadline, backoff index and checkpoint ids are what `status.wake` reports. Two things still stop a record being written: a session with no persisted file or no entry to anchor, and an unset directory. Where nothing is recorded, `status.wake.durable` is `false` and a restart brings the root back open. Absent, the guard still gates exactly the same and reports `wake: null`: it simply does not persist or self-recover. A non-absolute path is dropped — a relative path is not a directory the guard can honestly own — so `wake` stays `null`.
 - `quotaGuardCodexLimits` — the verified Codex meter scope: the meter ids and the windows each is read from (`primary_window` / `secondary_window`). Without it, a Codex attempt is **refused** rather than attributed to the wrong window (see [First run](#first-run--what-to-expect)). An entry that does not match that shape drops the whole list, so the Codex path stays refusing instead of becoming half-configured. CommandCode needs nothing extra; note that it runs as one provider-wide lane, for the reason given under [Honest limits](#honest-limits).
-- `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number strictly greater than `0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. A seed of `0` is refused for the same reason an unknown reserve is never treated as zero: for a metered window no dispatch burns nothing, so accepting `0` would silently disable the protection this number exists to provide. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node quota-guard/certify-live.mjs --dry-run`.
+- `quotaGuardReserveUnits` — an operator-asserted per-window reserve, keyed by window id, in that window's own units. It is how a fresh install over an idle account is unblocked (see [First run](#first-run--what-to-expect)): it fills **only** a window whose reserve the estimator could not compute, and an observed reserve always wins over it, so it never blends with calibration and never turns an observed window back into an unobserved one. Absent, an unknown reserve stays unknown and the guard stays closed — this is not a default and the guard never invents one. An entry that is not a finite number strictly greater than `0` under a non-empty id drops the whole value, so a malformed seed cannot half-configure the guard. A seed of `0` is refused for the same reason an unknown reserve is never treated as zero: for a metered window no dispatch burns nothing, so accepting `0` would silently disable the protection this number exists to provide. **A value that is too small under-protects**: the guard will hold back less than a dispatch actually burns, and the operator owns that risk. Window ids for a real account are visible from `node scripts/quota-guard/certify-live.mjs --dry-run`.
 
 ### Manual control while installed
 

@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { forceSse, installQuotaGuard } from '../../src/quota-guard/root.ts';
+import type { AttemptScope, GuardCoordinator } from '../../src/quota-guard/coordinator.ts';
 import type { GatedCoordinator } from '../../src/quota-guard/root.ts';
-import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
-import type { GuardCoordinator } from '../../src/quota-guard/coordinator.ts';
+import { forceSse, installQuotaGuard } from '../../src/quota-guard/root.ts';
 import { codexCredential, jwt } from './guard-fixtures.ts';
 
 // Compile-time only: the real coordinator must satisfy the public surface root.ts depends on.

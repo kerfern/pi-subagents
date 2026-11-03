@@ -1,7 +1,7 @@
 {
   "name": "@tintinweb/pi-subagents",
   "version": "0.19.0",
-  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi — parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
+  "description": "A pi extension that brings Claude Code-like sub-agents and workflow orchestration to pi \u2014 parallel execution, live widget, fleet view, custom agent types, mid-run steering, dynamic workflows, Claude Code compatibility, look and feel.",
   "author": "tintinweb",
   "license": "MIT",
   "repository": {
@@ -44,10 +44,10 @@
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/",
     "check": "npm run lint && npm run typecheck && npm run typecheck:quota && npm run test && npm run test:quota",
-    "test:quota": "npm --prefix quota-guard test",
-    "typecheck:quota": "tsc -p quota-guard/tsconfig.json",
-    "mutate:quota": "node quota-guard/mutate-coordinator.mjs",
-    "check:quota-host": "node quota-guard/check-host.mjs",
+    "test:quota": "node --test --test-timeout=10000 test/quota-guard/*.test.ts",
+    "typecheck:quota": "tsc --noEmit -p tsconfig.quota.json",
+    "mutate:quota": "node scripts/quota-guard/mutate-coordinator.mjs",
+    "check:quota-host": "node scripts/quota-guard/check-host.mjs",
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench",
     "bench:ab": "node test/perf/ab.mjs"

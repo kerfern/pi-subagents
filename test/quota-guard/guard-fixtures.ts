@@ -1,6 +1,6 @@
 import { AccountFifo, FleetLatch } from '../../src/quota-guard/controller.ts';
-import type { GuardMode, QuotaScope, QuotaSnapshot } from '../../src/quota-guard/types.ts';
 import type { AttemptScope, CoordinatorDeps } from '../../src/quota-guard/coordinator.ts';
+import type { GuardMode, QuotaScope, QuotaSnapshot } from '../../src/quota-guard/types.ts';
 
 export const NOW = Date.parse('2026-10-04T12:00:00.000Z');
 

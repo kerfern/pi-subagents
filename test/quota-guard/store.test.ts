@@ -5,9 +5,9 @@ import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
-import { openStore, type Manifest } from '../../src/quota-guard/store.ts';
+import { pathToFileURL } from 'node:url';
+import { type Manifest, openStore } from '../../src/quota-guard/store.ts';
 
 const utc = () => new Date().toISOString();
 const sleepMs = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));

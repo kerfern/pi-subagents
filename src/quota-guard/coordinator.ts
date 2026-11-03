@@ -135,8 +135,13 @@ function isFirstPartyDestination(url: string, providerId: GuardedProvider): bool
   try { return FIRST_PARTY_ORIGINS[providerId].has(new URL(url).origin); } catch { return false; }
 }
 
-/** Releases the lease on the first terminal event, before the consumer can observe it. */
-function terminalStream(body: ReadableStream<Uint8Array>, release: Release): ReadableStream<Uint8Array> {
+/**
+ * Releases the lease on the first terminal event, before the consumer can observe it.
+ *
+ * Exported for the release-once test: the FleetLatch release is already idempotent, so a double call
+ * here is invisible downstream and only a direct count can pin it.
+ */
+export function terminalStream(body: ReadableStream<Uint8Array>, release: Release): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   let released = false;
   const finish = (): void => { if (!released) { released = true; release(); } };

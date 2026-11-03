@@ -12,22 +12,22 @@
 
 import assert from 'node:assert/strict';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { inspect } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
+import { inspect } from 'node:util';
 import { RUNTIME_HOOK_KEY } from '../../src/quota-guard/host-hook.ts';
 import {
+  type QuotaGuardConfig,
+  type QuotaGuardHost,
   quotaGuardControls,
   quotaGuardExtension,
   quotaGuardRootBinding,
   resetQuotaGuardStateForTest,
   setQuotaGuardEnabled,
-  type QuotaGuardConfig,
-  type QuotaGuardHost,
 } from '../../src/quota-guard/index.ts';
 import { assess, DEFAULT_POLICY } from '../../src/quota-guard/policy.ts';
-import { openStore, type Manifest } from '../../src/quota-guard/store.ts';
+import { type Manifest, openStore } from '../../src/quota-guard/store.ts';
 import type { QuotaWindow } from '../../src/quota-guard/types.ts';
 import { codexCredential } from './guard-fixtures.ts';
 

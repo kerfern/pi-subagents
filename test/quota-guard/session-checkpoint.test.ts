@@ -3,8 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
+import { listCheckpoints, readCheckpoint } from '../../src/quota-guard/checkpoint.ts';
 import { FleetLatch } from '../../src/quota-guard/controller.ts';
-import { checkpointPath, listCheckpoints, readCheckpoint } from '../../src/quota-guard/checkpoint.ts';
 import {
   captureCheckpoint,
   projectionDigest,

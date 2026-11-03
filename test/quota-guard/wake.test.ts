@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { QuotaError } from '../../src/quota-guard/adapters.ts';
 import { FleetLatch } from '../../src/quota-guard/controller.ts';
 import { DEFAULT_POLICY } from '../../src/quota-guard/policy.ts';
-import { openStore, type Manifest, type QuotaStore } from '../../src/quota-guard/store.ts';
+import { type Manifest, openStore, type QuotaStore } from '../../src/quota-guard/store.ts';
 import { CheckpointUnavailableError, RootWake, type WakeCheck, type WakeDeps } from '../../src/quota-guard/wake.ts';
 
 type Value = Omit<Manifest, 'digest'>;

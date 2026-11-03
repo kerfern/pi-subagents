@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 // @ts-expect-error check-host.mjs is an executable JS harness; keep this test scoped to two files.
-import { loadHostContractModules, resolveHost, runChecks, withBlockedGlobalFetch } from '../check-host.mjs';
-import { installQuotaGuard, type GatedCoordinator, type GuardRuntime } from '../../src/quota-guard/root.ts';
+import { loadHostContractModules, resolveHost, runChecks, withBlockedGlobalFetch } from '../../scripts/quota-guard/check-host.mjs';
 import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
+import { type GatedCoordinator, type GuardRuntime, installQuotaGuard } from '../../src/quota-guard/root.ts';
 
 type AdapterStream = (...args: unknown[]) => AsyncIterable<unknown>;
 interface ResolvedHost {

@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { QuotaError, readQuota, type ReadOptions } from '../../src/quota-guard/adapters.ts';
-import { classifyFinalRequest, GuardCoordinator, laneKey, type AttemptScope } from '../../src/quota-guard/coordinator.ts';
+import { QuotaError, type ReadOptions, readQuota } from '../../src/quota-guard/adapters.ts';
 import { FleetLatch, type Release } from '../../src/quota-guard/controller.ts';
-import type { GuardedProvider } from '../../src/quota-guard/types.ts';
+import { type AttemptScope, classifyFinalRequest, GuardCoordinator, laneKey, terminalStream } from '../../src/quota-guard/coordinator.ts';
 import {
   quotaGuardControls, quotaGuardExtension, quotaGuardRootBinding, resetQuotaGuardStateForTest,
   setQuotaGuardEnabled,
 } from '../../src/quota-guard/index.ts';
-import { NOW, commandcodeScope, deps, openSnapshot, streamOf } from './guard-fixtures.ts';
+import type { GuardedProvider } from '../../src/quota-guard/types.ts';
+import { commandcodeScope, deps, NOW, openSnapshot, streamOf } from './guard-fixtures.ts';
 
 /** Counts guard releases; the underlying FleetLatch release is already idempotent. */
 class CountingFleet extends FleetLatch {
@@ -417,6 +417,18 @@ test('the gate never forwards on missing identity or origin drift', async () => 
   assert.equal(calls, 0);
   assert.equal(d.fleet.snapshot().state, 'open');
   assert.equal(d.fleet.snapshot('commandcode').reason, 'identity');
+});
+
+test('a completed body and a second cancel release the lease exactly once', async () => {
+  // Two terminal paths can fire for one body: `reader.closed` and the consumer's cancel. The
+  // FleetLatch release is idempotent, so this counts the calls the body itself makes.
+  let calls = 0;
+  const stream = terminalStream(streamOf(['a', 'b']), () => { calls++; });
+  const reader = stream.getReader();
+  assert.equal((await reader.read()).done, false);
+  await reader.cancel();
+  await new Promise((resolve) => { setTimeout(resolve, 10); });
+  assert.equal(calls, 1, 'the body must release its lease once, not once per terminal path');
 });
 
 test('release happens exactly once on stream error', async () => {

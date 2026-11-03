@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { codexUsageUrl, normalizeCodex, normalizeCommandCode, readQuota, QuotaError } from '../../src/quota-guard/adapters.ts';
+import { codexUsageUrl, normalizeCodex, normalizeCommandCode, QuotaError, readQuota } from '../../src/quota-guard/adapters.ts';
 
 const now = Date.parse('2026-10-04T12:00:00.000Z');
 const codexId = { providerId: 'openai-codex' as const, scope: 'account' as const, accountId: 'acct', workspaceId: 'work' };

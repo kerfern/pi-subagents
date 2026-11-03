@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
 import { installQuotaGuard } from '../../src/quota-guard/root.ts';
 import { codexCredential } from './guard-fixtures.ts';
-import type { AttemptScope } from '../../src/quota-guard/coordinator.ts';
 
 /** Verified meter scope the Codex path requires; without it a Codex attempt is refused. */
 const codexLimits = [{ id: 'codex', windows: ['primary_window', 'secondary_window'] as const }];

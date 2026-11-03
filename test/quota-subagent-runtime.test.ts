@@ -2,7 +2,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { codexCredential } from "../quota-guard/test/guard-fixtures.js";
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import {
@@ -11,6 +10,7 @@ import {
   resetQuotaGuardStateForTest,
 } from "../src/quota-guard/index.js";
 import type { AgentConfig } from "../src/types.js";
+import { codexCredential } from "../test/quota-guard/guard-fixtures.js";
 
 // Exercise real SDK providers under CPU contention; a genuine hang still fails.
 vi.setConfig({ testTimeout: 30_000 });

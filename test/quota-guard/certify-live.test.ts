@@ -2,8 +2,8 @@
 // the credential is a synthetic string, and the assertions include that nothing was sent.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { codexUsageUrl, CODEX_USAGE_BASE, COMMANDCODE_ENDPOINTS } from '../../src/quota-guard/adapters.ts';
-import { main } from '../certify-live.mjs';
+import { main } from '../../scripts/quota-guard/certify-live.mjs';
+import { CODEX_USAGE_BASE, COMMANDCODE_ENDPOINTS, codexUsageUrl } from '../../src/quota-guard/adapters.ts';
 
 const SECRET = 'fixture-secret-key';
 const now = Date.parse('2026-10-04T12:00:00.000Z');
@@ -62,7 +62,7 @@ test('refuses instead of guessing which quota to certify', async () => {
   assert.equal(await bare.run([], credentials), 2);
   assert.equal(bare.urls.length, 0);
   assert.match(output(bare), /no provider given/);
-  assert.match(output(bare), /usage: node quota-guard\/certify-live\.mjs/);
+  assert.match(output(bare), /usage: node scripts\/quota-guard\/certify-live\.mjs/);
   const unknown = harness(route);
   assert.equal(await unknown.run(['openai'], credentials), 2);
   assert.equal(unknown.urls.length, 0);
