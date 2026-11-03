@@ -399,6 +399,10 @@ The harness entry point (`runtime/jev-host.mjs`) blocks `ModelRuntime.prototype.
   identity plus a passing result, the issuer, and issue/expiry times (24 h maximum age). No pin ships
   with the harness, so `strict` refuses until an operator authenticates one — fail-closed by
   construction. An unrecognised mode value refuses startup rather than falling back to `declared`.
+  The guard's content digest is taken from loaded bytes when the loader produced them and otherwise
+  from a deterministic disk digest of the declaring package, because pi bundles extension code: the
+  module that names itself on the call stack never has a file load of its own. Provenance that cannot
+  be observed is reported in `declared` mode and fatal in `strict`.
 - **Enabled providers.** Dispatch also stays closed until the decorator has replaced **both**
   methods. Replacements are staged off the live prototype, so a partial, asynchronous or half-applied
   decoration never goes live; a stall past the install watchdog, a refusal, or a timeout aborts
