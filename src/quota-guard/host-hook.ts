@@ -22,8 +22,8 @@ export interface HarnessHookTarget {
 }
 /**
  * The startup decision the harness barrier blocks dispatch on: both guarded providers named
- * explicitly. The harness derives the declaring file from its own call stack and binds its
- * owner-pinned evidence to that file's package - a guard-supplied path would only be a claim.
+ * explicitly. The harness derives the declaring file from its own call stack and reports that
+ * package's identity beside the decision - a guard-supplied path would only be a claim.
  */
 export interface HarnessStartupDeclaration {
   providers: Readonly<Record<GuardedProvider, boolean>>;

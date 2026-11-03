@@ -406,17 +406,13 @@ The harness entry point (`runtime/jev-host.mjs`) blocks `ModelRuntime.prototype.
   the declaring file from its own call stack rather than accepting a path from the caller, so the
   evidence cannot be bound to content other than the code performing the handshake. A hook that
   cannot accept a declaration is refused — an older harness cannot gate dispatch.
-- **Evidence.** Two modes, selected by `PI_STARTUP_EVIDENCE`. The default, `declared`, observes and
-  hashes the declaring package and the source bytes Node actually loaded, and reports them on stderr —
-  it asserts no attestation, so an ordinary `pi` launch works. `strict` additionally requires an
-  owner-pinned manifest covering the exact host and guard content, the seam ABI, the validation suite
-  identity plus a passing result, the issuer, and issue/expiry times (24 h maximum age). No pin ships
-  with the harness, so `strict` refuses until an operator authenticates one — fail-closed by
-  construction. An unrecognised mode value refuses startup rather than falling back to `declared`.
-  The guard's content digest is taken from loaded bytes when the loader produced them and otherwise
-  from a deterministic disk digest of the declaring package, because pi bundles extension code: the
-  module that names itself on the call stack never has a file load of its own. Provenance that cannot
-  be observed is reported in `declared` mode and fatal in `strict`.
+- **Origins are reported, not attested.** The harness identifies and content-hashes the host package
+  and the package that declared startup, and prints them once on stderr. The guard's content digest
+  comes from loaded bytes when the loader produced them and otherwise from a deterministic disk digest
+  of the declaring package, because pi bundles extension code: the module that names itself on the call
+  stack never has a file load of its own. There is no manifest, no pin and nothing to refresh — an
+  owner-pinned record with a 24 h expiry was friction without a matching risk reduction, and requiring
+  one stopped every ordinary launch. Unobservable origins are printed, never fatal.
 - **Enabled providers.** Dispatch also stays closed until the decorator has replaced **both**
   methods. Replacements are staged off the live prototype, so a partial, asynchronous or half-applied
   decoration never goes live; a stall past the install watchdog, a refusal, or a timeout aborts

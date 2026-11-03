@@ -119,12 +119,12 @@ test('a rejected declaration aborts before the install is attempted', async () =
   const coordinator = fakeCoordinator();
   let installed = false;
   const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
-    async declareStartup() { throw new Error('startup evidence: owner pin is not configured'); },
+    async declareStartup() { throw new Error('startup decision rejected by the harness'); },
     async install() { installed = true; return () => {}; },
   } };
   await assert.rejects(
     () => installGuardedRuntimeViaHook({ coordinator: coordinator as never, rootId: 'root-1', source }),
-    /owner pin is not configured/,
+    /startup decision rejected/,
   );
   assert.equal(installed, false);
 });

@@ -721,9 +721,9 @@ subscription usage and admits a request only after a fresh check, serialising on
 latching the whole fleet — draining admitted work rather than aborting it — when a window is close to exhausted.
 The guard is off by default. `/quota-guard on|off [all|codex|commandcode]` persists per-provider choices in the
 current project's settings; when both providers are off, command-only mode keeps these controls available without
-resolving credentials or decorating the runtime. Under the harness, both dispatch methods are held at startup until
-an explicit decision is verified against an owner-pinned evidence record, so a missing, stale or mismatched record stops
-the launch rather than dispatching unguarded. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
+resolving credentials or decorating the runtime. Under the harness, both dispatch methods are held at startup until the guard declares
+which providers it guards and, when any is on, until it has replaced both; instead of stalling silently for 5 s the
+harness then releases dispatch with a warning (`PI_STARTUP_BARRIER=required` refuses instead). It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
 failure mode it exists to prevent is a guard that looks installed while dispatching unguarded. Upgrade procedure: run
 `npm run check:quota-host` after a pi upgrade. See [the compatibility guide](docs/quota-guard-compatibility.md).
 

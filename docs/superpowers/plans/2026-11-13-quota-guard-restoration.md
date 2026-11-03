@@ -1,8 +1,13 @@
 # Quota Guard Restoration Implementation Plan
 
-> **Status: Planned — not executed.** No code from this plan exists. It closes the design question that
-> kept TODOs #14–#17 blocked ("no process-restart restoration API") using APIs verified in the
-> installed Pi 1.5.0 SDK. Sizes and check names below are proposals, not results.
+> **Status: Delivered, reduced — #14, #15 and #16 shipped; #17 dropped.** What exists: durable
+> checkpoints bound to a session position (`src/quota-guard/checkpoint.ts`), capture on a fresh
+> automatic pause (`RootWake.recordPause`), `/quota-guard checkpoints` and `/quota-guard restore <id>`
+> with projection-verified navigation, and retention of interrupted child handles through
+> `AgentManager.adoptTombstones`. What does not: child-runtime hydration and dependency-graph
+> restoration — the second was dropped after a second-opinion review because reconstructing queue
+> order, deadlines and ownership restores obligations for work that no longer exists. Task text below
+> is the original plan; the review section supersedes it where they conflict.
 
 **Goal:** Make a paused, interrupted guard recoverable across a process restart: reinstate the
 transcript position, the fleet's holds and identities, attached children, and dependency structure —
