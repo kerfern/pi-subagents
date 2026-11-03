@@ -12,8 +12,19 @@ export interface HarnessHookTarget {
   prototype: object;
   host: { name: string; version: string; packagePath: string };
 }
+/**
+ * The startup decision the harness barrier blocks dispatch on: both guarded providers named
+ * explicitly. The harness derives the declaring file from its own call stack and binds its
+ * owner-pinned evidence to that file's package - a guard-supplied path would only be a claim.
+ */
+export interface HarnessStartupDeclaration {
+  providers: Readonly<Record<GuardedProvider, boolean>>;
+}
+
 export interface HarnessRuntimeHook {
   install(decorate: (target: HarnessHookTarget) => Release | Promise<Release> | undefined): Promise<Release>;
+  /** Present only on harness builds that gate startup; absence is a refusal, never an implied ready. */
+  declareStartup?(request: HarnessStartupDeclaration): Promise<string>;
 }
 
 /**
@@ -40,6 +51,38 @@ export interface HookInstallOptions {
 }
 
 /**
+ * Name both guarded providers and the loaded guard entry before anything is installed.
+ *
+ * Also used for the all-off case: the harness barrier holds both dispatch methods until a startup
+ * decision arrives, so silence would abort the launch. A hook that cannot accept the declaration is
+ * older than the barrier contract and cannot gate dispatch, so it is refused rather than assumed.
+ */
+export async function declareStartupViaHook(
+  providers: Readonly<Record<GuardedProvider, boolean>>,
+  source: object = globalThis,
+): Promise<void> {
+  const hook = findRuntimeHook(source);
+  if (!hook) return;
+  if (typeof hook.declareStartup !== 'function') {
+    throw new Error(
+      'Quota guard: the published harness runtime hook does not accept a startup declaration, so the '
+      + 'harness barrier can never admit a dispatch. Update pi-harness (runtime/jev-host.mjs) to a build '
+      + 'that gates startup, or dispatch stays closed.',
+    );
+  }
+  await hook.declareStartup({ providers });
+}
+
+/** Both guarded providers, named explicitly rather than implied by an omission. */
+function declaredProviders(providers?: readonly GuardedProvider[]): Readonly<Record<GuardedProvider, boolean>> {
+  const active = providers ?? GUARDED_PROVIDERS;
+  return {
+    'openai-codex': active.includes('openai-codex'),
+    commandcode: active.includes('commandcode'),
+  };
+}
+
+/**
  * Install the guard on the live runtime prototype, through the harness hook.
  *
  * Fails closed when the hook is absent: the guard is worthless if it can be quietly not-installed,
@@ -56,6 +99,9 @@ export async function installGuardedRuntimeViaHook(options: HookInstallOptions):
       + 'pi-harness entry point (runtime/jev-host.mjs), or update it if it predates the hook.',
     );
   }
+  // Declare before installing: enabling without a declaration leaves the barrier pending, and the
+  // hook would refuse the install. A rejected declaration aborts before any decoration.
+  await declareStartupViaHook(declaredProviders(options.guardedProviders), options.source ?? globalThis);
   return hook.install(async ({ prototype, host: hostInfo }) => {
     // Gate activation on what can actually be seen. A missing seam must stop an enabled guard here,
     // not surface later as traffic that is quietly not being gated.

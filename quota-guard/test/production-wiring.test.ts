@@ -53,6 +53,10 @@ const flush = async () => { for (let index = 0; index < 16; index++) await Promi
 function hookSource(prototype: Record<string, unknown>, calls: string[] = []): Record<PropertyKey, unknown> {
   const source: Record<PropertyKey, unknown> = {};
   source[RUNTIME_HOOK_KEY] = {
+    async declareStartup(request: unknown) {
+      calls.push('declare');
+      return request;
+    },
     async install(decorate: (target: unknown) => unknown) {
       calls.push('install');
       return await decorate({
@@ -284,7 +288,7 @@ test('flag off: the entry is inert on the real wiring path', async () => {
   quotaGuardExtension(host, { codexLimits: [{ id: 'codex', windows: ['primary_window'] as const }] });
   await flush();
 
-  assert.deepEqual(hookCalls, [], 'a disabled guard must never reach the harness hook');
+  assert.deepEqual(hookCalls, ['declare'], 'a disabled guard declares an explicit OFF startup and nothing else');
   assert.deepEqual(registered, [], 'a disabled guard must register no command');
   assert.equal(prototype.stream, originalStream, 'nothing may be decorated while disabled');
   assert.equal(prototype.streamSimple, originalSimple);

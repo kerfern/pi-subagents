@@ -107,10 +107,14 @@ async function durableText(dir: string): Promise<string> {
   return text;
 }
 
-/** A published harness hook handing over `prototype`, recording each install call. */
+/** A published harness hook handing over `prototype`, recording each declaration and install. */
 function hookSource(prototype: Record<string, unknown>, calls: string[] = []): Record<PropertyKey, unknown> {
   const source: Record<PropertyKey, unknown> = {};
   source[RUNTIME_HOOK_KEY] = {
+    async declareStartup(request: unknown) {
+      calls.push('declare');
+      return request;
+    },
     async install(decorate: (target: unknown) => unknown) {
       calls.push('install');
       return await decorate({ prototype, host: { name: 'fake', version: '1.0.0', packagePath: '/tmp/fake' } });
@@ -164,7 +168,7 @@ test('enabling installs the guard on the prototype the hook hands over', async (
   quotaGuardExtension(host);
   await flush();
 
-  assert.deepEqual(calls, ['install'], 'the published hook must be used exactly once');
+  assert.deepEqual(calls, ['declare', 'install'], 'the startup decision is declared first, then the hook installs once');
   assert.notEqual(prototype.stream, originalStream, 'the prototype stream must be decorated');
   assert.notEqual(prototype.streamSimple, originalSimple, 'the prototype streamSimple must be decorated');
   assert.equal(quotaGuardControls()?.status().installed, true, 'installed must be truthful for the hook path');
@@ -194,7 +198,7 @@ test('status is truthful: state and active come from the root latch, never "unkn
   assert.equal(controls.status().active, 0);
 });
 
-test('disabled is inert: no hook lookup, nothing decorated, no output, no coordinator', async () => {
+test('disabled declares OFF and stays inert: nothing decorated, no output, no coordinator', async () => {
   const calls: string[] = [];
   const registered: string[] = [];
   const { prototype, originalStream, originalSimple } = fakeRuntime();
@@ -208,7 +212,7 @@ test('disabled is inert: no hook lookup, nothing decorated, no output, no coordi
   quotaGuardExtension(host);
   await flush();
 
-  assert.deepEqual(calls, [], 'a disabled guard must never look the hook up');
+  assert.deepEqual(calls, ['declare'], 'a disabled startup must say OFF explicitly, and do nothing else');
   assert.deepEqual(registered, [], 'a disabled guard must register no command');
   assert.equal(prototype.stream, originalStream, 'a disabled guard must decorate nothing');
   assert.equal(prototype.streamSimple, originalSimple);

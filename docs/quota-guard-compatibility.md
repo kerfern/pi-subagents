@@ -383,6 +383,37 @@ Quota guard: no verified Codex meter scope configured; pass codexLimits to insta
 The refusal applies only to Codex automatic state, so a missing scope stops Codex rather than
 gating nothing; CommandCode remains independent.
 
+## Startup barrier
+
+The harness entry point (`runtime/jev-host.mjs`) blocks `ModelRuntime.prototype.stream` and
+`streamSimple` before pi starts and only releases them on an explicit startup decision:
+
+- **Declaration.** The guard names both providers, on or off, plus nothing else; the harness derives
+  the declaring file from its own call stack rather than accepting a path from the caller, so the
+  evidence cannot be bound to content other than the code performing the handshake. A hook that
+  cannot accept a declaration is refused — an older harness cannot gate dispatch.
+- **Evidence.** Two modes, selected by `PI_STARTUP_EVIDENCE`. The default, `declared`, observes and
+  hashes the declaring package and the source bytes Node actually loaded, and reports them on stderr —
+  it asserts no attestation, so an ordinary `pi` launch works. `strict` additionally requires an
+  owner-pinned manifest covering the exact host and guard content, the seam ABI, the validation suite
+  identity plus a passing result, the issuer, and issue/expiry times (24 h maximum age). No pin ships
+  with the harness, so `strict` refuses until an operator authenticates one — fail-closed by
+  construction. An unrecognised mode value refuses startup rather than falling back to `declared`.
+- **Enabled providers.** Dispatch also stays closed until the decorator has replaced **both**
+  methods. Replacements are staged off the live prototype, so a partial, asynchronous or half-applied
+  decoration never goes live; a stall past the install watchdog, a refusal, or a timeout aborts
+  startup.
+- **Failure is terminal; silence is not.** A rejected declaration, a mismatch, a timeout (60 s total,
+  5 s for the evidence read and hash), or a late settlement leaves dispatch closed, and a late success
+  cannot reopen it. *No* declaration is different: after a 5 s grace window the harness releases
+  dispatch with a warning, so a missing, disabled or older guard cannot stop pi from loading. An
+  enabled guard that declares after that window has its install refused — it reports
+  `enabled, not installed` instead of pretending to gate. Set `PI_STARTUP_BARRIER=required` to refuse
+  the launch when no guard declares.
+
+The guard's own suite pins this with synthetic evidence and fake transports only. It does not prove
+production egress isolation, and it is not a live-certification claim.
+
 ## Child-runtime coverage
 
 The runtime hook intercepts the shared SDK `ModelRuntime` prototype used by parent, `runAgent`, and
@@ -442,7 +473,7 @@ Check it took effect:
   unless a manual hold matches.
 - `enabled, not installed` → the switch is on but installation failed. The reason is on stderr at startup and from `quotaGuardInstallFailure()`. The usual cause is that pi was started through the bare `pi` binary rather than the harness entry point, so the runtime hook is absent.
 
-**The one remaining fail-open path, and how to close it.** Installation can fail *after* startup — the harness publishes the hook before any extension installs a decorator, so the decorator is applied asynchronously after boot and can fail then (a host whose prototype lacks `stream`/`streamSimple`, or a refused double-install). The guard detects that failure, records it and calls `pause('identity')` — but a latch is only consulted *by* the decorator, and the decorator is exactly what failed to install. So in that state the guard cannot block anything, and no change inside the guard fixes it: it has no interception point. The enforcement belongs to the seam owner. Set `QUOTA_GUARD_REQUIRE_SEAM=1` and the harness refuses to continue when a decorator fails to install, for every refusal path except the hook's own completed-duplicate refusal: a missing `ModelRuntime` prototype, a missing dispatch method, a decorator that throws, or one that returns no dispose function. Without the flag the default is to report the failure on stderr and keep running — which means genuinely ungated in the cases where the install left the runtime undecorated.
+**Installation can fail *after* startup.** The harness publishes the hook before any extension installs a decorator, so the decorator is applied asynchronously after boot and can fail then (a host whose prototype lacks `stream`/`streamSimple`, or a refused double-install). The guard detects that failure, records it and calls `pause('identity')` — but a latch is only consulted *by* the decorator, and the decorator is exactly what failed to install. A current harness closes that gap itself: its startup barrier keeps both dispatch methods wrapped until a ready decision, so a failed or stalled decorator leaves dispatch closed and the process exits rather than running ungated. On a harness without the barrier, set `QUOTA_GUARD_REQUIRE_SEAM=1`: the harness then refuses to continue when a decorator fails to install, for every refusal path except the hook's own completed-duplicate refusal — a missing `ModelRuntime` prototype, a missing dispatch method, a decorator that throws, or one that returns no dispose function. Without either, the default is to report the failure on stderr and keep running.
 
 Without the flag, an install failure that leaves the runtime undecorated leaves pi running with nothing gated, so the flag is the only way to make that condition stop the session. With the flag, every genuine install failure refuses to continue — but one case is deliberately exempt.
 
@@ -455,8 +486,9 @@ A decorator **already present and gating** is not an ungated runtime: a factory 
 `false` values without changing the legacy fallback or other settings. Alternatively, set both
 provider switches to `false` in the settings file. A legacy `false` does not override a
 provider-specific `true`. When both are OFF, the command-only entry remains available for future
-`on`/`off` changes, but no coordinator is constructed, no hook is looked up, no credentials are
-resolved, and no runtime is decorated.
+`on`/`off` changes: no coordinator is constructed, no credentials are resolved, and no runtime is
+decorated. It does still **declare** the all-off decision to the harness, because the harness stops
+dispatch until it hears one — silence is not OFF.
 
 **Three optional keys, and what happens without them:**
 

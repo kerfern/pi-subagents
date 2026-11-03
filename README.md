@@ -48,7 +48,7 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
-Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
+Requires pi **1.5.0 or newer** (the supported quota-guard SDK/runtime baseline declared in `peerDependencies`). The [`SubagentWorkflow`](#subagentworkflow) tool itself builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0).
 
 ### Other hosts
 
@@ -721,7 +721,9 @@ subscription usage and admits a request only after a fresh check, serialising on
 latching the whole fleet — draining admitted work rather than aborting it — when a window is close to exhausted.
 The guard is off by default. `/quota-guard on|off [all|codex|commandcode]` persists per-provider choices in the
 current project's settings; when both providers are off, command-only mode keeps these controls available without
-resolving credentials or decorating the runtime. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
+resolving credentials or decorating the runtime. Under the harness, both dispatch methods are held at startup until
+an explicit decision is verified against an owner-pinned evidence record, so a missing, stale or mismatched record stops
+the launch rather than dispatching unguarded. It also refuses to activate when the installed pi build no longer exposes the seams it depends on, because the
 failure mode it exists to prevent is a guard that looks installed while dispatching unguarded. Upgrade procedure: run
 `npm run check:quota-host` after a pi upgrade. See [the compatibility guide](docs/quota-guard-compatibility.md).
 

@@ -15,7 +15,7 @@
 
 import type { CodexLimit } from './adapters.ts';
 import type { FleetSnapshot, FleetState, GuardTarget as FleetTarget, PauseReason, ProviderFleetSnapshot } from './controller.ts';
-import { findRuntimeHook, installGuardedRuntimeViaHook } from './host-hook.ts';
+import { declareStartupViaHook, findRuntimeHook, installGuardedRuntimeViaHook } from './host-hook.ts';
 import { DEFAULT_POLICY, validateReserveSeed } from './policy.ts';
 import { type GatedCoordinator, type GuardRuntime, installQuotaGuard } from './root.ts';
 import { createQuotaGuardCoordinator, type RootBinding } from './root-binding.ts';
@@ -562,10 +562,15 @@ export interface QuotaGuardConfig {
  * carries wins, so an explicit host field is never overwritten by the settings.
  */
 export function quotaGuardExtension(host: unknown, config?: QuotaGuardConfig): void {
-  const guardedProviders = config?.guardedProviders;
-  const commandOnly = guardedProviders !== undefined && guardedProviders.length === 0
-    && typeof config?.persistProviderEnabled === 'function';
-  if (!commandOnly && (guardedProviders !== undefined ? guardedProviders.length === 0 : !enabled)) return;
+  const guardedProviders = config?.guardedProviders ?? (enabled ? DEFAULT_GUARDED_PROVIDERS : []);
+  const off = guardedProviders.length === 0;
+  const commandOnly = off && typeof config?.persistProviderEnabled === 'function';
+  if (off && !commandOnly) {
+    // Legacy-off registers no command, as before - but a harness barrier still holds dispatch until
+    // it hears a decision, so an off startup must say so explicitly instead of staying silent.
+    declareOffStartup(host);
+    return;
+  }
   if (!host || typeof host !== 'object') return;
   const h = host as QuotaGuardHost;
   if (typeof h.registerCommand === 'function' && !commanded.has(h)) {
@@ -573,9 +578,20 @@ export function quotaGuardExtension(host: unknown, config?: QuotaGuardConfig): v
     registerCommand(h, config);
   }
   // Keep the persistent settings command available while both providers are OFF, without creating
-  // a coordinator, resolving credentials, looking up the runtime hook, or decorating dispatch.
-  if (commandOnly) return;
-  install(h, config);
+  // a coordinator, resolving credentials, or decorating dispatch.
+  if (commandOnly) declareOffStartup(h);
+  else install(h, config);
+}
+
+/**
+ * Report an all-off startup. Best effort by construction: the harness barrier is already terminal on
+ * a rejected declaration, so a failure is recorded for inspection rather than thrown out of
+ * extension init, where it would replace the barrier's own actionable refusal.
+ */
+function declareOffStartup(host: unknown): void {
+  const source = (host as QuotaGuardHost | undefined)?.hookSource;
+  void declareStartupViaHook({ 'openai-codex': false, commandcode: false }, source ?? globalThis)
+    .catch((error: Error) => { lastInstallFailure = error; });
 }
 
 /** Controls for a bound runtime, or the most recent binding when omitted. */

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { findRuntimeHook, installGuardedRuntimeViaHook, RUNTIME_HOOK_KEY } from '../../src/quota-guard/host-hook.ts';
+import { declareStartupViaHook, findRuntimeHook, installGuardedRuntimeViaHook, RUNTIME_HOOK_KEY } from '../../src/quota-guard/host-hook.ts';
+
+/** Startup declarations the fake hook received, in order: the OFF/ON handshake is observable. */
+const declarations: unknown[] = [];
 
 interface FakeCoordinator { pauses: string[]; scopes: unknown[]; gatedFetch(scope: unknown, inner?: unknown): typeof fetch; pause(reason: string): void }
 function fakeCoordinator(): FakeCoordinator {
@@ -17,6 +20,10 @@ function fakeCoordinator(): FakeCoordinator {
 function publishFakeHook(source: Record<PropertyKey, unknown>, decorate: (target: unknown) => (() => void) | undefined) {
   const seen: unknown[] = [];
   source[RUNTIME_HOOK_KEY] = {
+    async declareStartup(request: unknown) {
+      declarations.push(request);
+      return 'pending';
+    },
     async install(given: (target: unknown) => (() => void) | undefined) {
       const target = { prototype: {}, host: { name: 'fake-host', version: '1.0.0', packagePath: '/tmp/fake' } };
       seen.push(target);
@@ -65,6 +72,75 @@ test('a malformed hook takes the same fail-closed path', async () => {
   assert.deepEqual(coordinator.pauses, ['identity']);
 });
 
+test('the guard declares both providers and its own loaded entry before installing', async () => {
+  const coordinator = fakeCoordinator();
+  const prototype: Record<string, unknown> = { stream: async () => 'stream', streamSimple: async () => 'simple',
+    getAuth: async () => ({ auth: { apiKey: 'k', headers: {} } }) };
+  const order: string[] = [];
+  const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
+    async declareStartup(request: { providers: Record<string, boolean> }) {
+      order.push('declare');
+      assert.deepEqual(request.providers, { 'openai-codex': true, commandcode: false },
+        'every guarded provider is named explicitly, not implied by an omission');
+      assert.deepEqual(Object.keys(request), ['providers'],
+        'the declaration carries no path: the harness derives the declaring file itself');
+      return 'pending';
+    },
+    async install(decorate: (target: unknown) => unknown) {
+      order.push('install');
+      return await decorate({ prototype, host: { name: 'fake', version: '1.0.0', packagePath: '/tmp/fake' } });
+    },
+  } };
+  const dispose = await installGuardedRuntimeViaHook({
+    coordinator: coordinator as never, rootId: 'root-1', source, guardedProviders: ['openai-codex'],
+  });
+  assert.deepEqual(order, ['declare', 'install'], 'nothing may be decorated before the startup decision');
+  assert.notEqual(prototype.stream, undefined);
+  dispose();
+});
+
+test('a hook without the startup handshake is refused before anything is decorated', async () => {
+  const coordinator = fakeCoordinator();
+  const originalStream = async () => 'stream';
+  const prototype: Record<string, unknown> = { stream: originalStream, streamSimple: async () => 'simple' };
+  let installed = false;
+  const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
+    async install(decorate: (target: unknown) => unknown) { installed = true; return await decorate({ prototype }); },
+  } };
+  await assert.rejects(
+    () => installGuardedRuntimeViaHook({ coordinator: coordinator as never, rootId: 'root-1', source }),
+    /does not accept a startup declaration/,
+  );
+  assert.equal(installed, false, 'an older harness must never reach the decorator');
+  assert.equal(prototype.stream, originalStream);
+});
+
+test('a rejected declaration aborts before the install is attempted', async () => {
+  const coordinator = fakeCoordinator();
+  let installed = false;
+  const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
+    async declareStartup() { throw new Error('startup evidence: owner pin is not configured'); },
+    async install() { installed = true; return () => {}; },
+  } };
+  await assert.rejects(
+    () => installGuardedRuntimeViaHook({ coordinator: coordinator as never, rootId: 'root-1', source }),
+    /owner pin is not configured/,
+  );
+  assert.equal(installed, false);
+});
+
+test('an all-off startup is declared explicitly instead of staying silent', async () => {
+  const coordinator = fakeCoordinator();
+  const source: Record<PropertyKey, unknown> = {};
+  publishFakeHook(source, () => () => {});
+  await declareStartupViaHook({ 'openai-codex': false, commandcode: false }, source);
+  assert.equal(declarations.length, 1);
+  assert.deepEqual(declarations[0], {
+    providers: { 'openai-codex': false, commandcode: false },
+  }, 'silence is not OFF: both providers are named false');
+  assert.deepEqual(coordinator.pauses, []);
+});
+
 test('with a hook present the guard installs on the handed-over prototype and dispose restores it', async () => {
   const coordinator = fakeCoordinator();
   const originalStream = async () => 'stream-result';
@@ -72,6 +148,7 @@ test('with a hook present the guard installs on the handed-over prototype and di
   const prototype: Record<string, unknown> = { stream: originalStream, streamSimple: originalSimple,
     getAuth: async () => ({ auth: { apiKey: 'k', headers: {} } }) };
   const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
+    async declareStartup() { return 'pending'; },
     async install(decorate: (target: unknown) => unknown) {
       return await decorate({ prototype, host: { name: 'fake', version: '1.0.0', packagePath: '/tmp/fake' } });
     },
@@ -99,6 +176,7 @@ test('identity resolves from the dispatching instance, not from the prototype', 
     streamSimple: async function (this: unknown, _model: unknown, _ctx: unknown, options?: { fetch?: typeof fetch }) { return await callGated(options); },
   };
   const source: Record<PropertyKey, unknown> = { [RUNTIME_HOOK_KEY]: {
+    async declareStartup() { return 'pending'; },
     async install(decorate: (target: unknown) => unknown) {
       return await decorate({ prototype, host: { name: 'fake', version: '1.0.0', packagePath: '/tmp/fake' } });
     },
