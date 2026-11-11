@@ -10,6 +10,8 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 
 ## Features
 
+- **Experimental OpenCode task delegation** — optional parent-only `opencode_task` that runs the official CLI in a separate runtime with explicit per-call approval; not a `/subagent-model` route and not enabled by default. See [experimental guide](docs/opencode-poc.md).
+
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
@@ -991,6 +993,7 @@ This is useful for creating agents that inherit extension tools but should not h
 docs/                 # Long-form guides (shipped to npm; README links out to them)
   workflows.md        # SubagentWorkflow: writing, editing, saving and re-running scripts
   rpc.md              # Cross-extension integration: pi.events, subagents:rpc:*, manager registry
+  opencode-poc.md     # Experimental parent-only OpenCode task delegation and its limits
 examples/
   workflows/          # Runnable examples, executed by test/workflow-examples.test.ts
   agent-tool-description.md
@@ -1024,6 +1027,8 @@ src/
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
+  opencode-poc.ts     # Experimental parent-only opencode_task tool via official CLI
+  opencode-runner.ts  # OpenCode CLI subprocess, JSONL parsing, abort/timeout, usage
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch
