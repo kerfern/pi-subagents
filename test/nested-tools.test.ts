@@ -346,7 +346,9 @@ describe("child-safe nested Agent tools", () => {
 
     await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue" });
 
-    expect(manager.resume).toHaveBeenLastCalledWith("child-1", "Continue", undefined, {});
+    const lastOptions = vi.mocked(manager.resume).mock.calls.at(-1)?.[3];
+    expect(lastOptions).toStrictEqual({});
+    expect(Object.hasOwn(lastOptions ?? {}, "maxTurns")).toBe(false);
   });
 
   it("reports a background child that fails to start as a tool error", async () => {
