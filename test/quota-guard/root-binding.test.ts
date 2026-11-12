@@ -637,8 +637,9 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
   const bareRuntime = { stream: dispatch, streamSimple: dispatch } as unknown as QuotaGuardHost['runtime'];
   const bare: QuotaGuardHost = { rootId: ROOT_ID, runtime: bareRuntime, coordinator };
   quotaGuardExtension(bare);
+  const bareStream = bare.runtime.stream as (this: unknown, ...args: unknown[]) => unknown;
   await assert.rejects(
-    async () => (bare.runtime?.stream as (this: unknown, ...args: unknown[]) => unknown).call(receiver, model, undefined, {}),
+    async () => bareStream.call(receiver, model, undefined, {}),
     /no verified Codex meter scope configured/,
   );
 });
