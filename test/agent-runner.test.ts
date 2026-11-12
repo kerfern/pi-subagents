@@ -3219,6 +3219,14 @@ describe("agent-runner turn limits", () => {
       expect(result.aborted).toBe(false);
     });
 
+    it("treats maxTurns 0 as unlimited on resume", async () => {
+      setDefaultMaxTurns(4);
+      setGraceTurns(2);
+      const { session } = await resumeWithTurns(30, { maxTurns: 0 });
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
     it("reports each resumed turn to the caller's counter", async () => {
       const onTurnEnd = vi.fn();
       await resumeWithTurns(3, { maxTurns: 10, onTurnEnd });

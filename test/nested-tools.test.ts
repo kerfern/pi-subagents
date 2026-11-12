@@ -340,6 +340,15 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined, expect.objectContaining({ maxTurns: 3 }));
   });
 
+  it("omits maxTurns on a nested resume when neither source sets one", async () => {
+    const [agent] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true });
+
+    await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue" });
+
+    expect(manager.resume).toHaveBeenLastCalledWith("child-1", "Continue", undefined, {});
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error

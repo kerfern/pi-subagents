@@ -193,9 +193,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         }
         // Frontmatter authoritative, as on the spawn path; the manager falls
         // back to the limit the child was spawned with, then the default.
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
-          maxTurns: getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns,
-        });
+        // Omit the property when neither source sets one: an own `undefined`
+        // would mean an explicit unlimited override and skip the spawned limit.
+        const resumeMaxTurns = getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns;
+        const resumed = await context.manager.resume(
+          params.resume,
+          params.prompt,
+          signal,
+          resumeMaxTurns === undefined ? {} : { maxTurns: resumeMaxTurns },
+        );
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);

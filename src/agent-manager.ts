@@ -1524,7 +1524,11 @@ export class AgentManager {
     }
 
     try {
-      const maxTurns = options && Object.hasOwn(options, "maxTurns") ? options.maxTurns : record.invocation?.maxTurns;
+      // An own `maxTurns: undefined` is a resolved-unlimited caller, not an
+      // absent override. Pass 0 so the runner does not fall back to the type
+      // or project default; an absent property keeps the spawned fallback.
+      const hasExplicitMaxTurns = options !== undefined && Object.hasOwn(options, "maxTurns");
+      const maxTurns = hasExplicitMaxTurns ? options.maxTurns ?? 0 : record.invocation?.maxTurns;
       this.settleOutcome(record, await resumeAgent(record.session, prompt, {
         type: record.type,
         maxTurns,
@@ -1652,7 +1656,7 @@ export class AgentManager {
       this.drainQueue();
     };
 
-    const maxTurns = Object.hasOwn(options, "maxTurns") ? options.maxTurns : record.invocation?.maxTurns;
+    const maxTurns = Object.hasOwn(options, "maxTurns") ? options.maxTurns ?? 0 : record.invocation?.maxTurns;
     const promise = resumeAgent(record.session, prompt, {
       type: record.type,
       maxTurns,

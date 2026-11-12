@@ -873,7 +873,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
       expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBe(50);
     });
 
-    it("does not resurrect the spawned limit when the caller resolves to unlimited", async () => {
+    it("translates an explicit unlimited resume to 0 so the runner keeps it unlimited", async () => {
       manager = new AgentManager();
       vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: mockSession() as any, aborted: false, steered: false });
       const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
@@ -885,10 +885,10 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
       vi.mocked(resumeAgent).mockResolvedValue({ text: "second", aborted: false, steered: false });
 
       await manager.resume(id, "more", undefined, { maxTurns: undefined });
-      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBeUndefined();
+      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBe(0);
 
       await (await manager.resume(id, "again", undefined, { isBackground: true, maxTurns: undefined }))!.promise;
-      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBeUndefined();
+      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBe(0);
     });
 
     it("inline: abort() reaches the resumed run and the record stays stopped", async () => {
