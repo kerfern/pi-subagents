@@ -637,6 +637,7 @@ test('transport: configured codexLimits reach the codex attempt scope', async ()
   const bareRuntime = { stream: dispatch, streamSimple: dispatch } as unknown as QuotaGuardHost['runtime'];
   const bare: QuotaGuardHost = { rootId: ROOT_ID, runtime: bareRuntime, coordinator };
   quotaGuardExtension(bare);
+  assert.ok(bare.runtime);
   const bareStream = bare.runtime.stream as (this: unknown, ...args: unknown[]) => unknown;
   await assert.rejects(
     async () => bareStream.call(receiver, model, undefined, {}),
