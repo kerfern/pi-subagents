@@ -6,7 +6,7 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { abortable } from "./abortable.js";
 import {
   buildAgentRegistry,
@@ -92,7 +92,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number }): Promise<AgentRecord | undefined>;
   /** Stop an owned child; false when it is neither queued nor running. */
   abort(id: string): boolean;
 }
@@ -191,7 +191,11 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
         }
-        const resumed = await context.manager.resume(params.resume, params.prompt, signal);
+        // Frontmatter authoritative, as on the spawn path; the manager falls
+        // back to the limit the child was spawned with, then the default.
+        const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns,
+        });
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
           : textResult(`Failed to resume nested agent "${params.resume}".`, true);

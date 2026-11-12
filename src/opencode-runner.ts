@@ -57,6 +57,17 @@ function allowedEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 const finiteNumber = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 const asRecord = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
 
+/** Renders OpenCode's terminal error event (provider failures, rate limits) instead of dropping its detail. */
+const describeErrorEvent = (raw: unknown): string => {
+  const error = asRecord(raw);
+  const label = [error.type, error.name].find((v): v is string => typeof v === "string" && v.length > 0);
+  const message = typeof error.message === "string" && error.message.length > 0 ? error.message : undefined;
+  const status = finiteNumber(error.status);
+  const detail = [label, message].filter(Boolean).join(": ");
+  const described = detail ? `${detail}${status !== undefined ? ` (status ${String(status)})` : ""}` : "no detail";
+  return `OpenCode reported an error event: ${described}`.slice(0, 500);
+};
+
 export async function runOpenCodeTask(
   prompt: string,
   cwdInput: string,
@@ -154,7 +165,7 @@ function supervise(
       modelId = event.modelID;
     }
     if (modelId !== undefined && !modelMatches(modelId)) return protocol("OpenCode emitted contradictory model identity");
-    if (event.type === "error") return protocol("OpenCode reported an error event");
+    if (event.type === "error") return terminate({ message: describeErrorEvent(event.error) });
     const part = asRecord(event.part);
     if (event.type === "text") {
       if (typeof part.text !== "string") return protocol("OpenCode text event missing text");

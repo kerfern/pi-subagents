@@ -114,23 +114,27 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     }
   });
 
-  it("does not let usage metadata change context-window percentage", async () => {
-    // Tool-result text participates in the projected transcript. Only usage
-    // metadata differs between these sessions, so it must not affect context.
-    const withUsage = await realSession();
-    const withoutUsage = await realSession();
+  it("leaves the context-window percentage alone", async () => {
+    // pi takes context usage from assistant messages; a tool result counts only
+    // by its own text. If the carried usage ever counted, a delegating session
+    // would look like it was filling its context with work that happened
+    // somewhere else entirely — and users would compact for no reason. The
+    // baseline is the same tool result without usage, because pi 1.x estimates
+    // the result's text into the percentage.
+    const session = await realSession();
+    const baseline = await realSession();
     try {
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
-      withUsage.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
-      withoutUsage.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
+      session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
+      baseline.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
 
-      expect(withUsage.getSessionStats().contextUsage?.percent ?? null).toBe(
-        withoutUsage.getSessionStats().contextUsage?.percent ?? null,
+      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(
+        baseline.getSessionStats().contextUsage?.percent ?? null,
       );
     } finally {
-      withUsage.dispose?.();
-      withoutUsage.dispose?.();
+      session.dispose?.();
+      baseline.dispose?.();
     }
   });
 

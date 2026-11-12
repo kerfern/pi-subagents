@@ -103,8 +103,14 @@ describe.skipIf(!isPosix)("runOpenCodeTask", () => {
     await expect(runWith("stdout-flood").promise).rejects.toThrow("exceeded output bound");
   });
 
-  it("fails on OpenCode error events", async () => {
-    await expect(runWith("error-event").promise).rejects.toThrow("error event");
+  it("fails on OpenCode error events, surfacing provider detail", async () => {
+    await expect(runWith("error-event").promise).rejects.toThrow(
+      /error event: provider\.rate-limit: The inference service is overloaded.*\(status 429\)/,
+    );
+  });
+
+  it("still fails on an OpenCode error event with no detail", async () => {
+    await expect(runWith("error-event-bare").promise).rejects.toThrow("error event: no detail");
   });
 
   it("fails on contradictory model identity", async () => {

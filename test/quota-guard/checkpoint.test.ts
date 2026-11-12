@@ -150,6 +150,18 @@ test('children round-trip, and the digest covers them', async () => {
   assert.match((editedRead as { reason: string }).reason, /digest mismatch/);
 });
 
+test('a lost-worktree child keeps that marker through the checkpoint round-trip', async () => {
+  const dir = await stateDir();
+  const children = [child({ worktreeLost: true })];
+  const checkpoint = createCheckpoint({ ...base(), children });
+  await writeCheckpoint(dir, checkpoint);
+
+  const read = await readCheckpoint(dir, checkpoint.id, { rootId: 'root-1', sessionId: 'session-1' });
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.ok && read.checkpoint.children, children);
+  assert.equal(read.ok && read.checkpoint.children[0].worktreeLost, true);
+});
+
 test('a checkpoint written before children existed still validates, as having none', async () => {
   const dir = await stateDir();
   // The pre-children canonical form, rebuilt here by hand so this pins the format rather than
@@ -203,6 +215,7 @@ test('a malformed child is refused rather than half-understood', () => {
   assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ type: 'not a type' })] }), /agent type name/);
   assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ handle: '' })] }), /handle must be a non-empty string/);
   assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ completedAt: -1 })] }), /completedAt/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child({ worktreeLost: 'yes' } as never)] }), /worktreeLost/);
   assert.throws(() => validateCheckpoint({ ...checkpoint, children: [child(), child()] }), /duplicate child handle/);
   assert.throws(
     () => validateCheckpoint({ ...checkpoint, children: Array.from({ length: 17 }, (_, index) => child({ handle: `explore-${index}` })) }),

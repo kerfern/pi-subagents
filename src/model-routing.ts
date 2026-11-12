@@ -11,7 +11,7 @@
 
 import type { ThinkingLevel } from "./types.js";
 
-export const DEFAULT_SUBAGENT_MODEL = "openai-codex/gpt-6-luna";
+export const DEFAULT_SUBAGENT_MODEL = "opencode-go/deepseek-v4.1-flash";
 export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.1-sol";
 const DEFAULT_SUBAGENT_THINKING: ThinkingLevel = "low";
 const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "xhigh";

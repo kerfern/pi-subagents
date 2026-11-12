@@ -11,6 +11,7 @@ const {
   sessionManagerInMemory,
   sessionManagerCreate,
   sessionManagerOpen,
+  sessionManagerForkFrom,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
@@ -26,13 +27,25 @@ const {
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
-  sessionManagerOpen: vi.fn(() => ({ kind: "reopened-session-manager" })),
+  // A child session this parent spawned: its header names the parent's file
+  // (`ctx` below), so a resume reopens it in place.
+  sessionManagerOpen: vi.fn((_path: string, _dir?: string) => ({
+    kind: "reopened-session-manager",
+    getHeader: () => ({ parentSession: "/sessions/parent.jsonl" }),
+    getCwd: () => "/child-cwd",
+  })),
+  sessionManagerForkFrom: vi.fn(() => ({ kind: "forked-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  // The runner forwards these to the child loader's `extensionFactories`. Stubbed
+  // to the shape pi returns: a factory that registers nothing.
+  createMcpExtension: () => () => {},
+  createCodemodeExtension: () => () => {},
+  createToolSearchExtension: () => () => {},
   // Identity, as pi's own is: `defineTool` exists for the type inference, and
   // the structured-output tool is built through it.
   defineTool: (definition: unknown) => definition,
@@ -64,7 +77,12 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
   },
   getAgentDir,
-  SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate, open: sessionManagerOpen },
+  SessionManager: {
+    inMemory: sessionManagerInMemory,
+    create: sessionManagerCreate,
+    open: sessionManagerOpen,
+    forkFrom: sessionManagerForkFrom,
+  },
   SettingsManager: { create: settingsManagerCreate },
 }));
 
@@ -101,6 +119,7 @@ vi.mock("../src/env.js", () => ({
 
 vi.mock("../src/prompts.js", () => ({
   buildAgentPrompt: vi.fn(() => "system prompt"),
+  inheritableParentPrompt: vi.fn((rendered: string) => rendered),
 }));
 
 vi.mock("../src/memory.js", () => ({
@@ -175,6 +194,7 @@ function createSession(finalText: string) {
       const opts = createAgentSession.mock.calls[0]?.[0];
       return opts ? mockRegistry(opts).map((name) => ({ name })) : [];
     }),
+    getToolDefinition: vi.fn((_name: string): Record<string, unknown> | undefined => undefined),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
     agent: { beforeToolCall: undefined } as {
@@ -192,6 +212,7 @@ const ctx = {
   model: undefined,
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
   getSystemPrompt: vi.fn(() => "parent prompt"),
+  isProjectTrusted: vi.fn(() => true),
   sessionManager: {
     getBranch: vi.fn(() => []),
     getSessionFile: vi.fn(() => "/sessions/parent.jsonl"),
@@ -207,6 +228,7 @@ beforeEach(() => {
   sessionManagerInMemory.mockClear();
   sessionManagerCreate.mockClear();
   sessionManagerOpen.mockClear();
+  sessionManagerForkFrom.mockClear();
   // The setting is process-global; a test that flips it must not leak the
   // flip into the next one.
   setRememberAgents(true);
@@ -255,7 +277,7 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
-    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir", { projectTrusted: true });
     // Same claim as before `rememberAgents` flipped the default — the effective
     // cwd reaches the session manager — now via the persistent constructor.
     expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp/worktree", undefined, expect.anything());
@@ -263,6 +285,61 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
+  });
+
+  it("carries the parent's project-trust decision into the child's settings and loader", async () => {
+    const { session } = createSession("UNTRUSTED");
+    createAgentSession.mockResolvedValue({ session });
+    ctx.isProjectTrusted.mockReturnValueOnce(false);
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(settingsManagerCreate).toHaveBeenCalledWith(expect.any(String), "/mock/agent-dir", { projectTrusted: false });
+    // One manager for both, so the loader and the session agree on what loads.
+    const settingsManager = settingsManagerCreate.mock.results[0].value;
+    expect(lastLoaderOpts().settingsManager).toBe(settingsManager);
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
+  });
+
+  it("a cross-directory spawn keeps the parent project's settings but reports its cwd untrusted", async () => {
+    const { session } = createSession("CROSS");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, cwd: "/target", configCwd: "/project" });
+
+    // Both managers read the parent project's settings with the parent's trust…
+    expect(settingsManagerCreate).toHaveBeenCalledTimes(2);
+    for (const call of settingsManagerCreate.mock.calls) {
+      expect(call).toEqual(["/project", "/mock/agent-dir", { projectTrusted: true }]);
+    }
+    // …the loader's still loads the parent project's extensions, while the
+    // session's tells extensions (pi's MCP reading `<cwd>/.pi/mcp.json`) that
+    // its cwd is not a trusted project.
+    const loaderManager = lastLoaderOpts().settingsManager;
+    const sessionManager = createAgentSession.mock.calls[0][0].settingsManager;
+    expect(sessionManager).not.toBe(loaderManager);
+    expect(sessionManager.isProjectTrusted()).toBe(false);
+  });
+
+  it("forwards pi's built-in extensions to the child loader, as pi's CLI does", async () => {
+    // The child loader is built here, not by pi's CLI, so without these a
+    // `builtin:<name>` path resolves to nothing and MCP/codemode never load.
+    const { session } = createSession("BUILTINS");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "Say BUILTINS", { pi });
+
+    const factories = lastLoaderOpts().extensionFactories as Array<{
+      name: string;
+      factory: unknown;
+      builtin?: boolean;
+      replaceable?: boolean;
+    }>;
+    expect(factories.map((f) => f.name)).toEqual(["codemode", "tool-search", "mcp"]);
+    for (const f of factories) {
+      expect(f).toMatchObject({ builtin: true, replaceable: true });
+      expect(typeof f.factory).toBe("function");
+    }
   });
 
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {
@@ -350,7 +427,7 @@ describe("agent-runner final output capture", () => {
   it("resumeAgent also falls back to the final assistant message text", async () => {
     const { session } = createSession("RESUMED");
 
-    const result = await resumeAgent(session as any, "Continue");
+    const result = await resumeAgent(session as any, "Continue", { type: "Explore" });
 
     expect(result.text).toBe("RESUMED");
     expect(result.failure).toBeUndefined();
@@ -481,7 +558,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       session.messages.push(errorFinal);
     }) as any;
 
-    const result = await resumeAgent(session as any, "Continue");
+    const result = await resumeAgent(session as any, "Continue", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
   });
@@ -498,7 +575,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       session.messages.push({ role: "user", content: "follow-up" }, errorFinal);
     }) as any;
 
-    const result = await resumeAgent(session as any, "follow-up");
+    const result = await resumeAgent(session as any, "follow-up", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
     expect(result.text).toBe(""); // NOT "PREVIOUS ANSWER"
@@ -517,7 +594,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       );
     }) as any;
 
-    const result = await resumeAgent(session as any, "go");
+    const result = await resumeAgent(session as any, "go", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
     expect(result.text).toBe("new partial"); // this resume's progress, not the prior answer
@@ -624,6 +701,7 @@ describe("agent-runner usage callback wiring", () => {
     });
 
     await resumeAgent(session as any, "continue", {
+      type: "Explore",
       onAssistantUsage: (lifetime, delta) => seen.push({ lifetime, delta }),
     });
 
@@ -775,7 +853,6 @@ function makeAgentConfig(overrides: Record<string, unknown> = {}) {
     promptMode: "replace" as const,
     inheritContext: false,
     runInBackground: false,
-    isolated: false,
     ...overrides,
   };
 }
@@ -955,6 +1032,83 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerCreate).not.toHaveBeenCalled();
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
     expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/explore.jsonl", "/normal/pi/sessions");
+  });
+
+  it("reopens the child in place when this parent spawned it", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+
+    expect(sessionManagerForkFrom).not.toHaveBeenCalled();
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionManager: expect.objectContaining({ kind: "reopened-session-manager" }),
+    }));
+  });
+
+  it("forks the child when another parent resumes it, leaving the original file to its own parent", async () => {
+    // pi's /fork and /clone copy the parent's saved agent records, so a second
+    // parent can resume the same child. Opening the file in place would
+    // interleave two histories in it.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
+    sessionManagerOpen.mockReturnValueOnce({
+      kind: "reopened-session-manager",
+      getHeader: () => ({ parentSession: "/sessions/original-parent.jsonl" }),
+      getCwd: () => "/child-cwd",
+    });
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+
+    expect(sessionManagerForkFrom).toHaveBeenCalledWith(
+      "/sessions/explore.jsonl",
+      "/child-cwd",
+      "/normal/pi/sessions",
+      { parentSession: "/sessions/parent.jsonl" },
+    );
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionManager: { kind: "forked-session-manager" },
+    }));
+  });
+
+  it("does not prepend the parent's conversation to a reopened one", async () => {
+    // A reopened session already holds its own history; `inherit_context` is a
+    // property of the agent type and must only seed a fresh conversation, or a
+    // cold resume would paste the parent's whole transcript into this turn.
+    const parentCtx = {
+      ...ctx,
+      sessionManager: {
+        ...ctx.sessionManager,
+        getBranch: vi.fn(() => [{ type: "message", message: { role: "user", content: "PARENT-TURN" } }]),
+      },
+    };
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const fresh = createSession("OK").session;
+    createAgentSession.mockResolvedValueOnce({ session: fresh });
+    await runAgent(parentCtx, "Explore", "go", { pi, inheritContext: true });
+    expect(String(fresh.prompt.mock.calls[0][0])).toContain("PARENT-TURN");
+
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const reopened = createSession("OK").session;
+    createAgentSession.mockResolvedValueOnce({ session: reopened });
+    await runAgent(parentCtx, "Explore", "carry on", { pi, inheritContext: true, resumeSessionFile: "/sessions/explore.jsonl" });
+
+    expect(reopened.prompt).toHaveBeenCalledWith("carry on");
+  });
+
+  it("reopens in place a child whose header names no parent", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    sessionManagerOpen.mockReturnValueOnce({
+      kind: "reopened-session-manager",
+      getHeader: () => ({}),
+      getCwd: () => "/child-cwd",
+    } as any);
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+
+    expect(sessionManagerForkFrom).not.toHaveBeenCalled();
   });
 
   it("uses pi's normal persistent session location and links to the parent session", async () => {
@@ -1598,6 +1752,29 @@ describe("agent-runner async extension tool registration", () => {
     expect(session.getActiveToolNames()).toContain("mcp_search");
   });
 
+  it("a deferred tool stays inactive until activated, then survives turn_end", async () => {
+    setup();
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__lookup"] });
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    // pi's MCP registers server tools with non-declared exposure by default.
+    const registry = session.getAllTools.getMockImplementation();
+    session.getAllTools.mockImplementation(() =>
+      (registry?.() ?? []).map((t: { name: string }) =>
+        t.name === "mcp__srv__lookup" ? { ...t, exposure: "deferred" } : t,
+      ),
+    );
+
+    await runAgent(ctx, "Explore", "go", { pi });
+    expect(session.getActiveToolNames()).not.toContain("mcp__srv__lookup");
+
+    // tool_search loads it mid-run; the next renarrow must not take it back.
+    session.setActiveToolsByName([...session.getActiveToolNames(), "mcp__srv__lookup"]);
+    for (const l of listeners) l({ type: "turn_end" });
+
+    expect(session.getActiveToolNames()).toContain("mcp__srv__lookup");
+  });
+
   it("ext: admits a late tool from the selected extension but not from others", async () => {
     setup({ extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/foo.ts": [], "/ext/bar.ts": [] });
@@ -1675,7 +1852,7 @@ describe("agent-runner async extension tool registration", () => {
     createAgentSession.mockResolvedValue({ session });
 
     await runAgent(ctx, "Explore", "go", { pi });
-    await resumeAgent(session as any, "keep going");
+    await resumeAgent(session as any, "keep going", { type: "Explore" });
 
     registerLate("/ext/foo.ts", "foo_late");
     registerLate("/ext/bar.ts", "bar_late");
@@ -1703,6 +1880,121 @@ describe("agent-runner async extension tool registration", () => {
     expect(createAgentSession.mock.calls[0][0].tools).toEqual(["read"]);
     expect(session.setActiveToolsByName).not.toHaveBeenCalled();
     expect(session.agent.beforeToolCall).toBeUndefined();
+  });
+});
+
+// ─── bare `mcp__` entries in tools: (Claude Code style) ─────────────────
+// Claude Code lists MCP tools as bare `mcp__<server>__<tool>`. As in pi's own
+// `--tools`, such an entry narrows MCP tools to the matching ones and leaves every
+// other extension tool to the usual rules. The mock registry declares every tool
+// `direct`, so the active set after runAgent is exactly the agent's scope.
+describe("agent-runner bare mcp__ entries in tools:", () => {
+  function setup(o: { mcpToolPatterns?: string[]; extSelectors?: string[]; disallowedTools?: string[] } = {}) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true, ...o }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+  }
+
+  async function activeAfterRun(): Promise<string[]> {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await runAgent(ctx, "Explore", "go", { pi });
+    return session.getActiveToolNames();
+  }
+
+  it("keeps only the named MCP tool and leaves non-MCP extension tools alone", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__keep"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__keep", "mcp__srv__drop"], "/ext/other.ts": ["other_tool"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).toContain("mcp__srv__keep");
+    expect(active).not.toContain("mcp__srv__drop");
+    expect(active).toContain("other_tool");
+  });
+
+  it("matches `*` patterns, as pi's --tools does", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__*"] });
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__a", "mcp__srv__b", "mcp__other__c"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).toEqual(expect.arrayContaining(["mcp__srv__a", "mcp__srv__b"]));
+    expect(active).not.toContain("mcp__other__c");
+  });
+
+  it("admits the named MCP tool and its codemode/tool_search bridges through the ext: opt-in", async () => {
+    // An ext: selector for another extension flips extension tools to an
+    // allowlist; the bare mcp__ entry and the bridges that reach it must survive.
+    setup({ mcpToolPatterns: ["mcp__srv__keep"], extSelectors: ["ext:foo"] });
+    withExtensions({
+      "/ext/foo.ts": ["foo_tool"],
+      "/ext/mcp.ts": ["mcp__srv__keep", "mcp__srv__drop"],
+      "/ext/bridges.ts": ["codemode", "tool_search", "bridge_sibling"],
+    });
+
+    const active = await activeAfterRun();
+
+    expect(active).toEqual(expect.arrayContaining(["foo_tool", "mcp__srv__keep", "codemode", "tool_search"]));
+    expect(active).not.toContain("mcp__srv__drop");
+    expect(active).not.toContain("bridge_sibling"); // the opt-in still applies to everything else
+  });
+
+  it("narrows MCP tools that register after spawn, as pi's MCP does once its servers connect", async () => {
+    setup({ mcpToolPatterns: ["mcp__srv__keep"] });
+    withExtensions({ "/ext/mcp.ts": [] });
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const mcp = loaderExtensionsRef.current.extensions.find((e) => e.path === "/ext/mcp.ts")!;
+    mcp.tools.set("mcp__srv__keep", {});
+    mcp.tools.set("mcp__srv__drop", {});
+    for (const l of listeners) l({ type: "turn_end" });
+
+    expect(session.getActiveToolNames()).toContain("mcp__srv__keep");
+    expect(session.getActiveToolNames()).not.toContain("mcp__srv__drop");
+    // codemode reaches MCP tools without activating them, so the call gate must agree.
+    await expect(
+      session.agent.beforeToolCall?.({ toolCall: { name: "mcp__srv__drop" } }),
+    ).resolves.toMatchObject({ block: true });
+    await expect(
+      session.agent.beforeToolCall?.({ toolCall: { name: "mcp__srv__keep" } }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("disallowed_tools wins over a bridge and a named MCP tool", async () => {
+    setup({
+      mcpToolPatterns: ["mcp__srv__keep"],
+      extSelectors: ["ext:foo"],
+      disallowedTools: ["codemode", "mcp__srv__keep"],
+    });
+    withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/mcp.ts": ["mcp__srv__keep", "codemode", "tool_search"] });
+
+    const active = await activeAfterRun();
+
+    expect(active).not.toContain("codemode");
+    expect(active).not.toContain("mcp__srv__keep");
+    expect(active).toContain("tool_search");
+  });
+
+  it("warns when mcp__ entries cannot be honoured because extensions are off", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, mcpToolPatterns: ["mcp__srv__keep"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const errors = onToolActivity.mock.calls
+      .map((c) => c[0]?.toolName)
+      .filter((n): n is string => typeof n === "string" && n.startsWith("tools-error:"));
+    expect(errors).toEqual([expect.stringContaining("mcp__srv__keep")]);
   });
 });
 
@@ -1749,6 +2041,36 @@ describe("extensionCanonicalNames (#143 — package short name alias)", () => {
     // Without this, `pi.extensions: ["./src/index.ts"]` only ever matches as "src".
     const dir = pkgDir("@tintinweb/Pi-Subagents", ["./src/index.ts"]);
     expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents"]);
+  });
+
+  it("aliases a directory-style entry to the package name even though pi registers dist/index.js", () => {
+    // A manifest may name a directory (`pi.extensions: ["./dist"]`); pi resolves
+    // it to `dist/index.js` when registering, so an exact-equality check never
+    // fires and the package alias is lost — `ext:<pkg>` silently matches nothing
+    // and the path-derived fallback (`ext:dist`) breaks on a folder rename.
+    const dir = pkgDir("pi-web-access", ["./dist"]);
+    mkdirSync(join(dir, "dist"));
+    writeFileSync(join(dir, "dist", "index.js"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "dist", "index.js"))).toEqual(["dist", "pi-web-access"]);
+  });
+
+  it("a directory-style entry lends its alias to every file inside that directory", () => {
+    // The directory arm matches by path prefix, so a sibling loaded by its own
+    // path answers to the same package alias — it lives under the package's
+    // declared directory either way. A file outside the declaration gets no
+    // alias, and the separator in the prefix test keeps a longer sibling
+    // directory name (`dist-v2`) from matching the `./dist` declaration.
+    const dir = pkgDir("@scope/dir-pkg", ["./dist"]);
+    mkdirSync(join(dir, "dist"));
+    writeFileSync(join(dir, "dist", "index.js"), "export default () => {};");
+    writeFileSync(join(dir, "dist", "other.js"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "dist", "index.js"))).toEqual(["dist", "dir-pkg"]);
+    expect(extensionCanonicalNames(join(dir, "dist", "other.js"))).toEqual(["other", "dir-pkg"]);
+    writeFileSync(join(dir, "root-level.ts"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "root-level.ts"))).toEqual(["root-level"]);
+    mkdirSync(join(dir, "dist-v2"));
+    writeFileSync(join(dir, "dist-v2", "index.js"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "dist-v2", "index.js"))).toEqual(["dist-v2"]);
   });
 
   it("adds no alias for a loose file with no enclosing package.json", () => {
@@ -1869,6 +2191,26 @@ describe("agent-runner extension allowlist", () => {
     expect(tools).toContain("mcp");
     expect(tools).toContain("mcp_call");
     expect(tools).not.toContain("other_tool");
+  });
+
+  it("['builtin:mcp'] keeps pi's built-in MCP and drops the other built-ins", async () => {
+    setupArrayAgent(["builtin:mcp"]);
+    withExtensions({
+      "builtin:mcp": ["mcp_builtin_tool"],
+      "builtin:codemode": ["codemode"],
+      "/ext/mcp.ts": ["mcp_ext_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const tools = lastToolsPassed();
+    expect(tools).toContain("mcp_builtin_tool");
+    expect(tools).not.toContain("codemode");
+    expect(tools).not.toContain("mcp_ext_tool");
+    expect(onToolActivity.mock.calls.map((c) => c[0]?.toolName).filter((n) => n?.startsWith("extension-error:"))).toEqual([]);
   });
 
   it("matches a package-installed extension by its package short name, not just its src dir (#143)", async () => {
@@ -2054,6 +2396,24 @@ describe("agent-runner exclude_extensions", () => {
     expect(extensionErrors(onToolActivity)).toEqual([]);
   });
 
+  it("extensions: true + exclude builtin:mcp — pi's built-in MCP is dropped, no typo warning", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["builtin:mcp"] });
+    withExtensions({
+      "builtin:mcp": ["mcp_builtin_tool"],
+      "builtin:codemode": ["codemode"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const tools = lastToolsPassed();
+    expect(tools).not.toContain("mcp_builtin_tool");
+    expect(tools).toContain("codemode");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
   it("['*'] + exclude — wildcard no longer short-circuits, exclusion applies", async () => {
     setupAgent({ extensions: ["*"], excludeExtensions: ["notify"] });
     withExtensions({
@@ -2211,6 +2571,94 @@ describe("agent-runner unknown built-in tools", () => {
   });
 });
 
+// ─── zero-tool spawns (#396) ────────────────────────────────────────────
+// Claude Code refuses an agent whose `tools:` list resolved to nothing, rather than
+// start one that can only narrate tool calls. pi registers extension tools after
+// spawn, so the refusal judges extension tools by what loaded.
+describe("agent-runner zero-tool spawns", () => {
+  function setup(agent: Record<string, unknown>, extensions = false) {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions, ...agent }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce((agent.builtinToolNames as string[] | undefined) ?? BUILTINS_7);
+    createAgentSession.mockClear();
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+  }
+  const run = (extra: Partial<RunOptions> = {}) => runAgent(ctx, "Explore", "go", { pi, ...extra });
+
+  it("refuses when every entry is unknown and extensions are off", async () => {
+    setup({ builtinToolNames: ["Foo", "Bar"] });
+
+    await expect(run()).rejects.toThrow(
+      "Agent 'Explore' would be spawned with zero tools — refusing. Its tools list resolved to nothing: " +
+        "unrecognized [Foo, Bar]. Fix the agent's tools frontmatter or pass a different subagent_type.",
+    );
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, Record<string, unknown>, boolean]>([
+    ["isolated", { builtinToolNames: ["Foo"], isolated: true }, true],
+    ["no extension loaded", { builtinToolNames: ["Foo"] }, true],
+    ["the only valid built-in denied", { builtinToolNames: ["Foo", "read"], disallowedTools: ["read"] }, false],
+  ])("refuses: %s", async (_, agent, extensions) => {
+    setup(agent, extensions);
+
+    await expect(run()).rejects.toThrow("resolved to nothing: unrecognized [Foo].");
+  });
+
+  it("refuses when only the extension's own scope gate loaded", async () => {
+    setup({ builtinToolNames: ["Foo"] }, true);
+    withExtensions({ "<inline:pi-subagents-scope>": [] });
+
+    await expect(run()).rejects.toThrow("resolved to nothing: unrecognized [Foo].");
+  });
+
+  it("refuses an ext:-only agent whose extensions are not loaded", async () => {
+    setup({ builtinToolNames: [], extSelectors: ["ext:foo"] }, true);
+    withExtensions({ "/ext/bar.ts": ["bar_tool"] });
+
+    await expect(run()).rejects.toThrow(
+      "resolved to nothing: recognized but matched no tools in this session [ext:foo].",
+    );
+  });
+
+  it.each<[string, Record<string, unknown>, boolean, Record<string, string[]>, Partial<RunOptions>]>([
+    ["no tools: line, extensions off", { builtinToolNames: undefined }, false, {}, {}],
+    ["no tools: line, extensions on", { builtinToolNames: undefined }, true, {}, {}],
+    ["tools: *", { builtinToolNames: BUILTINS_7 }, false, {}, {}],
+    ["tools: none", { builtinToolNames: [] }, false, {}, {}],
+    ["an unknown name next to a valid one", { builtinToolNames: ["Foo", "read"] }, false, {}, {}],
+    ["an unknown name with extension tools loaded", { builtinToolNames: ["Foo"] }, true, { "/ext/bar.ts": ["bar_tool"] }, {}],
+    [
+      "an unknown name with an injected StructuredOutput",
+      { builtinToolNames: ["Foo"] },
+      false,
+      {},
+      { structuredOutput: { schema: { type: "object" }, check: () => true } as RunOptions["structuredOutput"] },
+    ],
+    [
+      "an unknown name next to ext:foo with foo loaded",
+      { builtinToolNames: ["Foo"], extSelectors: ["ext:foo", "ext:gone"] },
+      true,
+      { "/ext/foo.ts": ["foo_tool"] },
+      {},
+    ],
+    [
+      "an mcp__ entry next to an ext: entry that matched nothing",
+      { builtinToolNames: [], extSelectors: ["ext:foo"], mcpToolPatterns: ["mcp__s__t"] },
+      true,
+      { "/ext/mcp.ts": ["codemode"] },
+      {},
+    ],
+  ])("starts: %s", async (_, agent, extensions, loaded, extra) => {
+    setup(agent, extensions);
+    withExtensions(loaded);
+
+    await run(extra).catch((err: Error) => expect(err.message).not.toContain("zero tools"));
+    expect(createAgentSession).toHaveBeenCalled();
+  });
+});
+
 // ─── ext: tool selectors in `tools:` (opt-in flip) ──────────────────────
 describe("parseExtSelectors", () => {
   it("bare ext:foo → name only, no narrowing", () => {
@@ -2258,6 +2706,7 @@ describe("agent-runner ext: tool selectors", () => {
     builtinToolNames: string[];
     extSelectors?: string[];
     disallowedTools?: string[];
+    isolated?: boolean;
   }) {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: o.extensions }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
@@ -2265,6 +2714,7 @@ describe("agent-runner ext: tool selectors", () => {
         extensions: o.extensions,
         extSelectors: o.extSelectors,
         disallowedTools: o.disallowedTools,
+        isolated: o.isolated,
       }),
     );
     vi.mocked(getToolNamesForType).mockReturnValueOnce(o.builtinToolNames);
@@ -2341,8 +2791,9 @@ describe("agent-runner ext: tool selectors", () => {
   it("ext: cannot pull an extension that `extensions: [...]` excludes — warns, no surfacing", async () => {
     // extensions: [a] loads only a. ext:foo references foo, which isn't loaded;
     // the opt-in flip still mutes a (it isn't named in ext:), so the agent gets
-    // zero extension tools and a warning fires.
-    setupExtAgent({ extensions: ["a"], builtinToolNames: [], extSelectors: ["ext:foo"] });
+    // zero extension tools and a warning fires. `read` keeps it spawnable: with no
+    // tool at all it would be refused (see "agent-runner zero-tool spawns").
+    setupExtAgent({ extensions: ["a"], builtinToolNames: ["read"], extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/a.ts": ["a_tool"], "/ext/foo.ts": ["foo_tool"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -2404,6 +2855,48 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).not.toContain("foo_tool");
     expect(lastLoaderOpts().noExtensions).toBe(true);
+  });
+
+  // Frontmatter is authoritative (README "Frontmatter is authoritative"): the
+  // agent file's `isolated` holds on every spawn path, not only the ones that
+  // resolve it before calling the runner. `@handle` mentions and RPC spawns
+  // pass no `isolated` at all.
+  describe("the agent file's `isolated` wins over the spawn option", () => {
+    function run(fileIsolated: boolean | undefined, optionIsolated: boolean | undefined) {
+      setupExtAgent({ extensions: true, builtinToolNames: ["read"], extSelectors: ["ext:foo"], isolated: fileIsolated });
+      withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      return runAgent(ctx, "Explore", "go", { pi, isolated: optionIsolated });
+    }
+
+    it("isolated: true in the file applies when the spawn omits it", async () => {
+      await run(true, undefined);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
+
+    it("isolated: true in the file overrides a spawn's isolated: false", async () => {
+      await run(true, false);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
+
+    it("isolated: false in the file overrides a spawn's isolated: true", async () => {
+      await run(false, true);
+
+      expect(lastToolsPassed()).toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(false);
+    });
+
+    it("the spawn option decides when the file leaves isolated unset", async () => {
+      await run(undefined, true);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
   });
 
   it("ext: composes with a path-loaded extension via its canonical name", async () => {
@@ -2468,6 +2961,58 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).toContain("foo_other");
     expect(tools).not.toContain("foo_tool"); // denylisted even though ext:foo selects it
+  });
+});
+
+// Subagent thinking levels inherit the spawning session's level unless the
+// caller or the agent file pins one — otherwise an unset level falls through
+// to pi's defaultThinkingLevel (e.g. "max") instead of matching the parent.
+describe("agent-runner thinking level inheritance", () => {
+  it("inherits the parent session level when neither option nor agent config sets one", async () => {
+    const { session } = createSession("INHERITED");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "Say INHERITED", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "medium",
+    }));
+  });
+
+  it("prefers an explicit option over the parent session level", async () => {
+    const { session } = createSession("EXPLICIT");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "Say EXPLICIT", {
+      pi,
+      thinkingLevel: "high",
+    });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "high",
+    }));
+  });
+
+  it("prefers the agent config over the parent session level", async () => {
+    const { session } = createSession("CONFIG");
+    createAgentSession.mockResolvedValue({ session });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "low" }) as any);
+
+    await runAgent({ ...ctx, thinkingLevel: "medium" } as any, "Explore", "Say CONFIG", { pi });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingLevel: "low",
+    }));
+  });
+
+  it("omits thinkingLevel when nothing sets it, so pi applies its own default", async () => {
+    const { session } = createSession("DEFAULT");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "Say DEFAULT", { pi });
+
+    const opts = createAgentSession.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(opts).not.toHaveProperty("thinkingLevel");
   });
 });
 
@@ -2629,6 +3174,57 @@ describe("agent-runner turn limits", () => {
     await runWithTurns(3, { maxTurns: 10, onTurnEnd });
     expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
   });
+
+  // #368 — a resumed run is the same kind of run as the first one: the same
+  // steer → grace → abort machine must bound it. resumeAgent wired only tool
+  // activity, usage and compaction, so a resumed agent had no turn limit at
+  // all and its widget counter never moved off turn 1.
+  describe("on resume (#368)", () => {
+    /** Resume a session whose prompt fires `turns` turn_end events, like runWithTurns. */
+    async function resumeWithTurns(turns: number, options: Partial<Parameters<typeof resumeAgent>[2]> = {}) {
+      const { session, listeners } = createSession("OK");
+      session.prompt.mockImplementation(async () => {
+        for (let i = 0; i < turns; i++) {
+          for (const l of [...listeners]) l({ type: "turn_end" });
+        }
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+      });
+      const result = await resumeAgent(session as any, "keep going", { type: "Explore", ...options });
+      return { session, result };
+    }
+
+    it("steers once on reaching the limit, and does not abort", async () => {
+      setGraceTurns(5);
+      const { session, result } = await resumeWithTurns(5, { maxTurns: 5 });
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.steer.mock.calls[0][0]).toContain("turn limit");
+      expect(session.abort).not.toHaveBeenCalled();
+      expect(result.steered).toBe(true);
+      expect(result.aborted).toBe(false);
+    });
+
+    it("hard-aborts once the grace turns are used up", async () => {
+      setGraceTurns(2);
+      const { session, result } = await resumeWithTurns(7, { maxTurns: 5 });
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.abort).toHaveBeenCalled();
+      expect(result.aborted).toBe(true);
+    });
+
+    it("does not steer or abort below the limit", async () => {
+      const { session, result } = await resumeWithTurns(3, { maxTurns: 5 });
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+      expect(result.steered).toBe(false);
+      expect(result.aborted).toBe(false);
+    });
+
+    it("reports each resumed turn to the caller's counter", async () => {
+      const onTurnEnd = vi.fn();
+      await resumeWithTurns(3, { maxTurns: 10, onTurnEnd });
+      expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
+    });
+  });
 });
 
 // A parent Esc / interrupt reaches the child through options.signal. The only
@@ -2636,6 +3232,31 @@ describe("agent-runner turn limits", () => {
 // nothing checked that the signal actually reaches the session, so a child could
 // be marked stopped while it keeps running and burning tokens.
 describe("agent-runner abort signal forwarding", () => {
+  // A signal that fired BEFORE the child was prompted. `addEventListener` never
+  // fires on an already-aborted signal, and pi's `session.abort()` is a no-op
+  // until a run is active — so the only way to honor it is not to prompt.
+  it("does not prompt when the signal fired before session creation", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("resumeAgent does not prompt when its signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+
+    await resumeAgent(session as any, "continue", { type: "Explore", signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
   it("aborts the session when the parent signal fires mid-run", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     const controller = new AbortController();

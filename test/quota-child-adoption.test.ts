@@ -79,6 +79,14 @@ describe("AgentManager — quota-guard child adoption", () => {
     expect(manager.resolveMention("explore")?.kind).toBe("tombstone");
   });
 
+  it("preserves a lost-worktree marker so adoption cannot reopen it in the main checkout", async () => {
+    const sessionFile = await transcript("child-lost-worktree.jsonl");
+    const result = manager.adoptTombstones([entry({ sessionFile, worktreeLost: true })]);
+
+    expect(result).toEqual({ adopted: 1, skipped: 0 });
+    expect(manager.listTombstones()[0].worktreeLost).toBe(true);
+  });
+
   it("skips a child whose transcript is gone, instead of holding its name for nothing", async () => {
     const result = manager.adoptTombstones([entry({ sessionFile: join(dir, "missing.jsonl") })]);
 

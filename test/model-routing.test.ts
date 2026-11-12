@@ -97,17 +97,17 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
-  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use OpenAI Codex Luna/low", () => {
+  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use OpenCode Go DeepSeek v4.1 Flash/low", () => {
     const state = restoreRoutingState([], [
       { provider: "openai-codex", id: "gpt-6.1-sol" },
-      { provider: "openai-codex", id: "gpt-6-luna" },
+      { provider: "opencode-go", id: "deepseek-v4.1-flash" },
     ]);
     for (const role of ["reviewer", "Plan", "advisor"]) {
       expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.1-sol");
       expect(thinkingForSubagent(state, role)).toBe("xhigh");
     }
     for (const role of ["worker", "Explore", "implementer", "custom-role"]) {
-      expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6-luna");
+      expect(modelForSubagent(state, role)).toBe("opencode-go/deepseek-v4.1-flash");
       expect(thinkingForSubagent(state, role)).toBe("low");
     }
   });

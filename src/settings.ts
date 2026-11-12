@@ -144,8 +144,9 @@ export interface SubagentsSettings {
    */
   agentMentions?: AgentMentionMode;
   /**
-   * Whether subagents persist their pi session by default, so `@handle` can
-   * reopen an agent's conversation long after its in-memory record is gone.
+   * Whether subagents persist their pi session by default, so `@handle`,
+   * `Agent({ resume })` and a workflow's `resume` can reopen an agent's
+   * conversation long after its in-memory record is gone.
    * Defaults to `true`. Per-agent `persist_session:` frontmatter overrides it
    * in both directions. Turning it off restores the previous behaviour, where
    * a handle stops resolving roughly ten minutes after the agent finishes and
@@ -351,6 +352,41 @@ export interface SubagentsSettings {
    */
   showModel?: boolean;
   /**
+   * Whether agents declared by installed pi packages load, and from which
+   * packages. Defaults to `true`.
+   *
+   *   - `true`  — every package whose `package.json` declares `pi.subagents`
+   *               (or the top-level `pi-subagents` key) contributes its agents.
+   *   - `false` — none do.
+   *   - list    — only packages matching an entry, compared case-insensitively
+   *               against the unscoped short name (`@scope/foo` matches `foo`),
+   *               the full package name, or the settings source string.
+   *
+   * On by default because installing is already the trust decision: pi executes
+   * an installed package's `extensions/` and injects its `skills/` into the
+   * system prompt with no further prompt, so a declared `.md` agent is strictly
+   * less privileged than what the same package already runs. The gate exists for
+   * users who want to narrow that anyway, not as a second install ritual.
+   *
+   * Package agents always load at the *lowest* precedence, below global and
+   * project files, so a same-named local agent silently takes the name back.
+   */
+  packageAgents?: boolean | string[];
+  /**
+   * The same gate for workflow scripts declared by installed pi packages
+   * (`pi.subagents.workflows`). Defaults to `true`.
+   *
+   * Deliberately separate from `packageAgents` rather than folded into it: an
+   * agent is markdown we hand to a model, a workflow is `.js` we execute. Both
+   * still sit below the package's own `extensions/`, which pi runs unsandboxed,
+   * so the default matches — but a user who wants package agents without package
+   * workflow scripts can have that without giving up either wholesale.
+   *
+   * No-op when `workflowsEnabled` is off: the tool is never registered, so there
+   * is nothing to resolve a workflow name against.
+   */
+  packageWorkflows?: boolean | string[];
+  /**
    * How much of the conversation viewer's transcript renders as Markdown.
    * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
    * same setting, so a choice made in the overlay persists like one made in
@@ -399,6 +435,8 @@ export interface SettingsAppliers {
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
+  setPackageAgents: (gate: boolean | string[]) => void;
+  setPackageWorkflows: (gate: boolean | string[]) => void;
 }
 
 /** Emit callback — a subset of `pi.events.emit` to keep helpers testable. */
@@ -454,6 +492,25 @@ function sanitizeReserveUnits(value: unknown): Record<string, number> | undefine
     out[id] = units;
   }
   return out;
+}
+
+/**
+ * Normalize a package gate: a boolean passes through, an array is trimmed to its
+ * non-empty string entries, a bare string becomes a one-entry allowlist, and
+ * anything else is dropped.
+ *
+ * The two coercions exist for the same reason: this setting's default is `true`,
+ * so *dropping* a malformed value silently admits every package — the opposite
+ * of what someone narrowing the gate meant. So an array that trims to empty is
+ * kept as `[]` (matching nothing, like `false`) rather than dropped, and
+ * `"my-package"` — the obvious typo for a one-entry list — is read as
+ * `["my-package"]` rather than widened to everything.
+ */
+function sanitizePackageGate(val: unknown): boolean | string[] | undefined {
+  if (typeof val === "boolean") return val;
+  if (typeof val === "string") return val.trim() ? [val.trim()] : [];
+  if (!Array.isArray(val)) return undefined;
+  return val.filter((e): e is string => typeof e === "string").map(e => e.trim()).filter(Boolean);
 }
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
@@ -569,6 +626,10 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (codexLimits) out.quotaGuardCodexLimits = codexLimits;
   const reserveUnits = sanitizeReserveUnits(r.quotaGuardReserveUnits);
   if (reserveUnits) out.quotaGuardReserveUnits = reserveUnits;
+  const packageAgents = sanitizePackageGate(r.packageAgents);
+  if (packageAgents !== undefined) out.packageAgents = packageAgents;
+  const packageWorkflows = sanitizePackageGate(r.packageWorkflows);
+  if (packageWorkflows !== undefined) out.packageWorkflows = packageWorkflows;
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
     // dropped, silently leaving the PERMISSIVE default in place. Every string is
@@ -675,6 +736,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.quotaGuardStateDir === "string") appliers.setQuotaGuardStateDir(s.quotaGuardStateDir);
   if (s.quotaGuardCodexLimits) appliers.setQuotaGuardCodexLimits(s.quotaGuardCodexLimits);
   if (s.quotaGuardReserveUnits) appliers.setQuotaGuardReserveUnits(s.quotaGuardReserveUnits);
+  if (s.packageAgents !== undefined) appliers.setPackageAgents(s.packageAgents);
+  if (s.packageWorkflows !== undefined) appliers.setPackageWorkflows(s.packageWorkflows);
 }
 
 /**

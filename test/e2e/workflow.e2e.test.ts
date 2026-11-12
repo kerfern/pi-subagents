@@ -21,7 +21,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxText, fauxToolCall, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { encodeCwd } from "../../src/output-file.js";
 import { readJournal } from "../../src/workflow/journal.js";
@@ -94,6 +94,8 @@ describe("Workflow end to end", () => {
     const childPrompts: string[] = [];
     /** System prompts those same subagent calls were given. */
     const childSystemPrompts: string[] = [];
+    /** Every context the parent model was called with, as text. */
+    const parentContexts: string[] = [];
 
     const cwd = workflowProject();
     const run = await runPrintMode({
@@ -102,12 +104,13 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
-          childSystemPrompts.push(context.systemPrompt ?? "");
+          childSystemPrompts.push(getCurrentSystemPrompt(context.messages));
           return fauxText("SUBAGENT-DONE");
         }
+        parentContexts.push(asText(context));
         return asText(context).includes("Task ID")
           ? fauxText("workflow launched")
           : workflowCall(script);
@@ -137,6 +140,14 @@ describe("Workflow end to end", () => {
       expect(recorded).toHaveLength(2);
       expect(recorded.every(entry => entry.ok && entry.key.length > 0)).toBe(true);
       expect(recorded.map(entry => entry.index)).toEqual([0, 1]);
+
+      // The completion notification is the model's only account of the run, and
+      // its count comes from the runtime's real progress log, which holds an
+      // entry per transition per agent. Counting entries reported "2/10 agents".
+      const notified = await waitFor(() => parentContexts.some(c => c.includes("<task-notification>")));
+      expect(notified, "the parent never received the workflow's completion notification").toBe(true);
+      const notification = parentContexts.find(c => c.includes("<task-notification>")) ?? "";
+      expect(notification).toMatch(/e2e-fanout\\" completed — 2\/2 agents/);
 
       // A workflow child's text is the value `agent()` resolves to, not a
       // report a person reads, and its prompt has to say so — otherwise the
@@ -186,13 +197,13 @@ describe("Workflow end to end", () => {
       maxModelCalls: 32,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           const seen = asText(context);
           childPrompts.push(seen);
           // Answer through the injected tool exactly once, then stop — a model
           // that kept calling it every turn would just spin.
-          const alreadyAnswered = (context.tools ?? []).length > 0 && /Recorded\./.test(seen);
+          const alreadyAnswered = getCurrentTools(context.messages).length > 0 && /Recorded\./.test(seen);
           return alreadyAnswered
             ? fauxText("done")
             : fauxToolCall("StructuredOutput", { files: ["a.ts", "b.ts"] }, { id: "so-1" });
@@ -234,7 +245,7 @@ describe("Workflow end to end", () => {
       maxModelCalls: 12,
       live: false, // scripted on purpose: a real model would not emit the tool call
       respond: context => {
-        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        const isParent = getCurrentTools(context.messages).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           childPrompts.push(asText(context));
           return fauxText("SUBAGENT-DONE");

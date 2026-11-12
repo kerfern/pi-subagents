@@ -27,7 +27,7 @@ const ctx = {
 function managerWithBridge(bridge: object): AgentManager {
   const ManagerWithBridge = AgentManager as unknown as new (...args: unknown[]) => AgentManager;
   const managerBridge = { invalidate: vi.fn(), dispose: vi.fn(), ...bridge };
-  const manager = new ManagerWithBridge(undefined, 1, undefined, undefined, undefined, undefined, managerBridge);
+  const manager = new ManagerWithBridge(undefined, 1, undefined, undefined, undefined, undefined, undefined, managerBridge);
   managers.push(manager);
   return manager;
 }

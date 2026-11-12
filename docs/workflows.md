@@ -247,7 +247,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku`. **Refused while the session's [subagent model route](../README.md#subagent-model-routing) is active** unless it names the routed model — the route decides what every child runs, so a script cannot pick one. Change the route with `/subagent-model` |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. With an active [subagent route](../README.md#subagent-model-routing), a conflicting value is refused; omit it to use routed thinking. Without routing, omission falls back to agent definition then parent |
-| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
+| `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent. Only this option decides, as in Claude Code — an agent file's `isolation:` does not apply to workflow children |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
@@ -257,6 +257,7 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 
 Every child of a run is a fresh subagent, so every one of them runs the session's routed model and thinking level (see [Subagent Model Routing](../README.md#subagent-model-routing)): the row reports what it actually ran on, and an `agent({ model })` or `agent({ effort })` that conflicts with its route is refused rather than ignored — typically surfacing to the script as a `null` agent and a run-level error, the same shape a bad agent type takes.
+A child stays resumable for the whole run. The manager evicts a finished child's record about ten minutes after it settles, and a review or a merge queue easily takes longer; `resume` then reopens the child's saved session under the same id, still owned by the run. That reopen runs under the agent type's current definition, so the model and tree the script chose for the first run are not carried over. It fails, resolving to `null` with the reason on that agent's row in the card and the inspector, when the child's session was never saved (`rememberAgents` off, or `persist_session: false`), its file is gone, or it ran with `isolation: "worktree"` and left changes: that worktree was removed when the child finished, with its changes on a branch, and continuing the work anywhere else would split it. A child whose worktree held no changes reopens in the run's directory, as in Claude Code.
 
 ### `pipeline()` and `parallel()`
 
@@ -292,9 +293,17 @@ The child runs in the *same* worker and vm context under its own globals, so it 
 | --- | --- |
 | An inline script, as run | `<tmp>/pi-subagents-<uid>/<encoded-cwd>/<session>/tasks/<run id>.workflow.js` |
 | The resume journal | the same directory, `<run id>.workflow.jsonl` |
-| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/`, first hit wins |
+| Saved workflows | `.pi/workflows/` → `.agents/workflows/` → `<agent dir>/workflows/` → installed pi packages, first hit wins |
 
 The first two are scratch: temp storage, wiped by a reboot or a temp sweep. Only the third is durable, and copying a script there is a manual step.
+
+A pi package can ship workflow scripts too, by declaring them in its `package.json`:
+
+```json
+{ "pi": { "subagents": { "workflows": ["./workflows"] } } }
+```
+
+Package directories are searched **last**, so a script of yours always wins the name, and only packages pi has actually installed are read — see [Shipping agents in a pi package](../README.md#shipping-agents-in-a-pi-package) for the full manifest and how discovery works. A package script still has to carry the `export const meta = …` declaration to count as a workflow. Set `"packageWorkflows": false` in `subagents.json` (or `/agents → Settings → Package workflows`) to leave package scripts out; the setting is separate from `packageAgents` because a workflow is JavaScript this extension executes.
 
 ### Limits and caps
 

@@ -128,6 +128,9 @@ function childList(value: unknown): AgentTombstone[] {
     const sessionFile = nonEmpty(child.sessionFile, `children[${index}].sessionFile`);
     if (!sessionFile.startsWith('/')) throw new Error(`children[${index}].sessionFile must be an absolute path`);
     if (child.alias !== undefined) nonEmpty(child.alias, `children[${index}].alias`);
+    if (child.worktreeLost !== undefined && typeof child.worktreeLost !== 'boolean') {
+      throw new Error(`children[${index}].worktreeLost must be a boolean`);
+    }
     if (!Number.isSafeInteger(child.completedAt) || (child.completedAt as number) < 0) {
       throw new Error(`children[${index}].completedAt must be a non-negative integer`);
     }
@@ -139,6 +142,7 @@ function childList(value: unknown): AgentTombstone[] {
       description: nonEmpty(child.description, `children[${index}].description`),
       sessionFile,
       completedAt: child.completedAt as number,
+      ...(child.worktreeLost ? { worktreeLost: true } : {}),
     });
   }
   return out;
@@ -194,6 +198,7 @@ function canonical(value: Omit<Checkpoint, 'digest'>): string {
         description: child.description,
         sessionFile: child.sessionFile,
         completedAt: child.completedAt,
+        ...(child.worktreeLost ? { worktreeLost: true } : {}),
       })),
     }),
   });

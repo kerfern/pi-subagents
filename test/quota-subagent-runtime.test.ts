@@ -230,6 +230,7 @@ async function createFixture(guardedProviders: readonly ("openai-codex" | "comma
     cwd: dir,
     modelRegistry,
     getSystemPrompt: () => "Answer with the single word ok.",
+    isProjectTrusted: () => true,
   } as any;
   return { runtime, modelRegistry, controls, network, context };
 }
@@ -290,7 +291,7 @@ describe.skipIf(!migrated)("quota guard on inherited real ModelRuntime child dis
     expect(codex.failure).toBeUndefined();
     expect(codex.responseText).toBe("ok");
     expect((codex.session as any).modelRuntime).toBe(fixture.runtime);
-    const codexResume = await resumeAgent(codex.session, "Reply once more.");
+    const codexResume = await resumeAgent(codex.session, "Reply once more.", { type: "quota-runtime-probe" as any });
     expect(codexResume.failure).toBeUndefined();
     expect(codexResume.text).toBe("ok");
 
@@ -298,7 +299,7 @@ describe.skipIf(!migrated)("quota guard on inherited real ModelRuntime child dis
     expect(commandCode.failure).toBeUndefined();
     expect(commandCode.responseText).toBe("ok");
     expect((commandCode.session as any).modelRuntime).toBe(fixture.runtime);
-    const commandCodeResume = await resumeAgent(commandCode.session, "Reply once more.");
+    const commandCodeResume = await resumeAgent(commandCode.session, "Reply once more.", { type: "quota-runtime-probe" as any });
     expect(commandCodeResume.failure).toBeUndefined();
     expect(commandCodeResume.text).toBe("ok");
 

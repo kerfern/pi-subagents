@@ -69,8 +69,16 @@ switch (mode) {
     );
     break;
   case "error-event":
-    emit({ type: "error", sessionID: "ses_1", error: { name: "UnknownError" } });
-    process.exit(0);
+    emit({
+      type: "error",
+      sessionID: "ses_1",
+      error: { type: "provider.rate-limit", name: "APIError", message: "The inference service is overloaded. Please try again later.", status: 429 },
+    });
+    process.exit(1);
+    break;
+  case "error-event-bare":
+    emit({ type: "error", sessionID: "ses_1" });
+    process.exit(1);
     break;
   case "wrong-model":
     emit({ type: "text", sessionID: "ses_1", modelID: "other/model", part: { text: "x" } });

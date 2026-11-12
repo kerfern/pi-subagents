@@ -79,7 +79,7 @@ describe("shared routing at startAgent", () => {
   it("routes reviewer, Plan, and advisor roles to reviewer model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [
       PRIMARY,
       { provider: "faux", id: "reviewer-1" },
       FALLBACK,
@@ -95,7 +95,7 @@ describe("shared routing at startAgent", () => {
   it("uses shared model for ordinary agents and Explore", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [
       PRIMARY,
       { provider: "faux", id: "reviewer-1" },
       FALLBACK,
@@ -114,7 +114,7 @@ describe("shared routing at startAgent", () => {
       reviewerEffectiveThinking: "high",
       effectiveThinking: "low",
     } as any);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
 
     for (const type of ["reviewer", "Plan", "advisor"]) {
       vi.mocked(runAgent).mockClear();
@@ -130,7 +130,7 @@ describe("shared routing at startAgent", () => {
   it("runs routed thinking instead of inherited or frontmatter thinking", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ effectiveThinking: "high" } as any);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
 
     await spawnAndSettle(manager, { thinkingLevel: "low" });
     expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
@@ -138,7 +138,7 @@ describe("shared routing at startAgent", () => {
 
   it("refuses an explicit thinking level that conflicts with the route", async () => {
     const routing = state({ effectiveThinking: "high" } as any);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
 
     await expect(spawnRefused(manager, {
       thinkingLevel: "medium",
@@ -152,7 +152,7 @@ describe("shared routing at startAgent", () => {
   it("allows an explicit thinking level that matches the route", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ effectiveThinking: "high" } as any);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
 
     await spawnAndSettle(manager, { thinkingLevel: "high", thinkingOverride: "high" });
     expect(vi.mocked(runAgent).mock.calls[0][3]!.thinkingLevel).toBe("high");
@@ -160,7 +160,7 @@ describe("shared routing at startAgent", () => {
 
   it("runs the routed model instead of the caller's inherited model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state()));
     await spawnAndSettle(manager, { model: FALLBACK });
     expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
   });
@@ -168,7 +168,7 @@ describe("shared routing at startAgent", () => {
   it("retries the same task once on the fallback after a provider failure", async () => {
     vi.mocked(runAgent).mockResolvedValueOnce(providerFail() as RunResult).mockResolvedValueOnce(ok() as RunResult);
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     const record = await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(FALLBACK);
@@ -182,7 +182,7 @@ describe("shared routing at startAgent", () => {
       .mockRejectedValueOnce(new Error("429 fallback quota exceeded"))
       .mockResolvedValueOnce(ok() as RunResult);
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
 
     await spawnAndSettle(manager);
 
@@ -197,7 +197,7 @@ describe("shared routing at startAgent", () => {
       failure: "gate command failed: npm test",
     } as RunResult);
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(1);
     expect(routing.routingFailed).toBe(false);
@@ -206,7 +206,7 @@ describe("shared routing at startAgent", () => {
   it("does not retry an aborted run", async () => {
     vi.mocked(runAgent).mockResolvedValue({ ...ok(), aborted: true, failure: "429 rate limit" } as RunResult);
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(1);
   });
@@ -214,14 +214,14 @@ describe("shared routing at startAgent", () => {
   it("does not retry a thrown non-provider error", async () => {
     vi.mocked(runAgent).mockRejectedValue(new Error("structured output schema mismatch"));
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(1);
   });
 
   it("retries a thrown provider error once", async () => {
     vi.mocked(runAgent).mockRejectedValueOnce(new Error("401 unauthorized")).mockResolvedValueOnce(ok() as RunResult);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state()));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(2);
   });
@@ -229,7 +229,7 @@ describe("shared routing at startAgent", () => {
   it("latches when the fallback fails, then refuses the next fresh dispatch without running it", async () => {
     vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(routing.routingFailed).toBe(true);
@@ -242,7 +242,7 @@ describe("shared routing at startAgent", () => {
   it("reports exact primary model when specialist route and fallback both fail", async () => {
     vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [
       PRIMARY,
       { provider: "faux", id: "reviewer-1" },
       FALLBACK,
@@ -255,7 +255,7 @@ describe("shared routing at startAgent", () => {
 
   it("fails before running when the routed model is not in the catalog", async () => {
     const routing = state({ effective: "faux/gone" });
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await expect(spawnRefused(manager)).rejects.toThrow(/unavailable/i);
     expect(routing.routingFailed).toBe(true);
     expect(runAgent).not.toHaveBeenCalled();
@@ -263,13 +263,13 @@ describe("shared routing at startAgent", () => {
 
   it("fails before running when the fallback is not in the catalog", async () => {
     const routing = state();
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing, [PRIMARY]));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [PRIMARY]));
     await expect(spawnRefused(manager)).rejects.toThrow(/unavailable/i);
     expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("rejects a conflicting caller-supplied model override", async () => {
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state()));
     await expect(
       spawnRefused(manager, { model: FALLBACK, modelOverride: "faux/fallback-1" }),
     ).rejects.toThrow(/override/i);
@@ -278,7 +278,7 @@ describe("shared routing at startAgent", () => {
 
   it("accepts a caller override that names the routed model", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state()));
     await spawnAndSettle(manager, { model: PRIMARY, modelOverride: "faux/primary-1" });
     expect(runAgent).toHaveBeenCalled();
   });
@@ -286,7 +286,7 @@ describe("shared routing at startAgent", () => {
   it("leaves resumes on their own model, out of the route and out of the latch", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state({ effective: "faux/gone", routingFailed: true, terminalReason: "latched" });
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(routing));
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager, { resumeSessionFile: "/tmp/s.jsonl", model: FALLBACK });
     expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(FALLBACK);
   });
@@ -294,7 +294,7 @@ describe("shared routing at startAgent", () => {
   it("settles once per logical task and leaks no pool slot", async () => {
     const completions: string[] = [];
     vi.mocked(runAgent).mockResolvedValueOnce(providerFail() as RunResult).mockResolvedValueOnce(ok() as RunResult);
-    manager = new AgentManager((r) => completions.push(r.id), 10, undefined, undefined, undefined, router(state()));
+    manager = new AgentManager((r) => completions.push(r.id), 10, undefined, undefined, undefined, undefined, router(state()));
     await spawnAndSettle(manager, { isBackground: true });
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(completions).toHaveLength(1);
@@ -305,7 +305,7 @@ describe("shared routing at startAgent", () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     process.env.PI_SUBAGENTS_MODEL_ROUTING = "off";
     try {
-      manager = new AgentManager(undefined, 10, undefined, undefined, undefined, router(state()));
+      manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state()));
       await spawnAndSettle(manager, { model: FALLBACK });
       expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(FALLBACK);
     } finally {

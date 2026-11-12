@@ -15,6 +15,9 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => "/tmp/pi-subagents-test-agent-dir",
   SessionManager: { inMemory: () => ({}), create: () => ({}) },
   SettingsManager: { create: () => ({ getSessionDir: () => undefined }) },
+  createCodemodeExtension: () => ({ name: "codemode", setup() {} }),
+  createToolSearchExtension: () => ({ name: "tool-search", setup() {} }),
+  createMcpExtension: () => ({ name: "mcp", setup() {} }),
 }));
 vi.mock("../src/agent-types.js", () => ({
   BUILTIN_TOOL_NAMES: ["read"],
@@ -25,7 +28,7 @@ vi.mock("../src/agent-types.js", () => ({
   getReadOnlyMemoryToolNames: () => [],
 }));
 vi.mock("../src/env.js", () => ({ detectEnv: async () => ({ isGitRepo: false, branch: "", platform: "test" }) }));
-vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "test prompt" }));
+vi.mock("../src/prompts.js", () => ({ buildAgentPrompt: () => "test prompt", inheritableParentPrompt: (prompt: string) => prompt }));
 
 import { getGraceTurns, resumeAgent, runAgent, setGraceTurns } from "../src/agent-runner.js";
 
@@ -81,6 +84,7 @@ describe("child confirmation runner binding", () => {
       modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
       sessionManager: { getSessionFile: vi.fn() },
       getSystemPrompt: () => "parent",
+      isProjectTrusted: () => true,
     } as unknown as ExtensionContext;
     const options = { pi: {} as never, childConfirmation: { uiContext: ui, beginRun } };
 
@@ -117,6 +121,7 @@ describe("child confirmation runner binding", () => {
       modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
       sessionManager: { getSessionFile: vi.fn() },
       getSystemPrompt: () => "parent",
+      isProjectTrusted: () => true,
     } as unknown as ExtensionContext;
     const previousGraceTurns = getGraceTurns();
     setGraceTurns(1);
@@ -151,6 +156,7 @@ describe("child confirmation runner binding", () => {
       modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
       sessionManager: { getSessionFile: vi.fn() },
       getSystemPrompt: () => "parent",
+      isProjectTrusted: () => true,
     } as unknown as ExtensionContext;
 
     await expect(runAgent(ctx, "general-purpose", "inspect", {
