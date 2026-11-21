@@ -615,6 +615,59 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
     manager.clearCompleted(true);
     expect(manager.getRecord(id)).toBeDefined();
   });
+
+  // Only the owner can read a nested child's result, so once the owner is gone
+  // an unread child has no reader left to be spared for.
+  it("clearCompleted(true) removes unread nested descendants along with their removed parent", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
+      description: "parent",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "scout", "child", {
+      description: "child",
+      isBackground: true,
+      depth: 2,
+      parentAgentId: parentId,
+    });
+    const grandchildId = manager.spawn(mockPi, mockCtx, "scout", "grandchild", {
+      description: "grandchild",
+      isBackground: true,
+      depth: 3,
+      parentAgentId: childId,
+    });
+    await Promise.all([parentId, childId, grandchildId].map(id => manager.getRecord(id)!.promise));
+    manager.getRecord(parentId)!.resultConsumed = true;
+
+    manager.clearCompleted(true);
+    expect(manager.getRecord(parentId)).toBeUndefined();
+    expect(manager.getRecord(childId)).toBeUndefined();
+    expect(manager.getRecord(grandchildId)).toBeUndefined();
+  });
+
+  it("clearCompleted(true) keeps an unread nested child while its parent stays", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
+      description: "parent",
+      isBackground: true,
+    });
+    const childId = manager.spawn(mockPi, mockCtx, "scout", "child", {
+      description: "child",
+      isBackground: true,
+      depth: 2,
+      parentAgentId: parentId,
+    });
+    await Promise.all([parentId, childId].map(id => manager.getRecord(id)!.promise));
+
+    // The parent is unread too, so it is spared — and can still collect its child.
+    manager.clearCompleted(true);
+    expect(manager.getRecord(parentId)).toBeDefined();
+    expect(manager.getRecord(childId)).toBeDefined();
+  });
 });
 
 // The manager-level usage hook is the ONE place every assistant message is seen
@@ -707,6 +760,10 @@ describe("AgentManager — the usage hook fires once per assistant message", () 
     // records would bill this session for two messages when one was sent. The
     // double-booking stays — it is what makes a hidden child visible.
     expect(manager.getRecord(parentId)!.lifetimeUsage).toEqual({ input: 20, output: 10, cacheWrite: 0, cost: 0.002 });
+    // `ownUsage` is the figure that is not double-booked: the parent keeps only
+    // its own message, the child only its own — what the fleet list shows.
+    expect(manager.getRecord(parentId)!.ownUsage).toEqual({ input: 10, output: 5, cacheWrite: 0, cost: 0.001 });
+    expect(manager.getRecord(childId)!.ownUsage).toEqual({ input: 10, output: 5, cacheWrite: 0, cost: 0.001 });
   });
 });
 
@@ -731,6 +788,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     const record = manager.getRecord(id)!;
 
     expect(record.lifetimeUsage).toEqual({ input: 0, output: 0, cacheWrite: 0, cost: 0 });
+    expect(record.ownUsage).toEqual({ input: 0, output: 0, cacheWrite: 0, cost: 0 });
     expect(record.compactionCount).toBe(0);
 
     manager.abort(id);
@@ -759,6 +817,35 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({
       input: 300, output: 130, cacheWrite: 30, cost: 0.03,
     });
+  });
+
+  // The workflow host reads the record inside these hooks to report a running
+  // row's counters (#298), so the record must already include the event.
+  it("updates the record before forwarding a spawn's activity and usage hooks", async () => {
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts: any) => {
+      // A real child does work first; by then spawn() has returned the id.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      opts.onToolActivity?.({ type: "end", toolName: "read" });
+      opts.onAssistantUsage?.({ input: 100, output: 20, cacheWrite: 0, cost: 0 });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+    const seen: { toolUses?: number; output?: number }[] = [];
+    let id = "";
+    const read = () => {
+      const record = manager.getRecord(id);
+      seen.push({ toolUses: record?.toolUses, output: record?.lifetimeUsage.output });
+    };
+
+    id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isBackground: true,
+      onToolActivity: read,
+      onAssistantUsage: read,
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(seen).toEqual([{ toolUses: 1, output: 0 }, { toolUses: 1, output: 20 }]);
   });
 
   it("onCompaction from runAgent increments record.compactionCount", async () => {
@@ -823,6 +910,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     await manager.resume(id, "more");
 
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5, cost: 0.007 });
+    expect(manager.getRecord(id)!.ownUsage).toEqual({ input: 70, output: 30, cacheWrite: 5, cost: 0.007 });
     expect(manager.getRecord(id)!.compactionCount).toBe(1);
   });
 
@@ -2264,6 +2352,71 @@ describe("AgentManager — waitForAll", () => {
     await expect(manager.waitForAll()).resolves.toBeUndefined();
     expect(manager.getRecord(id)?.status).toBe("error");
   });
+
+  it("waits for an inline resume without spinning on the settled spawn promise", async () => {
+    // An inline resume marks the record "running" but leaves `record.promise`
+    // pointing at the spawn's, long settled. Awaiting that resolves in a
+    // microtask, so the loop never yields: the resume's own I/O cannot run, the
+    // record never leaves "running", and the process pins a core forever. A
+    // workflow `agent({ resume })` in print mode hits this on exit.
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: mockSession(), aborted: false, steered: false,
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    // Settles on a timer: unreachable while the event loop is starved.
+    vi.mocked(resumeAgent).mockImplementation(() =>
+      new Promise(resolve => setTimeout(() => resolve({ text: "second", aborted: false, steered: false }), 5)),
+    );
+    const resumed = manager.resume(id, "more");
+    expect(manager.getRecord(id)?.status).toBe("running");
+
+    // A spinning loop would hang the test past vitest's own timeout (which a
+    // starved event loop cannot fire), so bound the passes and fail loudly.
+    let passes = 0;
+    const drain = vi.spyOn(manager as unknown as { drainQueue: () => void }, "drainQueue");
+    drain.mockImplementation(() => {
+      if (++passes > 1000) throw new Error("waitForAll spun without yielding");
+    });
+
+    await manager.waitForAll();
+    expect(manager.getRecord(id)?.status).toBe("completed");
+    await resumed;
+    expect(passes).toBeLessThan(10);
+  });
+
+  it("an inline resume's record.promise is the in-flight run, settling only once the record is terminal", async () => {
+    // What `get_subagent_result` with `wait` awaits (index.ts, nested-tools.ts):
+    // on the spawn's settled promise it returned mid-resume with a running record.
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first", session: mockSession(), aborted: false, steered: false,
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test", isBackground: true });
+    const record = manager.getRecord(id)!;
+    const spawnPromise = record.promise;
+    await spawnPromise;
+
+    let finish!: () => void;
+    vi.mocked(resumeAgent).mockImplementation(() =>
+      new Promise(resolve => { finish = () => resolve({ text: "second", aborted: false, steered: false }); }),
+    );
+    const resumed = manager.resume(id, "more");
+    const waiting = record.promise;
+    expect(waiting).not.toBe(spawnPromise);
+
+    let woke = false;
+    const waiter = waiting!.then(() => { woke = true; expect(record.status).toBe("completed"); });
+    await new Promise(r => setImmediate(r));
+    expect(woke, "the wait returned while the resume was still running").toBe(false);
+
+    finish();
+    await waiter;
+    expect(record.result).toBe("second");
+    await resumed;
+  });
 });
 
 describe("AgentManager — dispose prunes worktree repos", () => {
@@ -2387,6 +2540,31 @@ describe("AgentManager — background resume", () => {
     // Internal record bookkeeping still runs alongside the forwarded callbacks.
     expect(manager.getRecord(id)!.toolUses).toBe(1);
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
+    expect(manager.getRecord(id)!.ownUsage).toEqual({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
+  });
+
+  // As on spawn: a resumed workflow row is reported from inside these hooks.
+  it.each([
+    ["foreground", false],
+    ["background", true],
+  ])("updates the record before forwarding a %s resume's activity and usage hooks", async (_mode, isBackground) => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts: any) => {
+      opts.onToolActivity?.({ type: "end", toolName: "grep" });
+      opts.onAssistantUsage?.({ input: 5, output: 3, cacheWrite: 0, cost: 0 });
+      return { text: "ok" };
+    });
+    const seen: { toolUses: number; output: number }[] = [];
+    const read = () => {
+      const record = manager.getRecord(id)!;
+      seen.push({ toolUses: record.toolUses, output: record.lifetimeUsage.output });
+    };
+
+    const record = await manager.resume(id, "go", undefined, { isBackground, onToolActivity: read, onAssistantUsage: read });
+    await record?.promise;
+
+    expect(seen).toEqual([{ toolUses: 1, output: 0 }, { toolUses: 1, output: 3 }]);
   });
 
   it("queues a background resume when the concurrency pool is full", async () => {
@@ -2916,5 +3094,131 @@ describe("AgentManager — the agent file's `isolation` wins over the spawn opti
     await manager.awaitStartup(id);
 
     expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("AgentManager — waitForSettled (#443)", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  /**
+   * The parent ends as soon as it is aborted. The child is inside a tool call
+   * that ignores the abort — a write in progress — and finishes only when the
+   * test opens its gate.
+   */
+  function parentAndStubbornChild() {
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    const writes: string[] = [];
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, prompt, opts: any) => {
+      if (prompt === "child") {
+        await gate;
+        writes.push("OLD");
+        return { responseText: "child done", session: mockSession(), aborted: true, steered: false };
+      }
+      await new Promise<void>((resolve) => opts.signal.addEventListener("abort", () => resolve(), { once: true }));
+      return { responseText: "", session: mockSession(), aborted: true, steered: false };
+    });
+    manager = new AgentManager();
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", { description: "parent", isBackground: true });
+    const childId = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child", isBackground: true, parentAgentId: parentId, depth: 2,
+    });
+    return { parentId, childId, writes, openGate };
+  }
+
+  it("does not resolve while an aborted agent's owned child is still in a tool call", async () => {
+    const { parentId, childId, writes, openGate } = parentAndStubbornChild();
+
+    manager.abort(parentId);
+    await manager.getRecord(parentId)!.promise;
+    // The repro: the parent has settled and the child already reads "stopped",
+    // yet its write has not landed.
+    expect(manager.getRecord(childId)!.status).toBe("stopped");
+
+    let settled: boolean | undefined;
+    const waiting = manager.waitForSettled(parentId, 5_000).then((s) => { settled = s; });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBeUndefined();
+
+    openGate();
+    await waiting;
+    expect(settled).toBe(true);
+    // Settled means the child's write is behind us: a replacement writing now
+    // cannot be overwritten by it.
+    writes.push("NEW");
+    expect(writes).toEqual(["OLD", "NEW"]);
+  });
+
+  it("also waits for a descendant spawned while the tree unwinds", async () => {
+    let openChild!: () => void;
+    const childGate = new Promise<void>((resolve) => { openChild = resolve; });
+    let openGrandchild!: () => void;
+    const grandchildGate = new Promise<void>((resolve) => { openGrandchild = resolve; });
+    let childId = "";
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, prompt, opts: any) => {
+      if (prompt === "child") {
+        await childGate;
+        // Its last act before returning: a background grandchild.
+        manager.spawn(mockPi, mockCtx, "general-purpose", "grandchild", {
+          description: "grandchild", isBackground: true, parentAgentId: childId, depth: 3,
+        });
+      } else if (prompt === "grandchild") {
+        await grandchildGate;
+      } else {
+        await new Promise<void>((resolve) => opts.signal.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      return { responseText: "", session: mockSession(), aborted: true, steered: false };
+    });
+    manager = new AgentManager();
+    const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", { description: "parent", isBackground: true });
+    childId = manager.spawn(mockPi, mockCtx, "general-purpose", "child", {
+      description: "child", isBackground: true, parentAgentId: parentId, depth: 2,
+    });
+
+    manager.abort(parentId);
+    let settled: boolean | undefined;
+    const waiting = manager.waitForSettled(parentId, 5_000).then((s) => { settled = s; });
+    openChild();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled, "the grandchild is still running").toBeUndefined();
+
+    openGrandchild();
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it("reports false at the bound when a descendant never settles", async () => {
+    const { parentId, openGate } = parentAndStubbornChild();
+
+    manager.abort(parentId);
+    expect(await manager.waitForSettled(parentId, 30)).toBe(false);
+    openGate();
+  });
+
+  it("resolves true at once for an agent that has already settled with no descendants", async () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "solo", { description: "solo", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    expect(await manager.waitForSettled(id, 1_000)).toBe(true);
+  });
+
+  // What `get` reads as `settling`: the parent's own run is over and both
+  // records read "stopped", but the child's write is still in flight.
+  it("reports a stopped agent as settling until its owned child's run ends", async () => {
+    const { parentId, childId, openGate } = parentAndStubbornChild();
+
+    manager.abort(parentId);
+    await manager.getRecord(parentId)!.promise;
+    expect(manager.getRecord(parentId)!.status).toBe("stopped");
+    expect(manager.isSettling(parentId)).toBe(true);
+    expect(manager.isSettling(childId)).toBe(true);
+
+    openGate();
+    await manager.getRecord(childId)!.promise;
+    expect(manager.isSettling(parentId)).toBe(false);
+    expect(manager.isSettling(childId)).toBe(false);
   });
 });

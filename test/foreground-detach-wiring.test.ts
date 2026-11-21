@@ -38,6 +38,7 @@ vi.mock("../src/ui/fleet-list.js", () => ({
     }
     setUICtx = vi.fn();
     setWorkflowSource = vi.fn();
+    setTuiModeObserver = vi.fn();
     /** The real one peeks at the TUI's focused component; tests flip this. */
     editorHasFocus = vi.fn(() => true);
     setEnabled = vi.fn();
@@ -370,9 +371,9 @@ describe("Agent tool — foreground run sent to the background", () => {
     await execution;
 
     const created = pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "subagents:created");
-    expect(created).toEqual([["subagents:created", {
+    expect(created).toEqual([["subagents:created", expect.objectContaining({
       id: runs.agentId("long job"), type: "general-purpose", description: "long job", isBackground: true,
-    }]]);
+    })]]);
     runs.finish("long job", "DONE");
   });
 

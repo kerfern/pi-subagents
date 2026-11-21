@@ -7,12 +7,14 @@ import subagentsExtension from "../src/index.js";
 import {
   applyAndEmitLoaded,
   applySettings,
+  changedSettings,
   loadSettings,
   persistToastFor,
   type SettingsAppliers,
   saveAndEmitChanged,
   saveQuotaGuardProviderSetting,
   saveSettings,
+  settingSources,
   snapshotQuotaGuardSettings,
 } from "../src/settings.js";
 import { ctx as extensionContext, hermeticDir, makePi } from "./helpers/boot-extension.js";
@@ -22,20 +24,38 @@ import { ctx as extensionContext, hermeticDir, makePi } from "./helpers/boot-ext
  * - `globalDir`: redirected via PI_CODING_AGENT_DIR so getAgentDir() returns it.
  *   Simulates `~/.pi/agent/` — the global scope.
  * - `projectDir`: passed explicitly as cwd to load/save.
- *   Simulates the user's project root. Settings live at `<projectDir>/.pi/subagents.json`.
+ *   Simulates the user's project root. Its settings live at
+ *   `<projectDir>/.pi/subagents.json`; saves only land there when that file
+ *   already exists — see the "saveSettings write target" describe below.
  */
 describe("production settings snapshot wiring", () => {
+  // The merged save path writes only the keys the page changed, so an unset
+  // provider field stays absent instead of being frozen into the file.
+  const settingsPageKeys = {
+    matches: (data: string, id: string) =>
+      ({ "tui.input.submit": "\r", "tui.select.down": "\x1b[B", "tui.select.confirm": "\r" })[id] === data,
+    getKeys: () => [],
+  };
+  /** Open the Settings page, change max concurrency to 13, and leave. */
+  const driveSettingsPage = (factory: any) => {
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const page = factory({ requestRender: () => {} }, theme, settingsPageKeys, () => {});
+    page.handleInput("\x1b[B"); // filter → first row (max concurrent)
+    page.handleInput("\r"); // open its editor
+    for (const char of "13") page.handleInput(char);
+    page.handleInput("\r"); // submit
+  };
+
   it.each([
     ["unset provider fields", {}],
     ["legacy-only provider config", { quotaGuardEnabled: false }],
-  ])("saves actual snapshot with %s through /agents → Settings", async (_label, initial) => {
+  ])("persists only the changed key through /agents → Settings with %s", async (_label, initial) => {
     const env = hermeticDir({ settings: initial });
     try {
       initTheme(undefined, false);
       const boot = makePi();
       subagentsExtension(boot.pi);
       let settingsSelected = false;
-      let built: any;
       const ui = {
         notify: vi.fn(),
         select: vi.fn(async (_title: string, options: string[]) => {
@@ -44,8 +64,8 @@ describe("production settings snapshot wiring", () => {
           return options.find(option => option === "Settings");
         }),
         custom: vi.fn(async (factory: any) => {
-          built = factory({ requestRender: () => {} }, {}, {}, () => {});
-          built.handleInput(" ");
+          factory({ requestRender: () => {} }, { fg: (_c: string, t: string) => t }, settingsPageKeys, () => {});
+          driveSettingsPage(factory);
           return undefined;
         }),
         input: vi.fn(async () => undefined),
@@ -53,9 +73,9 @@ describe("production settings snapshot wiring", () => {
       await boot.commands.get("agents").handler("", extensionContext({ cwd: env.dir, ui }));
 
       const persisted = loadSettings(env.dir);
-      expect(ui.notify).toHaveBeenCalled(); // setting mutation reached notifyApplied()/snapshotSettings()
-      expect(persisted).toHaveProperty("maxConcurrent"); // unrelated snapshot field proves full snapshot persisted
-      expect(persisted.quotaGuardEnabled).toBe(initial.quotaGuardEnabled ?? false);
+      expect(ui.notify).toHaveBeenCalled(); // the change reached notifyApplied()
+      expect(persisted.maxConcurrent).toBe(13); // the key the UI changed is persisted
+      expect(persisted.quotaGuardEnabled).toBe(initial.quotaGuardEnabled); // unset stays unset
       expect(persisted.quotaGuardCodexEnabled).toBeUndefined();
       expect(persisted.quotaGuardCommandCodeEnabled).toBeUndefined();
     } finally {
@@ -111,7 +131,6 @@ describe("production settings snapshot wiring", () => {
       subagentsExtension(first.pi);
       subagentsExtension(second.pi);
       let settingsSelected = false;
-      let built: any;
       const ui = {
         notify: vi.fn(),
         select: vi.fn(async (_title: string, options: string[]) => {
@@ -120,8 +139,8 @@ describe("production settings snapshot wiring", () => {
           return options.find(option => option === "Settings");
         }),
         custom: vi.fn(async (factory: any) => {
-          built = factory({ requestRender: () => {} }, {}, {}, () => {});
-          built.handleInput(" ");
+          factory({ requestRender: () => {} }, { fg: (_c: string, t: string) => t }, settingsPageKeys, () => {});
+          driveSettingsPage(factory);
           return undefined;
         }),
         input: vi.fn(async () => undefined),
@@ -129,11 +148,17 @@ describe("production settings snapshot wiring", () => {
       const ctx = extensionContext({ cwd: env.dir, ui });
 
       await first.commands.get("quota-guard").handler("on codex", ctx);
+      const providerFile = JSON.parse(readFileSync(join(env.dir, ".pi", "subagents.json"), "utf-8"));
       await second.commands.get("agents").handler("", ctx);
 
       const saved = loadSettings(env.dir);
+      expect(saved.maxConcurrent).toBe(13); // the stale instance's own change landed
       expect(saved.quotaGuardCodexEnabled).toBe(true);
       expect(saved.quotaGuardCommandCodeEnabled).toBe(false);
+      // The other instance's provider switches are left byte-identical.
+      const afterFile = JSON.parse(readFileSync(join(env.dir, ".pi", "subagents.json"), "utf-8"));
+      expect(afterFile.quotaGuardCodexEnabled).toBe(providerFile.quotaGuardCodexEnabled);
+      expect(afterFile.quotaGuardCommandCodeEnabled).toBe(providerFile.quotaGuardCommandCodeEnabled);
     } finally {
       env.restore();
     }
@@ -276,8 +301,8 @@ describe("settings persistence", () => {
     saveSettings({ schedulingEnabled: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: true });
 
-    // Absence — caller's "use default" signal — must not become a stored false.
-    saveSettings({}, projectDir);
+    // Unset — the caller's "use default" signal — must not become a stored false.
+    saveSettings({ schedulingEnabled: undefined }, projectDir);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -286,7 +311,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ fleetView: false });
     saveSettings({ fleetView: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ fleetView: true });
-    writeProject({ fleetView: "on" } as any);
+    writeGlobal({ fleetView: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
@@ -295,7 +320,7 @@ describe("settings persistence", () => {
       saveSettings({ agentMentions: mode }, projectDir);
       expect(loadSettings(projectDir)).toEqual({ agentMentions: mode });
     }
-    writeProject({ agentMentions: "on" } as any);
+    writeGlobal({ agentMentions: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // unknown mode dropped
   });
 
@@ -314,8 +339,18 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ rememberAgents: false });
     saveSettings({ rememberAgents: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ rememberAgents: true });
-    writeProject({ rememberAgents: "on" } as any);
+    writeGlobal({ rememberAgents: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
+  });
+
+  it("round-trips cacheRetention; keeps the four values, drops others", () => {
+    for (const v of ["inherit", "none", "short", "long"] as const) {
+      saveSettings({ cacheRetention: v }, projectDir);
+      expect(loadSettings(projectDir)).toEqual({ cacheRetention: v });
+    }
+    writeProject({});
+    writeGlobal({ cacheRetention: "1h" });
+    expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
   it("round-trips widgetMode; keeps valid values, drops invalid", () => {
@@ -323,7 +358,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
     saveSettings({ widgetMode: "background" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "background" });
-    writeProject({ widgetMode: "sideways" } as any);
+    writeGlobal({ widgetMode: "sideways" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
@@ -332,7 +367,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "off" });
     saveSettings({ viewerMarkdown: "all" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ viewerMarkdown: "all" });
-    writeProject({ viewerMarkdown: "markdown" } as any);
+    writeGlobal({ viewerMarkdown: "markdown" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
@@ -341,7 +376,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: false });
     saveSettings({ outputTranscript: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: true });
-    writeProject({ outputTranscript: "no" } as any);
+    writeGlobal({ outputTranscript: "no" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
@@ -355,7 +390,7 @@ describe("settings persistence", () => {
     saveSettings({ backgroundByDefault: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ backgroundByDefault: true });
 
-    saveSettings({}, projectDir);
+    saveSettings({ backgroundByDefault: undefined }, projectDir);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -374,7 +409,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ packageAgents: true, packageWorkflows: true });
 
     saveSettings({ packageAgents: ["my-subagents", "@acme/tools"] }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["my-subagents", "@acme/tools"] });
+    expect(loadSettings(projectDir)).toEqual({ packageAgents: ["my-subagents", "@acme/tools"], packageWorkflows: true });
   });
 
   it("trims allowlist entries and drops the ones that are not strings", () => {
@@ -418,7 +453,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: false });
     saveSettings({ worktreeIsolation: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ worktreeIsolation: true });
-    writeProject({ worktreeIsolation: "off" } as any);
+    writeGlobal({ worktreeIsolation: "off" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
@@ -429,7 +464,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ reportUsage: false, showCost: false });
     // The sanitizer is an allowlist: a key it does not name is dropped, and the
     // setting silently never applies.
-    writeProject({ reportUsage: "on", showCost: 1 } as any);
+    writeGlobal({ reportUsage: "on", showCost: 1 } as any);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -438,7 +473,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ showModel: true });
     saveSettings({ showModel: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ showModel: false });
-    writeProject({ showModel: "on" } as any);
+    writeGlobal({ showModel: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -447,7 +482,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: true });
     saveSettings({ workflowsEnabled: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: false });
-    writeProject({ workflowsEnabled: "on" } as any);
+    writeGlobal({ workflowsEnabled: "on" } as any);
     // Dropped, not coerced — a truthy string must not switch the feature on.
     expect(loadSettings(projectDir)).toEqual({});
   });
@@ -467,13 +502,13 @@ describe("settings persistence", () => {
     // Exercise same production snapshot helper spread by index.ts.
     const emit = vi.fn();
     const unsetSnapshot = snapshotQuotaGuardSettings(false);
-    saveAndEmitChanged(unsetSnapshot, "saved", emit, projectDir);
+    saveAndEmitChanged(unsetSnapshot, {}, "saved", emit, projectDir);
     expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: false });
     expect(loadSettings(projectDir).quotaGuardCodexEnabled).toBeUndefined();
     expect(loadSettings(projectDir).quotaGuardCommandCodeEnabled).toBeUndefined();
 
     const legacyOnlySnapshot = snapshotQuotaGuardSettings(true);
-    saveAndEmitChanged(legacyOnlySnapshot, "saved", emit, projectDir);
+    saveAndEmitChanged(legacyOnlySnapshot, {}, "saved", emit, projectDir);
     expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: true });
   });
 
@@ -486,7 +521,9 @@ describe("settings persistence", () => {
       quotaGuardCommandCodeEnabled: false,
     };
 
-    saveAndEmitChanged(snapshot, "saved", vi.fn(), projectDir);
+    // Delta saves diff against the session-start effective settings, which
+    // include the provider switches inherited from global.
+    saveAndEmitChanged(snapshot, loadSettings(projectDir), "saved", vi.fn(), projectDir);
 
     expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 4 });
     expect(loadSettings(projectDir)).toEqual({
@@ -504,7 +541,7 @@ describe("settings persistence", () => {
     const emit = vi.fn();
 
     try {
-      const toast = saveAndEmitChanged({ maxConcurrent: 4 }, "saved", emit, projectDir);
+      const toast = saveAndEmitChanged({ maxConcurrent: 4 }, {}, "saved", emit, projectDir);
 
       expect(readFileSync(projectFile(), "utf-8")).toBe(malformed);
       expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
@@ -529,7 +566,7 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ quotaGuardEnabled: true });
 
     // Absence stays absent so the caller's "use default" signal is preserved.
-    saveSettings({}, projectDir);
+    saveSettings({ quotaGuardEnabled: undefined }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -547,7 +584,7 @@ describe("settings persistence", () => {
 
   it("round-trips quotaGuardCodexLimits; a malformed entry drops the whole value", () => {
     const limits = [{ id: "codex", windows: ["primary_window", "secondary_window"] }];
-    saveSettings({ quotaGuardCodexLimits: limits }, projectDir);
+    saveSettings({ quotaGuardCodexLimits: limits }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({ quotaGuardCodexLimits: limits });
 
     // Fail closed: a half-configured meter scope would attribute a Codex read to the wrong
@@ -564,6 +601,10 @@ describe("settings persistence", () => {
       writeProject({ quotaGuardCodexLimits: bad } as any);
       expect(loadSettings(projectDir)).toEqual({});
     }
+
+    // Absence stays absent rather than becoming an empty meter list.
+    saveSettings({ quotaGuardCodexLimits: undefined }, projectDir, "project");
+    expect(loadSettings(projectDir)).toEqual({});
   });
 
   it("round-trips quotaGuardReserveUnits; a malformed entry drops the whole value", () => {
@@ -571,7 +612,7 @@ describe("settings persistence", () => {
     // operator asserts one here. Values are window units; fractional is valid, zero is not - a zero
     // reserve is an unknown cost treated as zero, which the guard refuses at every other layer too.
     const units = { monthly: 12, fiveHour: 3.5, weekly: 0.5 };
-    saveSettings({ quotaGuardReserveUnits: units }, projectDir);
+    saveSettings({ quotaGuardReserveUnits: units }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({ quotaGuardReserveUnits: units });
 
     // Fail closed: one bad entry drops the whole seed rather than half-configuring the guard, so a
@@ -591,7 +632,7 @@ describe("settings persistence", () => {
     }
 
     // Absence stays absent so the caller's "use default" (unknown stays closed) is preserved.
-    saveSettings({}, projectDir);
+    saveSettings({ quotaGuardReserveUnits: undefined }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({});
   });
 
@@ -602,20 +643,110 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({});
   });
 
-  it("saveSettings writes only to the project file; global is untouched", () => {
-    writeGlobal({ maxConcurrent: 16 });
-    saveSettings({ maxConcurrent: 2 }, projectDir);
+  describe("saveSettings write target (#391)", () => {
+    it("writes the global file when the project has no settings file, and creates no .pi", () => {
+      expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBe("global");
 
-    // Project file contains the new value
-    expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
-    // Global file unchanged
-    expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 16 });
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+      // No project file — and no `.pi` directory left in the project either.
+      expect(existsSync(join(projectDir, ".pi"))).toBe(false);
+      // The save still loads back for this project (global scope).
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 2 });
+    });
+
+    it("writes the project file when one already exists; global is untouched", () => {
+      writeGlobal({ maxConcurrent: 16 });
+      writeProject({ graceTurns: 5 });
+      expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBe("project");
+
+      // The new value is merged into the project file's existing keys
+      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ graceTurns: 5, maxConcurrent: 2 });
+      // Global file unchanged
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 16 });
+    });
   });
 
-  it("saveSettings creates <cwd>/.pi/ when missing", () => {
-    expect(existsSync(join(projectDir, ".pi"))).toBe(false);
-    saveSettings({ maxConcurrent: 4 }, projectDir);
-    expect(existsSync(projectFile())).toBe(true);
+  describe("explicit scope (Tab on the Settings page)", () => {
+    it("project scope creates .pi/subagents.json with only the changed key", () => {
+      expect(saveSettings({ maxConcurrent: 2 }, projectDir, "project")).toBe("project");
+      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+      expect(existsSync(globalFile())).toBe(false);
+    });
+
+    it("global scope writes the global file even when the project has one", () => {
+      writeProject({ graceTurns: 5 });
+      expect(saveSettings({ maxConcurrent: 2 }, projectDir, "global")).toBe("global");
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ graceTurns: 5 });
+    });
+
+    it("a global write warns only when the project file sets a changed key", () => {
+      writeProject({ maxConcurrent: 3 });
+      const shadowed = saveAndEmitChanged({ maxConcurrent: 6 }, {}, "Max set to 6", vi.fn(), projectDir, "global");
+      expect(shadowed.message).toBe("Max set to 6 (saved to global settings; project settings override it)");
+      const clear = saveAndEmitChanged({ graceTurns: 2 }, {}, "Grace set to 2", vi.fn(), projectDir, "global");
+      expect(clear.message).toBe("Grace set to 2 (saved to global settings)");
+    });
+  });
+
+  describe("settingSources (the file tags on the Settings page)", () => {
+    it("names the file each loaded key comes from, the project file winning a key both set", () => {
+      writeGlobal({ maxConcurrent: 16, graceTurns: 10 });
+      writeProject({ maxConcurrent: 4, defaultJoinMode: "group" });
+      expect(settingSources(projectDir)).toEqual({
+        maxConcurrent: "project",
+        defaultJoinMode: "project",
+        graceTurns: "global",
+      });
+    });
+
+    it("leaves out a key whose stored value loading would drop", () => {
+      writeGlobal({ graceTurns: 10 });
+      writeProject({ graceTurns: 0, maxConcurrent: "four" });
+      expect(settingSources(projectDir)).toEqual({ graceTurns: "global" });
+    });
+  });
+
+  describe("saveSettings merges only changed keys", () => {
+    const defaults = { maxConcurrent: 10, graceTurns: 5, widgetMode: "all" as const };
+
+    it("does not revert a key another session saved to the shared global file", () => {
+      // Two sessions start from the same in-memory defaults.
+      saveAndEmitChanged({ ...defaults, maxConcurrent: 4 }, defaults, "a", vi.fn(), projectDir);
+      // The second session still holds maxConcurrent 10 and changes only the widget.
+      saveAndEmitChanged({ ...defaults, widgetMode: "off" }, defaults, "b", vi.fn(), projectDir);
+
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 4, widgetMode: "off" });
+    });
+
+    it("writes no untouched default into the file", () => {
+      saveAndEmitChanged({ ...defaults, graceTurns: 2 }, defaults, "c", vi.fn(), projectDir);
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ graceTurns: 2 });
+    });
+
+    it("removes a key whose value became unset, and keeps hand-written keys it does not know", () => {
+      writeGlobal({ fallbackSubagent: "Explore", someFutureKey: 1 });
+      expect(saveSettings({ fallbackSubagent: undefined }, projectDir)).toBe("global");
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ someFutureKey: 1 });
+    });
+
+    it("leaves a malformed or non-object target untouched and reports the save as failed", () => {
+      for (const content of ["not json {{", "[1]"]) {
+        writeFileSync(globalFile(), content);
+        expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBeUndefined();
+        expect(readFileSync(globalFile(), "utf-8")).toBe(content);
+      }
+    });
+
+    it("changedSettings returns only differing keys, with undefined for a key that became unset", () => {
+      expect(
+        changedSettings(
+          { maxConcurrent: 10, fallbackSubagent: "Explore", packageAgents: ["a"] },
+          { maxConcurrent: 4, packageAgents: ["a"] },
+        ),
+      ).toEqual({ maxConcurrent: 4, fallbackSubagent: undefined });
+      expect(Object.keys(changedSettings({ fallbackSubagent: "Explore" }, {}))).toEqual(["fallbackSubagent"]);
+    });
   });
 
   it("round-trips defaultMaxTurns: 0 (unlimited marker)", () => {
@@ -668,6 +799,20 @@ describe("settings persistence", () => {
       for (const bad of [-1, 1025, 1.5, "four", null]) {
         writeProject({ maxConcurrentForeground: bad });
         expect(loadSettings(projectDir).maxConcurrentForeground).toBeUndefined();
+      }
+    });
+
+    it("keeps maxConcurrentNested, including 0 (explicit unlimited)", () => {
+      writeProject({ maxConcurrentNested: 0 });
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrentNested: 0 });
+      writeProject({ maxConcurrentNested: 5 });
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrentNested: 5 });
+    });
+
+    it("drops out-of-range or non-integer maxConcurrentNested", () => {
+      for (const bad of [-1, 1025, 1.5, "four", null]) {
+        writeProject({ maxConcurrentNested: bad });
+        expect(loadSettings(projectDir).maxConcurrentNested).toBeUndefined();
       }
     });
 
@@ -796,6 +941,17 @@ describe("settings persistence", () => {
       }
     });
 
+    it("accepts every workflowToolExposure value, and drops anything else", () => {
+      for (const mode of ["skill", "inline", "deferred"] as const) {
+        writeProject({ workflowToolExposure: mode });
+        expect(loadSettings(projectDir)).toEqual({ workflowToolExposure: mode });
+      }
+      for (const bad of ["full", true, null]) {
+        writeProject({ workflowToolExposure: bad });
+        expect(loadSettings(projectDir).workflowToolExposure).toBeUndefined();
+      }
+    });
+
     it("drops invalid toolDescriptionMode", () => {
       writeProject({ toolDescriptionMode: "tiny" });
       expect(loadSettings(projectDir).toolDescriptionMode).toBeUndefined();
@@ -850,20 +1006,23 @@ describe("settings persistence", () => {
   });
 
   describe("save result + corrupt-file warning", () => {
-    it("saveSettings returns true on success", () => {
-      expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBe(true);
-      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
+    it("saveSettings returns the written scope on success", () => {
+      expect(saveSettings({ maxConcurrent: 2 }, projectDir)).toBe("global");
+      // No project file in this cwd, so the write landed in the global file.
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual({ maxConcurrent: 2 });
     });
 
-    it("saveSettings returns false when the target dir cannot be created", () => {
-      // Place a regular file where the parent of the settings file would go —
-      // mkdirSync + writeFileSync both fail with ENOTDIR / EEXIST.
-      const filePosingAsCwd = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
-      writeFileSync(filePosingAsCwd, "");
+    it("saveSettings returns undefined when the target dir cannot be created", () => {
+      // No project file, so the write targets the global file. Point the
+      // agent dir under a regular file — mkdirSync + writeFileSync both
+      // fail with ENOTDIR / EEXIST.
+      const filePosingAsParent = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
+      writeFileSync(filePosingAsParent, "");
+      process.env.PI_CODING_AGENT_DIR = join(filePosingAsParent, "agent");
       try {
-        expect(saveSettings({ maxConcurrent: 1 }, filePosingAsCwd)).toBe(false);
+        expect(saveSettings({ maxConcurrent: 1 }, projectDir)).toBeUndefined();
       } finally {
-        rmSync(filePosingAsCwd, { force: true });
+        rmSync(filePosingAsParent, { force: true });
       }
     });
 
@@ -898,6 +1057,7 @@ describe("settings persistence", () => {
       appliers = {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
+        setMaxConcurrentNested: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -910,6 +1070,7 @@ describe("settings persistence", () => {
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
       setRememberAgents: vi.fn(),
+      setCacheRetention: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
@@ -941,6 +1102,18 @@ describe("settings persistence", () => {
       vi.mocked(appliers.setMaxConcurrentForeground).mockClear();
       applySettings({}, appliers);
       expect(appliers.setMaxConcurrentForeground).not.toHaveBeenCalled();
+    });
+
+    it("applies maxConcurrentNested, including an explicit 0", () => {
+      applySettings({ maxConcurrentNested: 5 }, appliers);
+      expect(appliers.setMaxConcurrentNested).toHaveBeenCalledWith(5);
+
+      applySettings({ maxConcurrentNested: 0 }, appliers);
+      expect(appliers.setMaxConcurrentNested).toHaveBeenCalledWith(0);
+
+      vi.mocked(appliers.setMaxConcurrentNested).mockClear();
+      applySettings({}, appliers);
+      expect(appliers.setMaxConcurrentNested).not.toHaveBeenCalled();
     });
 
     it("applies packageAgents and packageWorkflows, including false and an empty list", () => {
@@ -1109,6 +1282,13 @@ describe("settings persistence", () => {
       expect(appliers.setRememberAgents).toHaveBeenCalledTimes(1); // absence is "use default"
     });
 
+    it("applies cacheRetention; skips it when absent", () => {
+      applySettings({ cacheRetention: "short" }, appliers);
+      expect(appliers.setCacheRetention).toHaveBeenCalledWith("short");
+      applySettings({}, appliers);
+      expect(appliers.setCacheRetention).toHaveBeenCalledTimes(1); // absence is "use default"
+    });
+
     it("applies scopeModels: false", () => {
       applySettings({ scopeModels: false }, appliers);
       expect(appliers.setScopeModels).toHaveBeenCalledWith(false);
@@ -1195,15 +1375,19 @@ describe("settings persistence", () => {
   });
 
   describe("persistToastFor", () => {
-    it("returns info-level toast with the plain message on success", () => {
-      expect(persistToastFor("Max concurrency set to 7", true)).toEqual({
-        message: "Max concurrency set to 7",
+    it("returns info-level toast naming the written scope on success", () => {
+      expect(persistToastFor("Max concurrency set to 7", "global")).toEqual({
+        message: "Max concurrency set to 7 (saved to global settings)",
+        level: "info",
+      });
+      expect(persistToastFor("Max concurrency set to 7", "project")).toEqual({
+        message: "Max concurrency set to 7 (saved to project settings)",
         level: "info",
       });
     });
 
     it("returns warning-level toast with session-only suffix on failure", () => {
-      expect(persistToastFor("Max concurrency set to 7", false)).toEqual({
+      expect(persistToastFor("Max concurrency set to 7", undefined)).toEqual({
         message: "Max concurrency set to 7 (session only; failed to persist)",
         level: "warning",
       });
@@ -1217,6 +1401,7 @@ describe("settings persistence", () => {
       appliers = {
         setMaxConcurrent: vi.fn(),
         setMaxConcurrentForeground: vi.fn(),
+        setMaxConcurrentNested: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -1229,6 +1414,7 @@ describe("settings persistence", () => {
         setFleetView: vi.fn(),
         setAgentMentions: vi.fn(),
       setRememberAgents: vi.fn(),
+      setCacheRetention: vi.fn(),
         setWidgetMode: vi.fn(),
         setViewerMarkdown: vi.fn(),
         setOutputTranscript: vi.fn(),
@@ -1288,28 +1474,41 @@ describe("settings persistence", () => {
       const emit = vi.fn();
       const snapshot = { maxConcurrent: 5, graceTurns: 2 };
 
-      const toast = saveAndEmitChanged(snapshot, "Max concurrency set to 5", emit, projectDir);
+      const toast = saveAndEmitChanged(snapshot, {}, "Max concurrency set to 5", emit, projectDir);
 
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
         settings: snapshot,
         persisted: true,
       });
-      expect(toast).toEqual({ message: "Max concurrency set to 5", level: "info" });
-      // File actually written
-      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual(snapshot);
+      expect(toast).toEqual({ message: "Max concurrency set to 5 (saved to global settings)", level: "info", persisted: true });
+      // File actually written — the global one, since this project has no
+      // settings file of its own (#391)
+      expect(JSON.parse(readFileSync(globalFile(), "utf-8"))).toEqual(snapshot);
+      expect(existsSync(projectFile())).toBe(false);
+    });
+
+    it("names the project scope in the toast when the project file takes the write", () => {
+      writeProject({});
+      const toast = saveAndEmitChanged({ maxConcurrent: 5 }, {}, "Max concurrency set to 5", vi.fn(), projectDir);
+      expect(toast).toEqual({ message: "Max concurrency set to 5 (saved to project settings)", level: "info", persisted: true });
+      expect(JSON.parse(readFileSync(projectFile(), "utf-8"))).toEqual({ maxConcurrent: 5 });
     });
 
     it("emits with persisted=false and returns warning toast on save failure", () => {
-      const filePosingAsCwd = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
-      writeFileSync(filePosingAsCwd, "");
+      // Break the global write target: with no project file, the save goes
+      // to the global file, whose dir cannot be created under a regular file.
+      const filePosingAsParent = join(tmpdir(), `pi-settings-notdir-${Date.now()}`);
+      writeFileSync(filePosingAsParent, "");
+      process.env.PI_CODING_AGENT_DIR = join(filePosingAsParent, "agent");
       const emit = vi.fn();
       try {
         const toast = saveAndEmitChanged(
           { maxConcurrent: 5 },
+          {},
           "Max concurrency set to 5",
           emit,
-          filePosingAsCwd,
+          projectDir,
         );
         expect(emit).toHaveBeenCalledWith("subagents:settings_changed", {
           settings: { maxConcurrent: 5 },
@@ -1318,9 +1517,10 @@ describe("settings persistence", () => {
         expect(toast).toEqual({
           message: "Max concurrency set to 5 (session only; failed to persist)",
           level: "warning",
+          persisted: false,
         });
       } finally {
-        rmSync(filePosingAsCwd, { force: true });
+        rmSync(filePosingAsParent, { force: true });
       }
     });
   });

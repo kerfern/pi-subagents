@@ -62,15 +62,18 @@ function stubManager(
   settle: (type: string, prompt: string, options: any) => Promise<AgentRecord> | AgentRecord = () => record(),
 ): StubManager {
   const abort = vi.fn();
+  const records = new Map<string, AgentRecord>();
   const resume = vi.fn(async () => record({ id: "agent-1", result: "resumed" }));
   const spawnAndWait = vi.fn(
     async (_pi: any, _ctx: any, type: string, prompt: string, options: any, onSpawned?: (id: string) => void) => {
       const settled = await settle(type, prompt, options);
+      records.set(settled.id, settled);
       onSpawned?.(settled.id);
       return { id: settled.id, record: settled };
     },
   );
-  return { manager: { spawnAndWait, abort, resume } as unknown as AgentManager, spawnAndWait, abort, resume };
+  const getRecord = (id: string) => records.get(id);
+  return { manager: { spawnAndWait, abort, resume, getRecord } as unknown as AgentManager, spawnAndWait, abort, resume };
 }
 
 const request = (overrides: Partial<WorkflowSpawnRequest> = {}): WorkflowSpawnRequest => ({
@@ -245,6 +248,17 @@ describe("createWorkflowHost — spawn mapping", () => {
 
     expect(stub.spawnAndWait.mock.calls[0][4].structuredOutput).toBe(compilation.compiled);
     expect(result).toMatchObject({ ok: true, text: '{"a":"x"}' });
+  });
+
+  it("forwards disallowedTools to the spawn, and leaves it off when unset", async () => {
+    const stub = stubManager(() => record({ result: "ok" }));
+    const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager: stub.manager });
+
+    await host.spawnAgent(request({ disallowedTools: ["Bash"] }));
+    await host.spawnAgent(request({}));
+
+    expect(stub.spawnAndWait.mock.calls[0][4].disallowedTools).toEqual(["Bash"]);
+    expect(stub.spawnAndWait.mock.calls[1][4]).not.toHaveProperty("disallowedTools");
   });
 
   it("falls back to the prose when no schema was asked for", async () => {
@@ -554,8 +568,78 @@ describe("createWorkflowHost — abort, resume and gate", () => {
     await host.spawnAgent(request({ agentId: "wf-agent-0" }));
     const resumed = await host.resumeAgent?.("wf-agent-0", "and now this");
 
-    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined);
+    expect(stub.resume).toHaveBeenCalledWith("manager-id-7", "and now this", undefined, {
+      onToolActivity: expect.any(Function),
+      onAssistantUsage: expect.any(Function),
+    });
     expect(resumed).toMatchObject({ ok: true, text: "resumed" });
+  });
+
+  describe("live counters (#298)", () => {
+    /**
+     * A manager whose one child keeps a live record while it runs: `during`
+     * mutates it and fires the manager's hooks, as `runAgent` would, before the
+     * spawn settles. `resume` does the same for the continuation.
+     */
+    function liveManager(during: (child: AgentRecord, options: any) => void) {
+      const child = record({ id: "child-1" });
+      const spawnAndWait = vi.fn(async (_pi: any, _ctx: any, _t: string, _p: string, options: any, onSpawned?: (id: string) => void) => {
+        onSpawned?.(child.id);
+        during(child, options);
+        return { id: child.id, record: child };
+      });
+      const resume = vi.fn(async (_id: string, _prompt: string, _signal: unknown, options: any) => {
+        during(child, options);
+        return child;
+      });
+      const getRecord = (id: string) => (id === child.id ? child : undefined);
+      return { spawnAndWait, resume, getRecord, abort: vi.fn() } as unknown as AgentManager;
+    }
+
+    it("reports a running child's completed tools and finalized usage before it settles", async () => {
+      const snapshots: unknown[] = [];
+      const manager = liveManager((child, options) => {
+        options.onToolActivity({ type: "start", toolName: "read" });
+        child.toolUses = 1;
+        options.onToolActivity({ type: "end", toolName: "read" });
+        child.lifetimeUsage = { input: 100, output: 20, cacheWrite: 0 };
+        options.onAssistantUsage({ input: 100, output: 20, cacheWrite: 0 });
+      });
+      const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager });
+
+      const result = await host.spawnAgent(request({ onProgress: info => snapshots.push(info) }));
+
+      // A tool start is not a completed tool call, so it reports nothing.
+      expect(snapshots).toEqual([
+        { tokens: 0, outputTokens: 0, toolCalls: 0 },
+        { tokens: 0, outputTokens: 0, toolCalls: 1 },
+        { tokens: 120, outputTokens: 20, toolCalls: 1 },
+      ]);
+      expect(result).toMatchObject({ tokens: 120, outputTokens: 20, toolCalls: 1 });
+    });
+
+    it("counts only the continuation on a resumed row, live and settled", async () => {
+      const snapshots: unknown[] = [];
+      let resuming = false;
+      const manager = liveManager((child, options) => {
+        if (!resuming) {
+          child.toolUses = 4;
+          child.lifetimeUsage = { input: 400, output: 40, cacheWrite: 0 };
+          return;
+        }
+        child.toolUses = 5;
+        child.lifetimeUsage = { input: 430, output: 45, cacheWrite: 0 };
+        options.onAssistantUsage({ input: 30, output: 5, cacheWrite: 0 });
+      });
+      const host = createWorkflowHost({ pi: {} as any, ctx: ctx(), manager });
+
+      await host.spawnAgent(request({ agentId: "wf-agent-0" }));
+      resuming = true;
+      const resumed = await host.resumeAgent?.("wf-agent-0", "more", undefined, info => snapshots.push(info));
+
+      expect(snapshots).toEqual([{ tokens: 35, outputTokens: 5, toolCalls: 1 }]);
+      expect(resumed).toMatchObject({ tokens: 35, outputTokens: 5, toolCalls: 1 });
+    });
   });
 
   it("refuses to resume an agent the run never spawned", async () => {
@@ -681,6 +765,84 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
     const scriptLine = text.split("\n").find((line: string) => line.startsWith("Script: "));
     expect(scriptLine, "the persisted script path is what makes iteration edit-then-rerun").toBeTruthy();
     expect(existsSync(scriptLine!.slice("Script: ".length))).toBe(true);
+  });
+
+  it("announces the run on pi.events — started once, then settled, no progress push", async () => {
+    const result = await tools.get("SubagentWorkflow").execute("tc-ev", { script: inlineScript }, undefined, undefined, workflowCtx());
+    const runId = /Task ID: (\S+)/.exec(textOf(result))![1];
+    const wf = () => booted.pi.events.emit.mock.calls.filter(([e]: [string]) => e.startsWith("subagents:workflow_"));
+
+    // started fires synchronously, before the first agent, carrying the summary.
+    expect(wf()[0][0]).toBe("subagents:workflow_started");
+    expect(wf()[0][1]).toMatchObject({
+      id: runId, name: "from-inline", description: "inline source",
+      status: "running", toolCallId: "tc-ev", agentCount: 0,
+    });
+
+    // settled fires once the detached run completes.
+    await vi.waitFor(() => expect(wf().map(([e]: [string]) => e)).toContain("subagents:workflow_settled"));
+    expect(wf().at(-1)![1]).toMatchObject({ id: runId, name: "from-inline", status: "completed", agentCount: 0 });
+
+    // Only the two lifecycle events — progress is pulled via workflow_get, never pushed.
+    expect(wf().map(([e]: [string]) => e)).toEqual(["subagents:workflow_started", "subagents:workflow_settled"]);
+    // The script returned nothing and the call passed no args.
+    expect(wf().at(-1)![1]).not.toHaveProperty("result");
+    expect(wf()[0][1]).not.toHaveProperty("args");
+  });
+
+  it("carries the call's args on workflow_started, and args and log lines on workflow_get", async () => {
+    const wf = () => booted.pi.events.emit.mock.calls.filter(([e]: [string]) => e.startsWith("subagents:workflow_"));
+    const context = workflowCtx();
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-args", { script: `${inlineScript}log("reviewing " + args.pr);\n`, args: { pr: 123 } },
+      undefined, undefined, context,
+    );
+    const runId = /Task ID: (\S+)/.exec(textOf(result))![1];
+
+    expect(wf()[0]).toEqual(["subagents:workflow_started", expect.objectContaining({ id: runId, args: { pr: 123 } })]);
+    await vi.waitFor(() => expect(wf().map(([e]: [string]) => e)).toContain("subagents:workflow_settled"));
+    expect(wf().at(-1)![1]).not.toHaveProperty("args");
+
+    const [, workflowGet] = booted.pi.events.on.mock.calls.find(([c]: [string]) => c === "subagents:rpc:workflow_get")!;
+    await workflowGet({ requestId: "wg-args", workflowId: runId });
+    const [, reply] = booted.pi.events.emit.mock.calls.find(([c]: [string]) => c === "subagents:rpc:workflow_get:reply:wg-args")!;
+    expect(reply.data.workflow.args).toEqual({ pr: 123 });
+    expect(reply.data.workflow.logs).toEqual([expect.stringContaining("reviewing 123")]);
+  });
+
+  it("carries the script's return value on workflow_settled, and omits it when the run fails", async () => {
+    const settled = () => booted.pi.events.emit.mock.calls.filter(([e]: [string]) => e === "subagents:workflow_settled");
+    const context = workflowCtx();
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    // Longer than the notification's 4000-char cap: the bus must not truncate.
+    const result = await tools.get("SubagentWorkflow").execute(
+      "tc-res", { script: `${inlineScript}return { findings: [{ file: "a.ts" }], body: "x".repeat(5000) };\n` },
+      undefined, undefined, context,
+    );
+    const runId = /Task ID: (\S+)/.exec(textOf(result))![1];
+    await vi.waitFor(() => expect(settled()).toHaveLength(1));
+    const payload = settled()[0][1];
+    expect(payload).toMatchObject({ status: "completed", result: { findings: [{ file: "a.ts" }] } });
+    expect(payload.result.body).toHaveLength(5000);
+
+    // A listener mutating its payload must not reach the run: workflow_get still
+    // returns what the script returned.
+    payload.result.findings[0].file = "mutated";
+    const [, workflowGet] = booted.pi.events.on.mock.calls.find(([c]: [string]) => c === "subagents:rpc:workflow_get")!;
+    await workflowGet({ requestId: "wg-1", workflowId: runId });
+    const [, reply] = booted.pi.events.emit.mock.calls.find(([c]: [string]) => c === "subagents:rpc:workflow_get:reply:wg-1")!;
+    expect(reply.data.workflow.result.findings[0].file).toBe("a.ts");
+
+    await tools.get("SubagentWorkflow").execute(
+      "tc-res-fail", { script: `${inlineScript}throw new Error("script blew up");\n` },
+      undefined, undefined, workflowCtx(),
+    );
+    await vi.waitFor(() => expect(settled()).toHaveLength(2));
+    expect(settled()[1][1]).toMatchObject({ status: "failed" });
+    expect(settled()[1][1]).not.toHaveProperty("result");
   });
 
   it("prefers scriptPath over script when both are given", async () => {
@@ -1043,6 +1205,127 @@ describe("SubagentWorkflow tool — script vs scriptPath vs name", () => {
 });
 
 /* ------------------------------------------------------------------------- *
+ * The inline card following a background run (#284)
+ * ------------------------------------------------------------------------- */
+
+describe("SubagentWorkflow card — redraws while the run goes", () => {
+  let hermetic: Hermetic;
+  let booted: ReturnType<typeof makePi>;
+
+  beforeEach(() => {
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, workflowsEnabled: true } });
+    booted = makePi();
+    subagentsExtension(booted.pi);
+  });
+
+  afterEach(async () => {
+    await flush();
+    hermetic.restore();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A UI whose widgets are drawn into a TUI of the given mode. The fleet list
+   * learns pi's renderer mode from the TUI its widget factory receives, which
+   * is the only place an extension can read it.
+   */
+  function uiCtx(mode: "fullscreen" | "regular") {
+    const tui = { mode, requestRender: vi.fn(), terminal: { columns: 80, rows: 24 } };
+    /** The components the factories returned, by widget key. */
+    const widgets = new Map<string, { invalidate(): void }>();
+    const context = ctx({
+      cwd: hermetic.dir,
+      hasUI: true,
+      ui: {
+        setStatus: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn(),
+        onTerminalInput: vi.fn(() => vi.fn()),
+        setWidget: vi.fn((key: string, factory: unknown) => {
+          if (typeof factory === "function") widgets.set(key, factory(tui, plainTheme));
+        }),
+      },
+    });
+    return { context, tui, widgets };
+  }
+
+  /** Launch `body` as a workflow in `mode`, and draw its card once. */
+  async function launch(mode: "fullscreen" | "regular", body: string) {
+    const { context, tui, widgets } = uiCtx(mode);
+    await booted.lifecycle.get("tool_execution_start")?.({}, context);
+    const tool = booted.tools.get("SubagentWorkflow");
+    const result = await tool.execute("tc-card", { script: `${inlineScript}${body}` }, undefined, undefined, context);
+    const invalidate = vi.fn();
+    const render = () =>
+      String(tool.renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false, invalidate }).text ?? "");
+    const first = render();
+    const taskId = /Task ID: (\S+)/.exec(textOf(result))![1];
+    const settled = () =>
+      vi.waitFor(
+        () => expect(booted.pi.sendMessage.mock.calls.some((c: any[]) => String(c[0]?.content).includes(taskId))).toBe(true),
+        { timeout: 10_000 },
+      );
+    return { context, tui, widgets, invalidate, render, first, settled };
+  }
+
+  const sleep = (ms: number) => `await new Promise(r => setTimeout(r, ${ms}));\n`;
+
+  it("redraws the card when the run reports progress", async () => {
+    const { context, invalidate } = await launch("fullscreen", `${sleep(50)}log("scanning");\nawait new Promise(() => {});\n`);
+
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 5_000 });
+
+    await booted.lifecycle.get("session_shutdown")?.({}, context);
+  });
+
+  it("re-renders every live card when pi switches renderer mid-run", async () => {
+    const { context, tui, widgets, invalidate, render } = await launch(
+      "fullscreen",
+      `${sleep(50)}log("scanning");\nawait new Promise(() => {});\n`,
+    );
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalled(), { timeout: 5_000 });
+    const before = invalidate.mock.calls.length;
+
+    // What pi does on a switch: a new TUI, and an invalidate that drops the
+    // list's widget until it registers again on its next tick.
+    tui.mode = "regular";
+    widgets.get("fleet")!.invalidate();
+    await vi.waitFor(() => expect(invalidate.mock.calls.length).toBeGreaterThan(before), { timeout: 2_000 });
+    expect(render()).toContain("Running in background");
+
+    await booted.lifecycle.get("session_shutdown")?.({}, context);
+  });
+
+  it("before any widget has drawn, follows pi's tuiMode setting", async () => {
+    booted.pi.getSettings.mockReturnValue({ tuiMode: "regular" });
+    const tool = booted.tools.get("SubagentWorkflow");
+    const context = ctx({ cwd: hermetic.dir });
+    const result = await tool.execute("tc-card", { script: `${inlineScript}await new Promise(() => {});\n` }, undefined, undefined, context);
+
+    const card = String(tool.renderResult(result, { expanded: false, isPartial: false }, plainTheme, { isError: false, invalidate: vi.fn() }).text ?? "");
+    expect(card).toContain("Running in background");
+
+    await booted.lifecycle.get("session_shutdown")?.({}, context);
+  });
+
+  it("in pi's regular renderer, shows a launch line and redraws only once the run settles", async () => {
+    const { invalidate, render, first, settled } = await launch(
+      "regular",
+      `${sleep(50)}log("one");\n${sleep(50)}log("two");\nreturn "done";\n`,
+    );
+
+    // An off-screen redraw there clears the terminal's scrollback, so a running
+    // card must not claim to be live.
+    expect(first).toContain("Running in background");
+    expect(first).not.toMatch(/\d+\/\d+ agents/);
+
+    await settled();
+    expect(invalidate, "progress does not redraw; settle does, once").toHaveBeenCalledTimes(1);
+    const card = render();
+    expect(card).toContain("from-inline");
+    expect(card).toContain("two");
+  });
+});
+
+/* ------------------------------------------------------------------------- *
  * The CLI flag
  * ------------------------------------------------------------------------- */
 
@@ -1247,6 +1530,16 @@ describe("workflowsEnabled — the master switch", () => {
     subagentsExtension(booted.pi);
     return booted;
   };
+
+  // Claude Code's Workflow tool carries no guideline choosing it over Agent;
+  // its description's explicit opt-in rule decides. A pi-only line ("Use Agent
+  // for ... a handful you can name up front") routed "use 10 agents to explore
+  // this folder" to SubagentWorkflow instead of 10 parallel Agent calls.
+  it("adds no guideline that picks SubagentWorkflow over Agent", () => {
+    const guidelines: string[] = boot({}).tools.get("SubagentWorkflow").promptGuidelines;
+
+    expect(guidelines.filter((g) => /\bAgent\b|handful|number of agents/i.test(g))).toEqual([]);
+  });
 
   it("is on with no setting at all", () => {
     const booted = boot({});
@@ -1490,11 +1783,73 @@ describe("collisions with another extension", () => {
     expect(warnings(context).filter(m => /disabled for this session/.test(m))).toEqual([]);
   });
 
+  /* ----------------------------------------------------------------------- *
+   * workflowToolExposure: "deferred"
+   * ----------------------------------------------------------------------- */
+
+  const workflowRegistrations = (booted: ReturnType<typeof boot>) =>
+    booted.pi.registerTool.mock.calls.map((c: any[]) => c[0]).filter((t: any) => t.name === "SubagentWorkflow");
+
+  it("registers the tool deferred only when workflowToolExposure is deferred", () => {
+    expect(workflowRegistrations(boot({ workflowToolExposure: "deferred" })).map((t: any) => t.exposure)).toEqual(["deferred"]);
+    hermetic.restore();
+    expect(workflowRegistrations(boot({})).map((t: any) => t.exposure)).toEqual([undefined]);
+  });
+
+  it("re-registers a deferred tool as hidden when it stands down", async () => {
+    // An inactive deferred tool stays searchable and callable, so taking it
+    // out of the active set alone would leave tool_search a way back in.
+    const booted = boot({ workflowToolExposure: "deferred" });
+    booted.pi.getAllTools.mockReturnValue([foreign("Workflow")]);
+
+    await booted.lifecycle.get("session_start")?.({}, uiContext());
+
+    expect(workflowRegistrations(booted).map((t: any) => t.exposure)).toEqual(["deferred", "hidden"]);
+  });
+
+  it("does not re-register a direct tool when it stands down", async () => {
+    const booted = bootAuto();
+    booted.pi.getAllTools.mockReturnValue([foreign("Workflow")]);
+
+    await booted.lifecycle.get("session_start")?.({}, uiContext());
+
+    expect(workflowRegistrations(booted)).toHaveLength(1);
+  });
+
+  it("warns when deferred but tool_search is inactive", async () => {
+    // pi only warns about unreachable deferred MCP tools, not extension tools.
+    const booted = boot({ workflowToolExposure: "deferred" });
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).some(m => /tool_search is inactive/.test(m) && /\+tool_search/.test(m))).toBe(true);
+  });
+
+  it("stays quiet when deferred and tool_search is active", async () => {
+    const booted = boot({ workflowToolExposure: "deferred" });
+    booted.pi.setActiveTools([...booted.pi.getActiveTools(), "tool_search"]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).filter(m => /tool_search/.test(m))).toEqual([]);
+  });
+
+  it("does not mention tool_search unless deferred", async () => {
+    const booted = boot();
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(warnings(context).filter(m => /tool_search/.test(m))).toEqual([]);
+  });
+
   /**
    * Drive `/agents → Settings` far enough to write the settings file.
    *
    * Any change writes the WHOLE snapshot, so which row is toggled does not
-   * matter — row 0 is `Max concurrency`, whose single-value list re-applies the
+   * matter — row 0 is `Max background concurrency`, whose single-value list re-applies the
    * value it already had. What matters is that the file gets written at all.
    */
   async function changeAnUnrelatedSetting(booted: ReturnType<typeof boot>) {
@@ -1514,7 +1869,12 @@ describe("collisions with another extension", () => {
           return options.find(o => o === "Settings");
         }),
         custom: vi.fn(async (factory: any) => {
-          built = factory({ requestRender: () => {} }, {}, {}, () => {});
+          // pi always hands the page a theme and a keybindings manager.
+          const theme = { fg: (_color: string, text: string) => text };
+          const kb = { matches: (data: string, id: string) => id === "tui.select.down" && data === "\x1b[B", getKeys: () => [] };
+          built = factory({ requestRender: () => {} }, theme, kb, () => {});
+          // Down from the filter onto row 0, then Space re-applies its value.
+          built.handleInput("\x1b[B");
           built.handleInput(" ");
           return undefined;
         }),

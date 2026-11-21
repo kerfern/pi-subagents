@@ -432,7 +432,7 @@ export class RootWake {
       this.pendingWithdrawal = null;
       return false;
     }
-    if (!this.manifest || this.manifest.state !== 'open') return false;
+    if (this.manifest?.state !== 'open') return false;
     this.pendingWithdrawal = { checkpoints, reason: this.deps.fleet.snapshot().reason };
     return await this.#commitWithdrawal();
   }

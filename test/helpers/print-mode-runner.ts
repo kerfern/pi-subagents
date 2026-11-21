@@ -54,8 +54,9 @@ import {
   fauxAssistantMessage,
   fauxText,
   fauxToolCall,
-  getCurrentTools,
+  getCurrentSystemPrompt,
   type Model,
+  type SimpleStreamOptions,
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
@@ -66,6 +67,7 @@ import {
   type EventBus,
   type ExtensionUIContext,
   getAgentDir,
+  type InlineExtension,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -90,11 +92,13 @@ export type FauxReply = string | FauxContentBlock | FauxContentBlock[] | Assista
 /**
  * A context-branching responder. Invoked once per model call (parent OR child)
  * with that call's own `Context`, so it can decide what to emit from the prompt
- * it sees — order-independent, unlike a flat FIFO `steps` list.
+ * it sees — order-independent, unlike a flat FIFO `steps` list. `options` are
+ * the request options as they reached the provider (e.g. `cacheRetention`).
  */
 export type FauxResponder = (
   context: Context,
   state: { callCount: number },
+  options?: SimpleStreamOptions,
 ) => FauxReply | Promise<FauxReply>;
 
 const transcriptHelpers = PiAI as unknown as {
@@ -151,6 +155,10 @@ export interface RunPrintModeOptions {
   signal?: AbortSignal;
   /** Additional extension paths loaded only for this test run. */
   extensionPaths?: string[];
+  /** Inline host extensions, e.g. pi's `createToolSearchExtension()`, which SDK sessions do not load. */
+  extensionFactories?: InlineExtension[];
+  /** Faux-mode `defaultTools` setting, e.g. `["+tool_search"]`. */
+  defaultTools?: string[];
   /** Called once after the real parent session is created and extensions are bound. */
   onParentSession?: (session: AgentSession, manager: ManagerHandle | undefined) => void;
   /**
@@ -240,12 +248,22 @@ function resolveReply(
 }
 
 /**
+ * Whether a faux call comes from a subagent session rather than the main one.
+ * Keyed on the `<active_agent name="…"/>` tag every subagent system prompt
+ * carries (`buildAgentPrompt`). Not on the `Agent` tool: `general-purpose`
+ * children have it too, since they may delegate.
+ */
+export function isSubagentContext(context: Context): boolean {
+  return getCurrentSystemPrompt(context.messages).includes("<active_agent name=");
+}
+
+/**
  * The common single-spawn flow as a responder. Routes by inspecting the calling
  * session's own context:
- *   - PARENT  (its tool set includes `Agent`):
+ *   - PARENT  (the main session):
  *       · `parentInitial` until an `Agent` tool result is in history (the spawn),
  *       · then `parentFinal` (the answer after the child reports back).
- *   - SUBAGENT (no `Agent` tool): `subagent`.
+ *   - SUBAGENT (`isSubagentContext`): `subagent`.
  * Each route may be a value or a `(ctx) => value` function.
  */
 export function routeBySession(routes: {
@@ -254,8 +272,7 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = getCurrentTools(context.messages).some((t) => t.name === "Agent");
-    if (!isParent) return resolveReply(routes.subagent, context);
+    if (isSubagentContext(context)) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
     );
@@ -372,8 +389,8 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
         throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
       }
       const max = options.maxModelCalls ?? 16;
-      const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(normalizeFauxContext(context), state));
+      const factory: FauxResponseStep = async (context, opts, state) =>
+        toAssistantMessage(await respond(normalizeFauxContext(context), state, opts));
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }
@@ -385,6 +402,7 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     cwd,
     agentDir,
     additionalExtensionPaths: [EXTENSION_PATH, ...(options.extensionPaths ?? [])],
+    extensionFactories: options.extensionFactories,
     systemPromptOverride: () => options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPromptOverride: () => [],
     noPromptTemplates: true,
@@ -412,7 +430,11 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     // Faux: in-memory, deterministic, no disk.
     settingsManager: live
       ? SettingsManager.create(cwd, agentDir)
-      : SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+      : SettingsManager.inMemory({
+          compaction: { enabled: false },
+          retry: { enabled: false },
+          ...(options.defaultTools ? { defaultTools: options.defaultTools } : {}),
+        }),
   });
   session.setSessionName("print-mode-host");
 

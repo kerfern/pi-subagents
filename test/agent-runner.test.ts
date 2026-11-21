@@ -157,6 +157,7 @@ import {
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import { setCacheRetention } from "../src/cache-retention.js";
 import type { LifetimeUsage, MessageUsageDelta } from "../src/usage.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
@@ -1111,6 +1112,60 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerForkFrom).not.toHaveBeenCalled();
   });
 
+  describe("the model and thinking level of a reopened session (#462)", () => {
+    const parentModel = { provider: "pA", id: "model-a", name: "Model A" };
+    const fileModel = { provider: "pF", id: "model-f", name: "Model F" };
+    /** The parent on model A / medium, with an agent file pinning model F / minimal. */
+    const parentCtx = {
+      ...ctx,
+      model: parentModel,
+      thinkingLevel: "medium",
+      modelRegistry: { find: vi.fn(() => fileModel), getAvailable: vi.fn(() => [fileModel]) },
+      ui: { notify: vi.fn() },
+    };
+    const pinned = () => makeAgentConfig({ model: "pF/model-f", thinking: "minimal" });
+
+    beforeEach(() => parentCtx.ui.notify.mockClear());
+
+    it("passes neither, so pi restores the ones the session recorded — not the agent file's or the parent's", async () => {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(pinned());
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+      await runAgent(parentCtx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+
+      const opts = createAgentSession.mock.lastCall![0];
+      expect(opts.model).toBeUndefined();
+      expect(opts.thinkingLevel).toBeUndefined();
+    });
+
+    it("still passes a model and level set explicitly for the run", async () => {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(pinned());
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+      const explicit = { provider: "pB", id: "model-b", name: "Model B" };
+
+      await runAgent(parentCtx, "Explore", "carry on", {
+        pi, resumeSessionFile: "/sessions/explore.jsonl", model: explicit as any, thinkingLevel: "low",
+      });
+
+      const opts = createAgentSession.mock.lastCall![0];
+      expect(opts.model).toBe(explicit);
+      expect(opts.thinkingLevel).toBe("low");
+    });
+
+    it("warns the user when pi could not use the recorded model", async () => {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig()).mockReturnValueOnce(makeAgentConfig());
+      const message = "Could not restore model pB/model-b. Using pA/model-a";
+      createAgentSession.mockResolvedValueOnce({ session: createSession("OK").session, modelFallbackMessage: message });
+      await runAgent(parentCtx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+      expect(parentCtx.ui.notify).toHaveBeenCalledWith(message, "warning");
+
+      parentCtx.ui.notify.mockClear();
+      createAgentSession.mockResolvedValueOnce({ session: createSession("OK").session });
+      await runAgent(parentCtx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+      expect(parentCtx.ui.notify).not.toHaveBeenCalled();
+    });
+  });
+
   it("uses pi's normal persistent session location and links to the parent session", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
@@ -1145,6 +1200,46 @@ describe("agent-runner session persistence", () => {
       "/repo/.seams/pi-sessions/seam-plan-reviewer",
       { parentSession: "/sessions/parent.jsonl" },
     );
+  });
+});
+
+describe("agent-runner prompt cache retention", () => {
+  afterEach(() => setCacheRetention("inherit"));
+
+  /**
+   * Run an agent whose session has a recording stream function, then make one
+   * model call through whatever stream function the session ends up with.
+   * Returns the retention that call carried and whether the wrapper was already
+   * in place when extensions were bound.
+   */
+  async function retentionOf(config: Record<string, unknown>) {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig(config));
+    const { session } = createSession("OK");
+    const inner = vi.fn((_m: unknown, _c: unknown, _o?: { cacheRetention?: string }) => undefined);
+    const agent = session.agent as { streamFunction?: unknown };
+    agent.streamFunction = inner;
+    let wrappedAtBind = false;
+    session.bindExtensions = vi.fn(async () => { wrappedAtBind = agent.streamFunction !== inner; });
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    (agent.streamFunction as typeof inner)("model", "context", {});
+    return { retention: inner.mock.calls[0]?.[2]?.cacheRetention, wrappedAtBind };
+  }
+
+  it("leaves model calls alone by default (inherit)", async () => {
+    expect(await retentionOf({})).toEqual({ retention: undefined, wrappedAtBind: false });
+  });
+
+  it("applies the setting when the agent sets nothing, before extensions are bound", async () => {
+    setCacheRetention("short");
+    expect(await retentionOf({})).toEqual({ retention: "short", wrappedAtBind: true });
+  });
+
+  it("lets frontmatter override the setting", async () => {
+    setCacheRetention("long");
+    expect((await retentionOf({ cacheRetention: "short" })).retention).toBe("short");
   });
 });
 
@@ -1263,6 +1358,84 @@ describe("agent-runner master tool allowlist", () => {
       "Agent", "get_subagent_result", "steer_subagent",
     ]));
     expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(3);
+  });
+
+  // Claude Code's workflow agents run as `workflow-subagent`, which disallows
+  // the Agent tool. Here an untyped workflow agent() runs as the built-in
+  // general-purpose, whose delegation must not follow it into the workflow.
+  it("gives the built-in general-purpose no nested tools as a workflow agent", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowedSubagents: "all", isDefault: true }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "general-purpose", "go", {
+      pi,
+      workflow: true,
+      nestedRuntime: { manager: {} as any, parentAgentId: "wf-agent-0", depth: 1 },
+    });
+
+    expect(createNestedSubagentTools).not.toHaveBeenCalled();
+    expect(lastToolsPassed()).not.toContain("Agent");
+    // Nor the "do not re-delegate" line, which only makes sense with the tool.
+    const { buildAgentPrompt } = await import("../src/prompts.js");
+    expect(vi.mocked(buildAgentPrompt).mock.lastCall![4]).not.toHaveProperty("delegationGuideline");
+  });
+
+  // Claude Code's general-purpose prompt closes with the re-delegation line. It
+  // is added exactly when the built-in can spawn.
+  describe("the built-in general-purpose's re-delegation line", () => {
+    async function extrasFor(agentOverrides: Record<string, unknown>): Promise<Record<string, unknown>> {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false, ...agentOverrides }));
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      await runAgent(ctx, "general-purpose", "go", {
+        pi,
+        nestedRuntime: { manager: {} as any, parentAgentId: "parent", depth: 1 },
+      });
+      const { buildAgentPrompt } = await import("../src/prompts.js");
+      return vi.mocked(buildAgentPrompt).mock.lastCall![4] as Record<string, unknown>;
+    }
+
+    it("is added when the built-in receives the nested Agent tool", async () => {
+      expect(await extrasFor({ allowedSubagents: "all", isDefault: true })).toMatchObject({ delegationGuideline: true });
+    });
+
+    it("is left out when `Agent` is disallowed", async () => {
+      expect(await extrasFor({ allowedSubagents: "all", isDefault: true, disallowedTools: ["Agent"] }))
+        .not.toHaveProperty("delegationGuideline");
+    });
+
+    // Claude Code adds it to its general-purpose only, not to custom agents.
+    it("is left out for a custom agent that delegates", async () => {
+      expect(await extrasFor({ allowedSubagents: "all" })).not.toHaveProperty("delegationGuideline");
+    });
+  });
+
+  // A custom agent's `allowed_subagents` is the author's explicit opt-in, and
+  // workflows honored it before general-purpose could delegate.
+  it("keeps a custom agent's opt-in nested tools as a workflow agent", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, allowedSubagents: ["scout"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "lead", "go", {
+      pi,
+      workflow: true,
+      nestedRuntime: { manager: {} as any, parentAgentId: "wf-agent-0", depth: 1 },
+    });
+
+    expect(createNestedSubagentTools).toHaveBeenCalled();
+    expect(lastToolsPassed()).toContain("Agent");
   });
 
   it("keeps opt-in nested tools active UNDER EXTENSIONS despite the EXCLUDED-name collision", async () => {
@@ -1663,6 +1836,22 @@ describe("agent-runner master tool allowlist", () => {
     const tools = lastToolsPassed();
     expect(tools).not.toContain("bash");
     expect(tools).toEqual(BUILTINS_7.filter((t) => t !== "bash"));
+  });
+
+  it("a spawn's disallowedTools adds to the definition's, in either tool spelling", async () => {
+    // `agent({ disallowedTools })` from a workflow: `Bash` must
+    // deny pi's `bash`, and the agent file's own list must still apply.
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, disallowedTools: ["write"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, disallowedTools: ["Bash"] });
+
+    expect(lastToolsPassed()).toEqual(BUILTINS_7.filter((t) => t !== "bash" && t !== "write"));
   });
 
   it("dynamic mode: leaves the allowlist unset, denies via excludeTools, activates post-bind", async () => {

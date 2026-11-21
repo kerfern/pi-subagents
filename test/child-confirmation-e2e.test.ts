@@ -648,7 +648,9 @@ describe("guarded approval bridge (offline e2e)", () => {
         });
       }
       const id = /Agent ID: (\S+)/.exec(contextText(ctx))?.[1];
-      if (id) {
+      // A stop that settles notifies the parent again; stop once, or the repeat
+      // is answered "Agent is not running" by design (see docs/rpc.md).
+      if (id && !stopReply) {
         // Abort only once the child is actually holding a pending request.
         await waitForRequests(tracePath, 1);
         stopReply = (await stopChild(bus, id)) as { success?: boolean; error?: string };
