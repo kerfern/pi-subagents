@@ -602,7 +602,9 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir)).toEqual({});
     }
 
-    // Absence stays absent rather than becoming an empty meter list.
+    // Absence stays absent rather than becoming an empty meter list. Re-seed a
+    // valid value first, or the deletion proves nothing after the loop above.
+    writeProject({ quotaGuardCodexLimits: limits } as any);
     saveSettings({ quotaGuardCodexLimits: undefined }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({});
   });
@@ -632,6 +634,8 @@ describe("settings persistence", () => {
     }
 
     // Absence stays absent so the caller's "use default" (unknown stays closed) is preserved.
+    // Re-seed a valid value first, or the deletion proves nothing after the loop above.
+    writeProject({ quotaGuardReserveUnits: units } as any);
     saveSettings({ quotaGuardReserveUnits: undefined }, projectDir, "project");
     expect(loadSettings(projectDir)).toEqual({});
   });
