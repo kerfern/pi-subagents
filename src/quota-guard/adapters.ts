@@ -158,11 +158,31 @@ export const COMMANDCODE_MONTHLY_POOLS: Readonly<Record<string, number>> = Objec
   'individual-ultra': 300, 'individual-max': 150, 'individual-provider': 15, 'individual-goat': 70,
   'individual-pro-v1': 80, 'individual-pro': 30, 'individual-go': 10, 'teams-pro': 40,
 });
+/**
+ * The monthly pool is never inferred. A `priceId` is a billing identifier, not a plan: without a
+ * provider-confirmed mapping recorded in `COMMANDCODE_MONTHLY_POOLS` the read refuses and names what an
+ * operator has to establish, instead of quietly picking a cap that could be far too generous.
+ */
+function commandCodePool(subscription: Record<string, unknown>): number {
+  const { planId } = subscription;
+  if (planId !== undefined) {
+    const plan = text(planId);
+    if (!Object.hasOwn(COMMANDCODE_MONTHLY_POOLS, plan)) throw new QuotaError('schema');
+    return COMMANDCODE_MONTHLY_POOLS[plan];
+  }
+  if (subscription.priceId !== undefined) {
+    text(subscription.priceId); // Shape-checked only: a billing identifier is never echoed or mapped.
+    throw new QuotaError('schema', undefined,
+      'CommandCode subscription priceId has no verified monthly pool mapping; guarded dispatch refused.');
+  }
+  throw new QuotaError('schema', undefined,
+    'CommandCode subscription carries no plan identifier; guarded dispatch refused.');
+}
+
 export function normalizeCommandCode(creditsPayload: unknown, subscriptionsPayload: unknown, identity: QuotaIdentity, now: number): QuotaSnapshot {
   const body = object(creditsPayload); const subscription = object(object(subscriptionsPayload).data);
-  const plan = text(subscription.planId);
-  if (!Object.hasOwn(COMMANDCODE_MONTHLY_POOLS, plan) || subscription.status !== 'active') throw new QuotaError('schema');
-  const cap = COMMANDCODE_MONTHLY_POOLS[plan];
+  if (subscription.status !== 'active') throw new QuotaError('schema');
+  const cap = commandCodePool(subscription);
   const remaining = number(object(body.credits).monthlyCredits);
   if (remaining > cap) throw new QuotaError('schema');
   const windows: QuotaWindow[] = [{ id: 'monthly', used: cap - remaining, cap, resetAt: instant(subscription.currentPeriodEnd) }];
@@ -170,7 +190,11 @@ export function normalizeCommandCode(creditsPayload: unknown, subscriptionsPaylo
   for (const id of ['fiveHour', 'weekly']) {
     const window = object(limits[id]); const used = number(window.used); const rollingCap = number(window.cap);
     if (rollingCap <= 0 || typeof window.exceeded !== 'boolean') throw new QuotaError('schema');
-    windows.push({ id, used: window.exceeded ? Math.max(used, rollingCap) : used, cap: rollingCap, resetAt: instant(window.resetAt, true) });
+    // `resetAt: 0` is the provider's sentinel for "no reset pending". It is the only value that becomes
+    // `null`; every other value keeps the strict instant() contract, so a malformed timestamp still
+    // fails instead of being read as an absent reset. `Object.is` keeps signed zero out.
+    const resetAt = Object.is(window.resetAt, 0) ? null : instant(window.resetAt, true);
+    windows.push({ id, used: window.exceeded ? Math.max(used, rollingCap) : used, cap: rollingCap, resetAt });
   }
   // Returned rolling caps apply even with limited:false; purchased/free credits never substitute.
   return snapshot(identity, 'commandcode', windows, now);

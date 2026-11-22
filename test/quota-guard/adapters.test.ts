@@ -103,9 +103,11 @@ test('CommandCode epoch-millisecond resets parse; seconds/ISO unchanged and malf
   assert.deepEqual(millis.windows.slice(1).map(w => w.resetAt), ['2026-10-17T10:59:06.174Z', '2026-10-17T10:27:38.338Z']);
   assert.equal(normalizeCommandCode(credits(), subscription(), commandId, now).windows[1]?.resetAt, new Date(now + 3600000).toISOString(),
     'epoch-seconds resets keep their exact former meaning');
-  for (const value of [0, -1, 1.5, Number.MAX_VALUE, 253402300800000]) {
+  for (const value of [-0, -1, 1.5, Number.MAX_VALUE, 253402300800000]) {
     schema(() => normalizeCommandCode(roll(value, now / 1000 + 3600), subscription(), commandId, now));
   }
+  assert.equal(normalizeCommandCode(roll(0, now / 1000 + 3600), subscription(), commandId, now).windows[1]?.resetAt, null,
+    'a zero reset is the provider saying no reset is pending, not a malformed instant');
 });
 
 test('readQuota accepts CommandCode millisecond resets end to end', async () => {
@@ -245,3 +247,64 @@ test('quota status mapping stays exact: 401/403 auth, 429 rate-limited, 5xx and 
   await assert.rejects(readQuota(auth('commandcode'), { now: () => now,
     fetchImpl: fake(() => { throw new TypeError('network down'); }) }), fail('unavailable'));
 });
+
+// Shape of the two live 200s, trimmed of account ids and tracking metadata: no `planId` at all, a
+// `priceId`, a fractional monthly balance, a zero rolling reset and a millisecond weekly reset.
+const liveCredits = () => ({
+  credits: { belowThreshold: false, creditThreshold: 0, monthlyCredits: 68.9124130148, purchasedCredits: 0, freeCredits: 0 },
+  windowLimits: { limited: false, exceeded: null,
+    fiveHour: { used: 0, cap: 14, exceeded: false, resetAt: 0 },
+    weekly: { used: 1.0875869852, cap: 35, exceeded: false, resetAt: 1795708810778 },
+  },
+  sandboxAccess: false,
+});
+const liveSubscription = () => ({ success: true, data: {
+  status: 'active', priceId: 'price_1U0sTYDSZgxV3MJKUKHcvFxc',
+  currentPeriodStart: '2026-11-19T11:38:11.000Z', currentPeriodEnd: '2026-12-19T11:38:11.000Z',
+  cancelAtPeriodEnd: false, quantity: 1,
+} });
+
+function normalizeCommandCodeRefusal(creditsPayload: unknown, subscriptionsPayload: unknown): QuotaError {
+  try {
+    normalizeCommandCode(creditsPayload, subscriptionsPayload, commandId, now);
+  } catch (error) {
+    assert.ok(error instanceof QuotaError);
+    return error;
+  }
+  assert.fail('expected a refusal');
+}
+
+test('a live subscription priceId without a verified pool mapping refuses with an actionable message', async () => {
+  const error = normalizeCommandCodeRefusal(liveCredits(), liveSubscription());
+  assert.equal(error.code, 'schema');
+  assert.match(error.message, /priceId has no verified monthly pool mapping/);
+  assert.match(error.message, /guarded dispatch refused/);
+  assert.equal(error.message.includes('price_1U0sTYDSZgxV3MJKUKHcvFxc'), false, 'a billing identifier is never echoed');
+  // The consequence is visible end to end: the read refuses rather than reporting some other failure.
+  const read = await readQuota(auth('commandcode'), { now: () => now,
+    fetchImpl: fake(url => json(url.endsWith('credits') ? liveCredits() : liveSubscription())) })
+    .then(() => null, (thrown: unknown) => thrown as QuotaError);
+  assert.equal(read?.code, 'schema');
+  assert.match(read?.message ?? '', /no verified monthly pool mapping/);
+});
+
+test('a subscription with no plan identifier at all says so instead of naming a plan', () => {
+  const subscriptionWithoutPlan = { data: { status: 'active', currentPeriodEnd: now / 1000 + 30 * 86400 } };
+  const error = normalizeCommandCodeRefusal(liveCredits(), subscriptionWithoutPlan);
+  assert.equal(error.code, 'schema');
+  assert.match(error.message, /carries no plan identifier/);
+});
+
+test('fractional allowance and the zero-reset sentinel normalize on a synthetic known plan', () => {
+  const body = { credits: { monthlyCredits: 21.25, purchasedCredits: 5, freeCredits: 5 },
+    windowLimits: { limited: false, exceeded: null,
+      fiveHour: { used: 2.5, cap: 14, exceeded: false, resetAt: 0 },
+      weekly: { used: 1.4999999999, cap: 35, exceeded: false, resetAt: 1795708810778 } } };
+  const result = normalizeCommandCode(body, subscription('individual-pro'), commandId, now);
+  assert.deepEqual(result.windows.map(w => [w.id, w.used, w.cap]), [
+    ['monthly', 8.75, 30], ['fiveHour', 2.5, 14], ['weekly', 1.4999999999, 35],
+  ]);
+  assert.equal(result.windows[1]?.resetAt, null);
+  assert.equal(result.windows[2]?.resetAt, '2026-11-26T16:00:10.778Z');
+});
+

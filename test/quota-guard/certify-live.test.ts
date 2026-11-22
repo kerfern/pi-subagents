@@ -217,3 +217,39 @@ test('a malformed CODEX_LIMITS is refused before any request', async () => {
   assert.match(output(misshapen), /CODEX_LIMITS must be a non-empty JSON array/);
   assert.equal(misshapen.urls.length, 0);
 });
+
+// The live CommandCode subscription carries a priceId but no planId, so certification must refuse and
+// say why: an operator can then record the mapping instead of guessing which pool to certify against.
+const liveCredits = () => ({
+  credits: { monthlyCredits: 68.9124130148, purchasedCredits: 0, freeCredits: 0 },
+  windowLimits: { limited: false, exceeded: null,
+    fiveHour: { used: 0, cap: 14, exceeded: false, resetAt: 0 },
+    weekly: { used: 1.0875869852, cap: 35, exceeded: false, resetAt: 1795708810778 },
+  },
+});
+const liveSubscription = () => ({ success: true, data: {
+  status: 'active', priceId: 'price_1U0sTYDSZgxV3MJKUKHcvFxc',
+  currentPeriodEnd: '2026-12-19T11:38:11.000Z',
+} });
+const liveRoute = (url: string) => json(url.endsWith('credits') ? liveCredits() : liveSubscription());
+
+test('an unmapped live priceId is refused with the adapter detail, and never certified', async () => {
+  const run = harness(liveRoute);
+  assert.equal(await run.run(['commandcode'], credentials), 1);
+  const lines = output(run);
+  assert.match(lines, /certification refused: schema/);
+  assert.match(lines, /priceId has no verified monthly pool mapping/);
+  assert.match(lines, /guarded dispatch refused/);
+  assert.ok(!/certified: yes/.test(lines), 'a refusal is not certification');
+  assert.equal(run.urls.length, 2, 'both billing routes are read before the shape is judged');
+  assert.ok(!lines.includes(SECRET));
+  assert.ok(!lines.includes('price_1U0sTYDSZgxV3MJKUKHcvFxc'), 'the billing identifier is never echoed');
+});
+
+test('a certified read spells out a rolling window that reports no reset', async () => {
+  const run = harness((url) => json(url.endsWith('credits') ? liveCredits()
+    : { data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: '2026-12-19T11:38:11.000Z' } }));
+  assert.equal(await run.run(['commandcode'], credentials), 0);
+  assert.match(output(run), /fiveHour {2}used 0 {2}cap 14 {2}resetAt no reset pending/);
+  assert.match(output(run), /weekly {2}used 1\.0875869852 {2}cap 35 {2}resetAt 2026-11-26T16:00:10\.778Z/);
+});

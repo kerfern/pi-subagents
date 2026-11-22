@@ -207,6 +207,11 @@ export async function main({
 		// only, because an unexpected error could still be carrying response text.
 		const code = error instanceof QuotaError ? error.code : error instanceof Error ? error.name : 'unknown';
 		fail(`certification refused: ${code}`);
+		// The adapter's own detail is sanitised by construction - payload values are never echoed - and it
+		// is the only place an operator learns what has to change for this provider to certify.
+		if (error instanceof QuotaError && error.message !== `Quota check unavailable: ${error.code}`) {
+			fail(`detail: ${error.message}`);
+		}
 		if (error instanceof QuotaError && error.retryAt) fail(`retry at: ${error.retryAt}`);
 		fail('A refusal is not certification: the guard stays closed.');
 		return 1;
@@ -217,14 +222,15 @@ export async function main({
 	log(`checked at: ${snapshot.checkedAt}`);
 	log('windows:');
 	for (const window of snapshot.windows) {
-		log(`  ${window.id}  used ${window.used}  cap ${window.cap}  resetAt ${window.resetAt}`);
+		log(`  ${window.id}  used ${window.used}  cap ${window.cap}  resetAt ${window.resetAt ?? 'no reset pending'}`);
 	}
 	log('reserve:');
 	for (const window of snapshot.windows) {
 		const units = reserve.get(window.id);
-		log(
-			`  ${window.id}  ${units === null ? 'unknown (one read: the estimator needs two observations with movement)' : units}`,
-		);
+		const why = window.resetAt === null
+			? 'unknown (no reset pending: this window cannot calibrate, set quotaGuardReserveUnits)'
+			: 'unknown (one read: the estimator needs two observations with movement)';
+		log(`  ${window.id}  ${units === null ? why : units}`);
 	}
 	log(
 		`assessment: ${assessment.state} / ${assessment.reason}${assessment.limitingWindow ? ` (limiting window ${assessment.limitingWindow})` : ''}`,

@@ -10,7 +10,11 @@ export interface QuotaWindow {
   id: string;
   used: number;
   cap: number;
-  resetAt: string;
+  /**
+   * `null` means the provider reports no reset pending for this window. Only CommandCode's rolling
+   * windows can say that; a monthly or Codex window always carries a parseable instant.
+   */
+  resetAt: string | null;
 }
 
 export type QuotaScope = 'account' | 'provider';

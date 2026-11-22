@@ -10,10 +10,14 @@ export function validatePolicy(policy: Policy): Readonly<Policy> {
   return Object.freeze({ pause, warn, resume });
 }
 
-function validWindow(window: QuotaWindow): boolean {
-  return typeof window.id === 'string' && window.id.length > 0 && Number.isFinite(window.used) && window.used >= 0
-    && Number.isFinite(window.cap) && window.cap > 0 && typeof window.resetAt === 'string'
-    && Number.isFinite(Date.parse(window.resetAt));
+/** The only windows that may report "no reset pending": CommandCode's rolling counters. */
+const NULL_RESET_WINDOWS: ReadonlySet<string> = new Set(['fiveHour', 'weekly']);
+
+function validWindow(window: QuotaWindow, allowNullReset: boolean): boolean {
+  if (typeof window.id !== 'string' || window.id.length === 0 || !Number.isFinite(window.used) || window.used < 0
+    || !Number.isFinite(window.cap) || window.cap <= 0) return false;
+  if (window.resetAt === null) return allowNullReset && NULL_RESET_WINDOWS.has(window.id);
+  return typeof window.resetAt === 'string' && Number.isFinite(Date.parse(window.resetAt));
 }
 
 export function assess(
@@ -30,10 +34,13 @@ export function assess(
     : snapshot.scope === 'provider' ? snapshot.accountId === undefined : false;
   if (!Number.isFinite(now) || !Number.isFinite(checkedAt) || checkedAt > now || !scopedIdentity
     || !['openai-codex', 'commandcode'].includes(snapshot.providerId) || !windows.length
-    || !windows.every(validWindow) || new Set(windows.map(window => window.id)).size !== windows.length) {
+    || !windows.every(window => validWindow(window, snapshot.providerId === 'commandcode'))
+    || new Set(windows.map(window => window.id)).size !== windows.length) {
     return { state: 'wait', reason: 'unavailable' };
   }
   for (const window of windows) {
+    // No pending reset means no epoch boundary to settle; the thresholds below still gate the window.
+    if (window.resetAt === null) continue;
     const resetAt = Date.parse(window.resetAt);
     if (resetAt <= now) {
       const deadline = resetAt + 60_000;
@@ -119,7 +126,9 @@ export class ReserveEstimator {
 
   observe(accountKey: string, windows: readonly QuotaWindow[]): ReadonlyMap<string, number | null> {
     const result = new Map<string, number | null>();
-    if (!accountKey || !windows.length || !windows.every(validWindow)
+    // The estimator sees adapter-produced windows only, so the null shape is already vetted upstream;
+    // `assess` is what ties a null reset to CommandCode's provider id.
+    if (!accountKey || !windows.length || !windows.every(window => validWindow(window, true))
       || new Set(windows.map(window => window.id)).size !== windows.length) {
       this.samples.delete(accountKey);
       for (const window of windows) result.set(window.id, null);
@@ -128,6 +137,12 @@ export class ReserveEstimator {
     const previous = this.samples.get(accountKey) ?? new Map<string, Sample>();
     const next = new Map<string, Sample>();
     for (const window of windows) {
+      if (window.resetAt === null) {
+        // A window with no reset instant has no observable epoch boundary: drop the history rather
+        // than learn a delta across a boundary the provider never reported.
+        result.set(window.id, null);
+        continue;
+      }
       const old = previous.get(window.id);
       const sample: Sample = !old || old.resetAt !== window.resetAt || old.cap !== window.cap || window.used < old.used
         ? { resetAt: window.resetAt, cap: window.cap, used: window.used, deltas: [] }

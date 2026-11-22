@@ -134,9 +134,10 @@ Two other refusals are worth recognizing:
   to key a lane on. All CommandCode traffic therefore shares one lane and serialises. This is a
   deliberate trade — a lane keyed on no verified identity would be a guess — and a per-account lane
   becomes possible only if CommandCode ever exposes a stable account id.
-- **CommandCode's quota surface is served again (verified 2026-10-17)**, so its automatic lane is
-  reachable and guarded dispatch admits. A quota route answering 404 would still refuse that provider
-  as `unsupported`, which is no longer this provider's case. When
+- **CommandCode's quota routes are served (200 on 2026-11-22), but its read refuses** for a missing plan
+  identifier, so guarded dispatch stays closed until that is resolved (the 2026-10-17 certification below
+  is expired). A quota route answering 404 would still refuse that provider as `unsupported`, which is no
+  longer this provider's case. When
   `quotaGuardCommandCodeEnabled` is OFF, dispatch is intentionally unguarded (manual pause still
   applies). This is deliberate and dated, not a silent bypass: see
   [CommandCode's quota surface](#commandcodes-quota-surface-live-status).
@@ -176,13 +177,25 @@ Two other refusals are worth recognizing:
 
 ## CommandCode's quota surface (live status)
 
-**Current: served.** Verified live on **2026-10-17** against the pinned origin
-`https://api.commandcode.ai`: `GET /alpha/billing/credits` and `GET /alpha/billing/subscriptions` both
-answer **200** with the same credential that serves models, and the guard parses them into real windows —
-`monthly` (cap taken from `COMMANDCODE_MONTHLY_POOLS` for the reported plan), `fiveHour` and `weekly`
-with their own caps and resets. Guarded CommandCode dispatch is enabled and admits; a refusal now comes
-from policy (threshold or reserve) or from an unreadable read. The missing-route failure documented below
-was not observed on 2026-10-17, and a quota route answering 404 would still be classified `unsupported`.
+**Current: served, but not certifying.** The routes answer 200; the subscription shape no longer carries
+a plan, so the read refuses and guarded dispatch is closed.
+
+On **2026-11-22** both routes still answered **200** against the pinned origin `https://api.commandcode.ai`
+with the credential that serves models. The credits body decoded and passed the same numeric checks as
+before (fractional `monthlyCredits`, both rolling windows with caps), but the subscription body carried
+`priceId` and **no `planId`** — so the refusal happens before any monthly window is built — and
+`fiveHour.resetAt` was `0` — the provider's "no reset pending" sentinel. With no plan identifier the
+monthly pool cannot be looked up, so `normalizeCommandCode` refuses with `schema` and the coordinator
+pauses CommandCode's automatic lane (`identity`). That is a deliberate fail-closed answer: a `priceId` is a
+billing identifier, and inferring a monthly allowance from it would guess the cap the guard exists to
+enforce. The engine now accepts the zero sentinel and reports such a window as `no reset pending`; the
+missing plan remains an operator-supplied fact, not something the adapter infers. A quota route answering
+404 is still classified `unsupported`.
+
+On **2026-10-17** both routes answered 200 and the guard parsed them into real windows — `monthly` (cap
+taken from `COMMANDCODE_MONTHLY_POOLS` for the reported plan), `fiveHour` and `weekly` with their own caps
+and resets — and guarded dispatch admitted. That certification expired with the response shape change
+recorded above; re-certify against the current API before relying on it.
 
 Historically, on **2026-10-09**, those same routes answered **404** and guarded dispatch refused as
 `unsupported`. That record is kept below, dated, because it no longer describes the API
@@ -231,14 +244,34 @@ certification of all three:
 3. **Gate** — a full guarded dispatch through the gate, after `check:quota-host` passes, with the quota
    read happening on the real route.
 
-**All three hold as of 2026-10-17**: `node scripts/quota-guard/certify-live.mjs commandcode` prints real windows,
-the operator supplies `quotaGuardReserveUnits` (the estimator's own values take over once they calibrate),
-and a guarded dispatch through the gate returns a real completion. CommandCode's automatic guard is ON.
-Observed on that date: `npm run check:quota-host` passed 10/10, the certifier reported `certified: yes`, and
-a guarded dispatch through the gate returned a real completion.
-When a provider has not been certified, leave its guard OFF if unguarded dispatch is intended, or ON if
-fail-closed refusal is intended; OFF must not be mistaken for guarded protection. Re-check after any
-CommandCode or pi upgrade: this record is dated, and it expires with the provider's API.
+All three held on 2026-10-17: the certifier printed real windows, the operator supplies
+`quotaGuardReserveUnits` (the estimator's own values take over once they calibrate), and a guarded
+dispatch through the gate returned a real completion (`check:quota-host` 10/10). **That certification is
+expired**: the 2026-11-22 read refuses for a missing plan identifier, so all three must be re-established
+against the current API before CommandCode's guard can be trusted. When a provider has not been certified,
+leave its guard OFF if unguarded dispatch is intended, or ON if fail-closed refusal is intended; OFF must
+not be mistaken for guarded protection. Re-check after any CommandCode or pi upgrade: this record is dated,
+and it expires with the provider's API.
+
+### A priceId is not a plan
+
+The monthly pool is the one number the provider does not report; the guard keeps it in
+`COMMANDCODE_MONTHLY_POOLS`, keyed by plan. When the subscription carries only a `priceId`, the refusal
+names that gap instead of guessing a pool, and nothing about the identifier is echoed anywhere. To resolve
+it, record all four of these against a dated observation:
+
+1. the exact `priceId` the account is billed under (for example `price_…`, copied verbatim);
+2. the provider-confirmed canonical plan name it maps to;
+3. the included monthly allowance for that plan, in credits;
+4. the source of that confirmation and the date, so the entry can be re-checked when pricing changes.
+
+Recording the mapping in settings is not enough on its own: today the guard looks a pool up by `planId`, so a
+subscription that returns only a `priceId` stays refused no matter what is configured. Resolving it takes
+either a provider change that reports the plan, or a code change adding a verified `priceId` entry to the
+guard's own table — a reviewed edit, dated like any other certification fact. Until one of those lands,
+CommandCode cannot be certified, and the refusal is the guard behaving correctly. Reachability (the routes
+answering 200) is not certification, and certification is not admission: the guard admits only after the
+read, the reserve and the gate all hold.
 
 ## Certifying against live quotas (operator-authorised)
 
@@ -304,9 +337,9 @@ or failed, `2` usage.
 
 | Outcome | What it means | What to do |
 | --- | --- | --- |
-| The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows as real. For CommandCode the monthly cap is the guard's own table entry for the reported plan, not a provider number. The reserve stays uncalibrated: one read cannot size it. Certify again after a provider or host upgrade. |
-| A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. Report the code and the provider, never the credential. |
-| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **That provider's automatic guard refuses dispatch.** Its peer stays independent. Certify scoped quota, reserve and gate before enabling that provider's guard (see [Re-enabling CommandCode](#re-enabling-commandcode)). Not CommandCode's case since 2026-10-17: its routes answer 200 and its guard is enabled. |
+| The windows and caps print | The pinned origins, headers, deadline and parsing still agree with the live API | Treat the reported windows as real. For CommandCode the monthly cap is the guard's own table entry for the reported plan, not a provider number. The reserve stays uncalibrated: one read cannot size it, and a window printed as `no reset pending` can never calibrate one, so give it a `quotaGuardReserveUnits` entry. Certify again after a provider or host upgrade. |
+| A refusal (`schema`, `auth`, `rate-limited`, `unavailable`, `timeout`, `aborted`) | The provider changed shape, or refused the credential | **The guard stays closed.** A refusal certifies nothing: the guard keeps refusing rather than attributing an unrecognised shape to a window. When the adapter has an actionable reason it prints it on a `detail:` line (for example an unmapped `priceId`); the reason is sanitised and never includes a payload value. Report the code, the detail and the provider, never the credential. |
+| `unsupported` | A quota route answered 404: this provider's quota surface is not served here | **That provider's automatic guard refuses dispatch.** Its peer stays independent. Certify scoped quota, reserve and gate before enabling that provider's guard (see [Re-enabling CommandCode](#re-enabling-commandcode)). Not CommandCode's case: its routes still answer 200 (2026-11-22), and its read now refuses for the missing plan identifier instead. |
 
 ## Enabling the guard
 

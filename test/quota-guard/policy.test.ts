@@ -5,7 +5,7 @@ import type { Policy, QuotaSnapshot, QuotaWindow } from '../../src/quota-guard/t
 
 const now = Date.parse('2026-10-04T12:00:00.000Z');
 const policy: Policy = { warn: 20, pause: 10, resume: 20 };
-const windowOf = (id: string, used: number, cap = 100, resetAt = '2026-10-04T13:00:00.000Z'): QuotaWindow => ({ id, used, cap, resetAt });
+const windowOf = (id: string, used: number, cap = 100, resetAt: string | null = '2026-10-04T13:00:00.000Z'): QuotaWindow => ({ id, used, cap, resetAt });
 const snapshotOf = (windows: readonly QuotaWindow[], checkedAt = '2026-10-04T11:59:00.000Z'): QuotaSnapshot => ({
   providerId: 'openai-codex', scope: 'account', accountId: 'acct', checkedAt, windows,
 });
@@ -155,5 +155,58 @@ describe('reserve estimator', () => {
     assert.equal(estimator.observe('scope', [windowOf('w', 12)]).get('w'), 4);
     assert.equal(estimator.observe('scope', [windowOf('w', 13, 200)]).get('w'), null);
     assert.equal(estimator.observe('different-workspace', [windowOf('w', 14, 200)]).get('w'), null);
+  });
+});
+
+describe('windows with no reset pending', () => {
+  const rolling = (id: string, used: number, cap: number): QuotaWindow => ({ id, used, cap, resetAt: null });
+  const commandSnapshot = (windows: readonly QuotaWindow[]): QuotaSnapshot => ({
+    providerId: 'commandcode', scope: 'provider', checkedAt: '2026-10-04T11:59:00.000Z', windows,
+  });
+
+  it('admits a CommandCode rolling window that reports no reset, and still gates it', () => {
+    assert.deepEqual(assess(commandSnapshot([rolling('fiveHour', 0, 14)]), policy, 'running', reserve(['fiveHour', 0]), now),
+      { state: 'open', reason: 'healthy' });
+    assert.deepEqual(assess(commandSnapshot([rolling('weekly', 34, 35)]), policy, 'running', reserve(['weekly', 0]), now),
+      { state: 'pause', reason: 'threshold', limitingWindow: 'weekly' }, 'no reset instant does not lift the threshold');
+    assert.deepEqual(assess(commandSnapshot([rolling('fiveHour', 0, 14)]), policy, 'running', reserve(), now),
+      { state: 'wait', reason: 'unknown-reserve', limitingWindow: 'fiveHour' },
+      'a null reset never supplies a reserve');
+    assert.deepEqual(assess(commandSnapshot([rolling('fiveHour', 0, 14)]), policy, 'running', reserve(['fiveHour', 3]), now),
+      { state: 'open', reason: 'healthy' }, 'an operator seed still fills the unknown');
+    assert.deepEqual(assess(commandSnapshot([rolling('fiveHour', 0, 14)]), policy, 'running', reserve(['fiveHour', 14]), now),
+      { state: 'pause', reason: 'reserve', limitingWindow: 'fiveHour' }, 'a seeded reserve that exceeds the headroom still refuses');
+  });
+
+  it('rejects a missing reset on the monthly pool and on every Codex window', () => {
+    assert.deepEqual(assess(commandSnapshot([rolling('monthly', 1, 30)]), policy, 'running', reserve(['monthly', 0]), now),
+      { state: 'wait', reason: 'unavailable' });
+    assert.deepEqual(assess(snapshotOf([rolling('codex.primary_window', 1, 100)]), policy, 'running',
+      reserve(['codex.primary_window', 0]), now), { state: 'wait', reason: 'unavailable' });
+    // The id alone is not enough: only CommandCode may report it, so a Codex snapshot cannot borrow it.
+    assert.deepEqual(assess(snapshotOf([rolling('weekly', 1, 100)]), policy, 'running', reserve(['weekly', 0]), now),
+      { state: 'wait', reason: 'unavailable' });
+  });
+
+  it('drops the estimate instead of learning across a window with no reset instant', () => {
+    const estimator = new ReserveEstimator();
+    const at = '2026-10-04T13:00:00.000Z';
+    const seen = (used: number, resetAt: string | null) => estimator.observe('acct', [windowOf('weekly', used, 35, resetAt)]).get('weekly');
+    assert.equal(seen(1, at), null);
+    assert.equal(seen(2, at), 2, 'two observations with movement estimate a reserve');
+    assert.equal(seen(3, null), null, 'the sentinel reports unknown, never the carried estimate');
+    assert.equal(seen(4, at), null, 'the history was dropped, not carried across the gap');
+
+    // A null window drops only itself: the sibling's history and estimate must survive the same read.
+    const both = new ReserveEstimator();
+    const pair = (weekly: number, resetAt: string | null, fiveHour: number) =>
+      both.observe('acct', [windowOf('fiveHour', fiveHour, 14), windowOf('weekly', weekly, 35, resetAt)]);
+    pair(1, at, 1);
+    const before = pair(3, at, 2);
+    assert.equal(before.get('weekly'), 4, 'weekly estimate is known before the gap');
+    assert.equal(before.get('fiveHour'), 2, 'fiveHour estimate is known before the gap');
+    const witnessed = pair(5, null, 3);
+    assert.equal(witnessed.get('weekly'), null, 'the sentinel reports unknown for its own window');
+    assert.equal(witnessed.get('fiveHour'), 2, 'the sibling keeps calibrating through the same read');
   });
 });
