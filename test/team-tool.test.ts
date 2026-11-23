@@ -2,7 +2,7 @@
  * team-tool.test.ts — the model-callable `Team` adapter: it must refuse before
  * confirming anything unsafe, and dispatch nothing without an explicit approval.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -48,11 +48,22 @@ const manifest = JSON.stringify({
 let dir = "";
 let tools: Map<string, any>;
 
-function boot(confirm: boolean) {
+function boot(confirm: boolean, policy?: Record<string, unknown>) {
   dir = mkdtempSync(join(tmpdir(), "team-tool-"));
   writeFileSync(join(dir, "team.json"), manifest);
+  if (policy) {
+    mkdirSync(join(dir, ".pi"), { recursive: true });
+    writeFileSync(join(dir, ".pi/subagents.json"), JSON.stringify({ teamPolicy: policy }));
+  }
+  // The extension loads persisted settings from the launch directory at boot.
+  const previous = process.cwd();
+  process.chdir(dir);
   const made = makePi();
-  subagentsExtension(made.pi);
+  try {
+    subagentsExtension(made.pi);
+  } finally {
+    process.chdir(previous);
+  }
   tools = made.tools;
   return {
     hasUI: true,
@@ -121,6 +132,27 @@ describe("Team tool", () => {
     expect(result.content[0].text).toContain("team ok: 2 writers");
     expect(result.content[0].text).toContain("team/x at abc123");
     expect(result.details).toMatchObject({ ok: true, commit: "abc123" });
+  });
+
+  it("skips the prompt when teamPolicy.autoApprove is declared", async () => {
+    const ctx = boot(
+      false,
+      { autoApprove: true, retries: 1, retryBaseMs: 3000, maxTeamTokens: 1_200_000, maxTeamMs: 1_800_000, maxDispatchMs: 900_000 },
+    );
+    vi.mocked(runTeam).mockResolvedValue({ ok: true, branch: "team/y", commit: "def456", merged: ["a", "b"] });
+    const result = await callTeam(ctx, "team.json");
+    expect(ctx.ui.confirm).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("auto-approved by teamPolicy"), "warning");
+    expect(runTeam).toHaveBeenCalledTimes(1);
+    expect(result.content[0].text).toContain("team ok: 2 writers");
+  });
+
+  it("still refuses a bad manifest before an auto-approved dispatch", async () => {
+    const ctx = boot(false, { autoApprove: true, retries: 1, retryBaseMs: 3000 });
+    writeFileSync(join(ctx.cwd, "bad.json"), JSON.stringify({ gate: [], writers: [] }));
+    const result = await callTeam(ctx, "bad.json");
+    expect(result.content[0].text).toMatch(/team refused: /);
+    expect(runTeam).not.toHaveBeenCalled();
   });
 
   it("surfaces a refusal reason and detail unchanged", async () => {

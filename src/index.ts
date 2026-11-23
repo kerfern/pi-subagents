@@ -4591,13 +4591,24 @@ Terse command-style prompts produce shallow, generic work.
    * One approval text for both entry points: the gate runs host commands on
    * writer-edited code, so the operator sees the exact argv and claims.
    */
-  const approveTeam = async (plan: TeamPlan, ctx: ExtensionCommandContext | ExtensionContext): Promise<boolean> =>
-    ctx.ui.confirm(
+  const approveTeam = async (plan: TeamPlan, ctx: ExtensionCommandContext | ExtensionContext): Promise<boolean> => {
+    // A declared policy may remove the checkpoint. It cannot remove the caps,
+    // the claim checks, isolation, or the never-touch-the-checkout rule.
+    const declaredPolicy = manager.getTeamPolicy();
+    if (declaredPolicy !== false && declaredPolicy.autoApprove === true) {
+      ctx.ui.notify(
+        `team auto-approved by teamPolicy: ${plan.writers.length} writers, gate: ${plan.gate.join(" ")}`,
+        "warning",
+      );
+      return true;
+    }
+    return ctx.ui.confirm(
       "Run this team?",
       `${plan.writers.length} writers, gate: ${plan.gate.join(" ")}\n` +
         plan.writers.map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`).join("\n") +
         "\n\nWriters run in isolated worktrees; the gate runs on the merged result in a throwaway tree.",
     );
+  };
 
   /**
    * `Team` — the model-callable path. It never dispatches without an explicit
@@ -4610,7 +4621,7 @@ Terse command-style prompts produce shallow, generic work.
     label: "Team",
     description: [
       "Run a writer team from a manifest file: 2–6 writers with exclusive file claims, each in its own worktree, merged into a throwaway integration tree and gated once.",
-      "The operator must approve the plan (writers, claims, gate argv) before any writer starts; a declined or unavailable confirmation refuses the call.",
+      "The operator must approve the plan (writers, claims, gate argv) before any writer starts unless teamPolicy.autoApprove is declared; a declined or unavailable confirmation refuses the call.",
       "Your checkout is never written, merged into, or reset, and nothing is pushed. Returns the integration branch and commit on success, or the refusal reason with retained refs to inspect.",
     ].join(" "),
     promptSnippet: "Run a gated parallel writer team from a manifest",

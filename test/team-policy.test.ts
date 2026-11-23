@@ -102,6 +102,13 @@ describe("teamPolicy settings", () => {
     expect(loadWith(policy)().teamPolicy).toEqual(policy);
   });
 
+  it("accepts autoApprove as a boolean and refuses any other type", () => {
+    const base = { retries: 1, retryBaseMs: 3000 };
+    expect(loadWith({ ...base, autoApprove: true })().teamPolicy).toMatchObject({ autoApprove: true });
+    expect(loadWith({ ...base, autoApprove: false })().teamPolicy).toMatchObject({ autoApprove: false });
+    expect(() => loadWith({ ...base, autoApprove: "yes" })()).toThrow(/autoApprove must be a boolean/);
+  });
+
   it("defaults to off", () => {
     expect(loadSettings(join(dir, "nowhere")).teamPolicy ?? false).toBe(false);
   });

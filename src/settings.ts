@@ -473,6 +473,12 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 export type WorkflowToolExposureMode = "skill" | "inline" | "deferred";
 
 export interface TeamPolicy {
+  /**
+   * Skip the per-run confirmation for `Team` / `/agents-team`. The declared caps,
+   * claim checks, isolation and the never-touch-checkout rule still apply; only
+   * the human checkpoint is removed. Defaults to `false`.
+   */
+  autoApprove?: boolean;
   maxDispatchMs?: number;
   maxTeamTokens?: number;
   maxTeamMs?: number;
@@ -809,6 +815,10 @@ function sanitizeTeamPolicy(raw: unknown): TeamPolicy | false {
   }
   const r = raw as Record<string, unknown>;
   const out: Partial<TeamPolicy> = {};
+  if (r.autoApprove !== undefined) {
+    if (typeof r.autoApprove !== "boolean") throw new TeamPolicyError("autoApprove must be a boolean");
+    out.autoApprove = r.autoApprove;
+  }
   for (const key of ["maxDispatchMs", "maxTeamTokens", "maxTeamMs"] as const) {
     const v = r[key];
     if (v === undefined) continue;

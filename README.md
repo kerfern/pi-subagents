@@ -606,7 +606,7 @@ A failed `agent()` call returns `null`. The completion notification lists every 
 Run a writer team from a manifest: 2–6 writers with **exclusive file claims**, each in
 its own worktree at one base SHA, squash-merged serially into a throwaway integration
 tree where the gate runs once. The model calls this; the operator approves the plan
-first.
+first unless `teamPolicy.autoApprove: true` is declared.
 
 | Parameter | Type | Required | Description |
 | ----------- | ------ | ---------- | ------------- |
@@ -623,9 +623,9 @@ first.
 ```
 
 Refused before anything starts when: the manifest is invalid, claims overlap, the path
-escapes the project, worktree isolation is off, or the operator declines the
-confirmation (which shows the gate argv and every claimed file — the gate runs with
-host permissions on writer-edited code). Writer errors, a drifting base SHA, a diff
+escapes the project, worktree isolation is off, or (without `autoApprove`) the
+operator declines the confirmation, which shows the gate argv and every claimed file —
+the gate runs with host permissions on writer-edited code. Writer errors, a drifting base SHA, a diff
 outside the claims, a merge conflict or a failing gate refuse the whole team; nothing
 is partially merged. Your checkout is never written, merged into or reset, and nothing
 is pushed. The result carries the integration branch and commit; inspect them and the
