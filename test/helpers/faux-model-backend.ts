@@ -18,16 +18,19 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "./pi-ai.js";
 
-/** Both option shapes for `createAgentSession`, for the given faux model. */
-export function fauxModelBackend(model: Model<string>): {
+/** Both option shapes for `createAgentSession`, for the given faux model(s). */
+export function fauxModelBackend(models: Model<string> | Model<string>[]): {
   modelRegistry: any;
   modelRuntime: any;
 } {
+  const catalog = Array.isArray(models) ? models : [models];
+  const model = catalog[0]!;
   return {
     modelRegistry: {
-      find: () => model,
-      getAll: () => [model],
-      getAvailable: () => [model],
+      find: (provider?: string, id?: string) =>
+        provider === undefined ? model : catalog.find((m) => m.provider === provider && m.id === id),
+      getAll: () => catalog,
+      getAvailable: () => catalog,
       hasConfiguredAuth: () => true,
       isUsingOAuth: () => false,
       // createAgentSession's injected streamFn checks `auth.ok` and throws
@@ -38,12 +41,15 @@ export function fauxModelBackend(model: Model<string>): {
       unregisterProvider: () => {},
     },
     modelRuntime: {
-      getModel: () => model,
-      getModels: () => [model],
+      getModel: (provider?: string, id?: string) =>
+        provider === undefined
+          ? model
+          : catalog.find((m) => m.provider === provider && m.id === id) ?? model,
+      getModels: () => catalog,
       getProvider: () => undefined,
       getProviders: () => [],
-      getAvailable: async () => [model],
-      getAvailableSnapshot: () => [model],
+      getAvailable: async () => catalog,
+      getAvailableSnapshot: () => catalog,
       getError: () => undefined,
       hasConfiguredAuth: () => true,
       checkAuth: async () => ({ ok: true }),

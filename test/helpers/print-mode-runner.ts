@@ -134,6 +134,16 @@ export interface RunPrintModeOptions {
   /** Faux mode: how many model calls to pad the queue for. Default 16. */
   maxModelCalls?: number;
   /**
+   * Faux mode: extra provider seats that serve the SAME model id, so the pool
+   * can rotate between them without a second real model. Each entry registers
+   * its own faux provider; the model id is the primary faux id.
+   */
+  extraProviderSeats?: string[];
+  /** Faux mode: provider id of the primary seat. Default "faux". */
+  primaryProvider?: string;
+  /** Faux mode: model id served by every seat. Default "faux-1". */
+  primaryModelId?: string;
+  /**
    * Honor the subagent hold condition — block the parent agent loop until
    * background subagents finish (the pi-chonky-step monkey-patch). Default true.
    */
@@ -370,19 +380,28 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     if (!options.steps && !options.respond) {
       throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
     }
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    const primaryProvider = options.primaryProvider ?? "faux";
+    const primaryModelId = options.primaryModelId ?? "faux-1";
+    faux = registerFauxProvider({ provider: primaryProvider, models: [{ id: primaryModelId, contextWindow: 200_000 }] });
     model = faux.getModel();
+    const seats: Model<string>[] = [model];
+    const seatProviders = [faux];
+    for (const provider of options.extraProviderSeats ?? []) {
+      const seat = registerFauxProvider({ provider, models: [{ id: primaryModelId, contextWindow: 200_000 }] });
+      seats.push(seat.getModel());
+      seatProviders.push(seat);
+    }
     // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since
     // resolveDefaultModel falls back to the parent model when no model is pinned.
-    ({ modelRegistry, modelRuntime } = fauxModelBackend(model));
+    ({ modelRegistry, modelRuntime } = fauxModelBackend(seats));
 
     // Pad the response queue: one context-branching responder per expected model
     // call. The queue is a single FIFO shared by parent + child, but every entry
     // is the same responder that decides from its own context, so interleaving
     // order doesn't matter.
     if (options.steps) {
-      faux.setResponses(options.steps);
+      for (const seat of seatProviders) seat.setResponses(options.steps);
     } else {
       const respond = options.respond;
       if (!respond) {
@@ -391,7 +410,8 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
       const max = options.maxModelCalls ?? 16;
       const factory: FauxResponseStep = async (context, opts, state) =>
         toAssistantMessage(await respond(normalizeFauxContext(context), state, opts));
-      faux.setResponses(Array.from({ length: max }, () => factory));
+      const steps = Array.from({ length: max }, () => factory);
+      for (const seat of seatProviders) seat.setResponses(steps);
     }
   }
 
