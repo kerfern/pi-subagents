@@ -55,6 +55,9 @@ async function spawnAndSettle(
 ) {
   const { type = "general-purpose", ...options } = over;
   const id = manager.spawn({} as any, mockCtx(models), type as string, "p", fresh(options) as any);
+  // `spawn` records the promise on a later tick; without this the helper would
+  // await only startup and read a half-settled record.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   const record = manager.getRecord(id);
   await (record?.promise ?? manager.awaitStartup(id)).catch(() => {});
   return record;
@@ -181,7 +184,7 @@ describe("shared routing at startAgent", () => {
     expect(record?.status).toBe("completed");
   });
 
-  it("does not retry fallback again when its provider error is thrown", async () => {
+  it("does not retry a leg that throws a provider error again, and does not latch", async () => {
     vi.mocked(runAgent)
       .mockResolvedValueOnce(providerFail() as RunResult)
       .mockRejectedValueOnce(new Error("429 fallback quota exceeded"))
@@ -192,7 +195,7 @@ describe("shared routing at startAgent", () => {
     await spawnAndSettle(manager);
 
     expect(runAgent).toHaveBeenCalledTimes(2);
-    expect(routing.routingFailed).toBe(true);
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("does not retry a task failure", async () => {
@@ -231,20 +234,23 @@ describe("shared routing at startAgent", () => {
     expect(runAgent).toHaveBeenCalledTimes(2);
   });
 
-  it("latches when the fallback fails, then refuses the next fresh dispatch without running it", async () => {
+  it("reports the leg's failure for that task and leaves the route free for the next dispatch", async () => {
+    // A runtime error is evidence about one task, not about routing: latching here
+    // would kill every later dispatch over a transient failure on the retry provider.
     vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
     const routing = state();
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
     await spawnAndSettle(manager);
     expect(runAgent).toHaveBeenCalledTimes(2);
-    expect(routing.routingFailed).toBe(true);
-    expect(routing.terminalReason).toContain("429 rate limit exceeded");
+    expect(routing.routingFailed).toBe(false);
 
-    await expect(spawnRefused(manager)).rejects.toThrow(/routing stopped/i);
-    expect(runAgent).toHaveBeenCalledTimes(2);
+    vi.mocked(runAgent).mockResolvedValue({ ...ok(), responseText: "recovered" } as RunResult);
+    const again = await spawnAndSettle(manager);
+    expect(again?.result).toBe("recovered");
+    expect(runAgent).toHaveBeenCalledTimes(3);
   });
 
-  it("reports exact primary model when specialist route and fallback both fail", async () => {
+  it("runs a specialist on its own route, then on the leg, without latching", async () => {
     vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
     const routing = state({ reviewerEffective: "faux/reviewer-1" });
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [
@@ -254,8 +260,9 @@ describe("shared routing at startAgent", () => {
     ]));
 
     await spawnAndSettle(manager, { type: "advisor" });
-    expect(routing.terminalReason).toContain("faux/reviewer-1");
-    expect(routing.terminalReason).not.toContain("faux/primary-1");
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual({ provider: "faux", id: "reviewer-1" });
+    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(FALLBACK);
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("fails before running when the routed model is not in the catalog", async () => {
@@ -308,7 +315,7 @@ describe("shared routing at startAgent", () => {
     expect(runAgent).toHaveBeenCalledTimes(1);
   });
 
-  it("uses a configured retry leg and names it when that leg fails", async () => {
+  it("uses a configured retry leg and does not latch when that leg fails", async () => {
     vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
     const routing = state();
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
@@ -318,7 +325,7 @@ describe("shared routing at startAgent", () => {
 
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(FALLBACK);
-    expect(routing.terminalReason).toContain("commandcode/minimax/minimax-m3.1-flash");
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("honors a configured leg that differs from the shipped default", async () => {
@@ -334,7 +341,7 @@ describe("shared routing at startAgent", () => {
 
     expect(runAgent).toHaveBeenCalledTimes(2);
     expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(leg);
-    expect(routing.terminalReason).toContain("faux/retry-2");
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("treats a retry leg naming the routed model as off", async () => {
@@ -349,11 +356,26 @@ describe("shared routing at startAgent", () => {
     expect(routing.routingFailed).toBe(false);
   });
 
-  it("fails before running when the fallback is not in the catalog", async () => {
+  it("dispatches normally when the leg is not in this session's catalog", async () => {
+    // The leg is resolved only if a provider actually fails, so a scope list that
+    // omits it cannot refuse work that never needed the retry.
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     const routing = state();
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [PRIMARY]));
-    await expect(spawnRefused(manager)).rejects.toThrow(/unavailable/i);
-    expect(runAgent).not.toHaveBeenCalled();
+    const record = await spawnAndSettle(manager);
+    expect(record?.result).toBe("done");
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(routing.routingFailed).toBe(false);
+  });
+
+  it("surfaces the routed model's failure when the leg is out of catalog at failure time", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [PRIMARY]));
+    const record = await spawnAndSettle(manager);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(record?.error).toContain("429 rate limit exceeded");
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("rejects a conflicting caller-supplied model override", async () => {

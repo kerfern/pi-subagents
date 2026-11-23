@@ -14,9 +14,6 @@ import { NO_FALLBACK } from "../src/agent-types.js";
 import {
   FALLBACK_SUBAGENT_MODEL,
   fallbackKeyFor,
-  recordFallbackFailure,
-  routingBlockReason,
-  type SubagentRoutingState,
 } from "../src/model-routing.js";
 import { loadSettings, SETTING_DEFAULTS } from "../src/settings.js";
 
@@ -33,23 +30,6 @@ describe("fallbackKeyFor", () => {
   it("is off when the configured leg is the routed model itself", () => {
     expect(fallbackKeyFor("a/b", "a/b")).toBeUndefined();
     expect(fallbackKeyFor("a/c", "a/b")).toBe("a/c");
-  });
-});
-
-describe("recordFallbackFailure", () => {
-  const state = (): SubagentRoutingState => ({ effective: "a/primary" } as SubagentRoutingState);
-
-  it("names the leg that actually failed", () => {
-    const s = state();
-    recordFallbackFailure(s, "429 rate limited", "a/primary", "b/leg");
-    expect(routingBlockReason(s)).toContain("b/leg");
-    expect(routingBlockReason(s)).not.toContain(FALLBACK_SUBAGENT_MODEL);
-  });
-
-  it("still defaults to the shipped leg for older callers", () => {
-    const s = state();
-    recordFallbackFailure(s, "boom");
-    expect(routingBlockReason(s)).toContain(FALLBACK_SUBAGENT_MODEL);
   });
 });
 

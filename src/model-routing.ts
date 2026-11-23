@@ -244,19 +244,6 @@ export function recordUnavailableModel(state: SubagentRoutingState, model: strin
     `Set an available model with /subagent-model.`;
 }
 
-/** Latches the route after the fallback leg itself failed. */
-export function recordFallbackFailure(
-  state: SubagentRoutingState,
-  detail: string,
-  primaryModel = state.effective,
-  fallbackModel = FALLBACK_SUBAGENT_MODEL,
-): void {
-  state.routingFailed = true;
-  state.terminalReason =
-    `Subagent routing stopped: ${primaryModel} failed, then the fallback ` +
-    `${fallbackModel} failed (${detail}).`;
-}
-
 /**
  * The fallback leg a fresh dispatch may use, or `undefined` for none.
  *

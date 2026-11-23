@@ -35,7 +35,6 @@ import {
   type ModelRef,
   modelForSubagent,
   modelKey,
-  recordFallbackFailure,
   recordUnavailableModel,
   routingBlockReason,
   type SubagentRoutingState,
@@ -90,8 +89,13 @@ export interface SubagentRouting {
 /** The models one logical task may run on: the route, and its one approved retry. */
 interface RoutedModels {
   model: Model<any>;
-  /** Absent when `fallbackModel` is off (or names the routed model itself). */
-  fallback?: Model<any>;
+  /**
+   * The configured retry leg, resolved only IF a provider failure actually
+   * happens. Absent when `fallbackModel` is off (or names the routed model
+   * itself). Deliberately not resolved up front: a leg missing from this
+   * session's scope must not refuse a healthy dispatch.
+   */
+  fallbackKey?: string;
 }
 
 /**
@@ -921,15 +925,11 @@ export class AgentManager {
     }
 
     // No configured leg means a provider failure surfaces on the routed model
-    // rather than moving the work to another provider and subscription.
+    // rather than moving the work to another provider and subscription. The leg
+    // itself is NOT resolved here: `/scoped-models` omitting it, or a stale
+    // catalog entry, must not refuse a dispatch that never needs it.
     const fallbackKey = fallbackKeyFor(this.fallbackModel, wanted);
-    if (fallbackKey === undefined) return { model };
-    const fallback = this.exactCatalogModel(ctx, catalog, fallbackKey);
-    if (typeof fallback === "string") {
-      recordUnavailableModel(routing.state, fallbackKey);
-      return this.latched(routing);
-    }
-    return { model, fallback };
+    return fallbackKey === undefined ? { model } : { model, fallbackKey };
   }
 
   /** The latched reason, announced to the UI exactly where the latch was set. */
@@ -967,6 +967,7 @@ export class AgentManager {
   private runRouted(
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route?: RoutedModels,
+    ctx?: ExtensionContext,
   ): Promise<RunResult> {
     // NOT an `async` method: every unrouted path must call the runner directly,
     // so a SYNCHRONOUS throw out of `runAgent` stays a startup failure the
@@ -974,12 +975,13 @@ export class AgentManager {
     // promise that the completion tail swallows, and the spawn would look like
     // it started.
     if (this.routing === undefined || route === undefined) return startRun(route?.model);
-    return this.runAttempts(startRun, route);
+    return this.runAttempts(startRun, route, ctx as ExtensionContext);
   }
 
   private async runAttempts(
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route: RoutedModels,
+    ctx: ExtensionContext,
   ): Promise<RunResult> {
     let first: RunResult;
     try {
@@ -987,47 +989,50 @@ export class AgentManager {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
-      if (route.fallback === undefined) {
+      if (route.fallbackKey === undefined) {
         // No approved retry leg: surface the routed model's own failure. Latching
         // here would kill every later dispatch over one transient error.
         throw error;
       }
-      return this.retryOnFallback(startRun, route);
+      return this.retryOnFallback(startRun, route, ctx, { error });
     }
 
     if (first.aborted || first.failure === undefined) return first;
     if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
-    if (route.fallback === undefined) return first;
-    return this.retryOnFallback(startRun, route);
+    if (route.fallbackKey === undefined) return first;
+    return this.retryOnFallback(startRun, route, ctx, { first });
   }
 
   /**
-   * The single fallback leg. A fallback that fails again latches the route for
-   * every LATER dispatch, while this task still reports what actually happened:
-   * the fallback's own error, not the primary's.
+   * The single fallback leg, resolved at the moment a provider actually fails.
+   *
+   * Two things it must NOT do: refuse a healthy dispatch because the leg is out
+   * of scope (a config that is not needed cannot block), and latch the route
+   * when the leg fails. A runtime failure is evidence about one task, not about
+   * routing, so the task reports what happened and the next dispatch is free.
    */
   private async retryOnFallback(
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route: RoutedModels,
+    ctx: ExtensionContext,
+    primary: { first: RunResult } | { error: unknown },
   ): Promise<RunResult> {
+    const key = route.fallbackKey as string;
     const routing = this.routing as SubagentRouting;
-    const fallback = route.fallback as Model<any>;
-    try {
-      const second = await startRun(fallback);
-      if (!second.aborted && second.failure !== undefined
-        && classifyProviderFailure({ isError: true, text: second.failure })) {
-        recordFallbackFailure(routing.state, second.failure, modelKey(route.model), modelKey(fallback));
-        this.latched(routing);
-      }
-      return second;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      if (classifyProviderFailure({ isError: true, text: detail })) {
-        recordFallbackFailure(routing.state, detail, modelKey(route.model), modelKey(fallback));
-        this.latched(routing);
-      }
-      throw error;
+    const fallback = this.exactCatalogModel(ctx, routing.catalogFor(ctx), key);
+    const reportPrimary = (): Promise<RunResult> => ("error" in primary ? Promise.reject(primary.error) : Promise.resolve(primary.first));
+    if (typeof fallback === "string") {
+      // The leg was withdrawn between spawn and failure (scope change, logout).
+      // Surface the routed model's own failure instead of pretending the leg ran.
+      ctx.ui?.notify?.(
+        `[routing] retry leg ${key} is unavailable in this session; reporting ${modelKey(route.model)}'s failure`,
+        "warning",
+      );
+      return reportPrimary();
     }
+    // Outside the primary's catch on purpose: the leg's own outcome IS the task's
+    // outcome, and it is never converted into a routing decision.
+    return startRun(fallback);
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
@@ -1249,7 +1254,7 @@ export class AgentManager {
       });
     };
 
-    const promise = this.runRouted(startRun, routed as RoutedModels | undefined)
+    const promise = this.runRouted(startRun, routed as RoutedModels | undefined, ctx)
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
         this.settleOutcome(record, { text: responseText, failure, aborted, steered });
         // Kept beside `result`, never inside it: `result` is prose meant for a

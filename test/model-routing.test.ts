@@ -8,7 +8,6 @@ import {
   modelForSubagent,
   modelKey,
   ROUTING_STATE_TYPE,
-  recordFallbackFailure,
   recordUnavailableModel,
   resolveExactSelection,
   restoreRoutingState,
@@ -167,17 +166,16 @@ describe("terminal latch", () => {
     expect(routingBlockReason(state)).not.toMatch(/choose another model/i);
   });
 
-  it("latches when the fallback leg fails and names both legs", () => {
+  it("has no latch for a retry-leg runtime failure", () => {
+    // A leg failure is reported for its task, never converted into a routing
+    // decision: the state must still be free for the next dispatch.
     const state = restoreRoutingState([], catalog);
-    recordFallbackFailure(state, "429 from fallback");
-    expect(state.routingFailed).toBe(true);
-    expect(routingBlockReason(state)).toContain(FALLBACK_SUBAGENT_MODEL);
-    expect(routingBlockReason(state)).toContain("429 from fallback");
+    expect(routingBlockReason(state)).toBeUndefined();
   });
 
   it("clears the latch on a deliberate re-selection", () => {
     const state = restoreRoutingState([], catalog);
-    recordFallbackFailure(state, "quota");
+    recordUnavailableModel(state, DEFAULT_SUBAGENT_MODEL);
     selectModels(state, modelKey(FAUX), modelKey(OTHER), "medium", "high");
     expect(state.routingFailed).toBe(false);
     expect(routingBlockReason(state)).toBeUndefined();
