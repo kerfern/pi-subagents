@@ -183,6 +183,31 @@ export type MentionResolution =
 /** Which concurrency pool a run is charged to. */
 export type Pool = "background" | "foreground";
 
+/** One provider seat a dispatch actually tried, and how it went. */
+export type ProviderAttemptOutcome = "skipped" | "success" | "provider-error" | "task-error" | "aborted";
+
+export interface ProviderAttempt {
+  /** `provider/model` the attempt would have run on. */
+  key: string;
+  /** Pool candidates are `pool`; the configured retry leg is `fallback`. */
+  leg: "pool" | "fallback";
+  outcome: ProviderAttemptOutcome;
+  /** Credential-free failure text, truncated; present for the non-success outcomes. */
+  reason?: string;
+}
+
+/**
+ * What served a pooled task: the declared rule, the seats tried, which one ran
+ * it. Persisted with the record so a benchmark or a human can attribute the run
+ * without reading a toast from another extension.
+ */
+export interface ProviderRouteRecord {
+  strategy: "fill_first" | "round_robin";
+  members: string[];
+  attempts: ProviderAttempt[];
+  servedModelKey?: string;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -295,6 +320,11 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Exact canonical provider/model selected at the runner boundary when known. */
   selectedModelId?: string;
+  /**
+   * Which seat ran a pooled dispatch, and every attempt it took. Undefined when
+   * the provider pool is off, so an unpooled record stays exactly as before.
+   */
+  providerRoute?: ProviderRouteRecord;
   /** Requested level passed to the runner, distinct from effective session thinking. */
   requestedThinking?: EffectiveThinkingLevel;
   /** Number of primary/fallback provider attempts started for this run. */

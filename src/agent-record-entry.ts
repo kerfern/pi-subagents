@@ -42,6 +42,12 @@ export interface AgentRecordEntryData {
   alias?: string;
   /** Set when the agent's work lived in a worktree that is now gone — see {@link worktreeLost}. */
   worktreeLost?: boolean;
+  /**
+   * The provider seats this run tried, in order, and which one served it. Kept
+   * on the persisted record so attribution survives model/process restarts
+   * instead of depending on another extension's toast.
+   */
+  providerRoute?: AgentRecord["providerRoute"];
 }
 
 /**
@@ -72,6 +78,7 @@ export function agentRecordEntryData(record: AgentRecord): AgentRecordEntryData 
     handle: record.handle,
     alias: record.alias,
     worktreeLost: worktreeLost(record) || undefined,
+    providerRoute: record.providerRoute,
   };
 }
 

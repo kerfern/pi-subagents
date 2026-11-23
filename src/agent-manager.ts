@@ -35,12 +35,25 @@ import {
   type ModelRef,
   modelForSubagent,
   modelKey,
+  type ProviderPoolSettings,
+  poolMembersFor,
   recordUnavailableModel,
   routingBlockReason,
   type SubagentRoutingState,
   thinkingForSubagent,
 } from "./model-routing.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, Pool, SubagentType, ThinkingLevel } from "./types.js";
+import type {
+  AgentInvocation,
+  AgentRecord,
+  AgentTombstone,
+  IsolationMode,
+  MentionResolution,
+  Pool,
+  ProviderAttemptOutcome,
+  ProviderRouteRecord,
+  SubagentType,
+  ThinkingLevel,
+} from "./types.js";
 import { addUsage, type LifetimeUsage, type MessageUsageDelta } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -96,6 +109,14 @@ interface RoutedModels {
    * session's scope must not refuse a healthy dispatch.
    */
   fallbackKey?: string;
+  /** Set only when this dispatch's routed provider is the pool's anchored seat. */
+  pool?: ProviderPoolSettings;
+  /**
+   * Attempt ledger attached to the record when this dispatch is pooled. Shared
+   * by reference with the running route so every attempt lands where the
+   * finished record can report it.
+   */
+  ledger?: ProviderRouteRecord;
 }
 
 /**
@@ -476,6 +497,10 @@ export class AgentManager {
   private maxConcurrentNested = DEFAULT_MAX_CONCURRENT_NESTED;
   /** `fallbackModel` setting; undefined keeps the historical retry leg. */
   private fallbackModel: string | undefined;
+  /** `providerPool` setting; `false` keeps one provider per dispatch. */
+  private providerPool: ProviderPoolSettings | false = false;
+  /** Round-robin cursor: advances once per pooled dispatch, never per attempt. */
+  private poolCursor = 0;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -594,6 +619,16 @@ export class AgentManager {
 
   getFallbackModel(): string | undefined {
     return this.fallbackModel;
+  }
+
+  /** Set the provider pool; `false` disables it and restores single-provider dispatch. */
+  setProviderPool(pool: ProviderPoolSettings | false) {
+    this.providerPool = pool;
+    this.poolCursor = 0;
+  }
+
+  getProviderPool(): ProviderPoolSettings | false {
+    return this.providerPool;
   }
 
   /**
@@ -929,7 +964,17 @@ export class AgentManager {
     // itself is NOT resolved here: `/scoped-models` omitting it, or a stale
     // catalog entry, must not refuse a dispatch that never needs it.
     const fallbackKey = fallbackKeyFor(this.fallbackModel, wanted);
-    return fallbackKey === undefined ? { model } : { model, fallbackKey };
+    const pool = this.providerPool;
+    const members = pool === false ? [] : poolMembersFor(model, pool);
+    // A leg inside the pool would re-try a seat this dispatch already spent.
+    const legProvider = fallbackKey?.split("/")[0];
+    const legSpent = legProvider !== undefined && members.includes(legProvider);
+    const route: RoutedModels = fallbackKey === undefined || legSpent ? { model } : { model, fallbackKey };
+    if (pool !== false && members.length > 1) {
+      route.pool = { strategy: pool.strategy, members };
+      route.ledger = { strategy: pool.strategy, members: [...members], attempts: [] };
+    }
+    return route;
   }
 
   /** The latched reason, announced to the UI exactly where the latch was set. */
@@ -983,56 +1028,148 @@ export class AgentManager {
     route: RoutedModels,
     ctx: ExtensionContext,
   ): Promise<RunResult> {
-    let first: RunResult;
-    try {
-      first = await startRun(route.model);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
-      if (route.fallbackKey === undefined) {
-        // No approved retry leg: surface the routed model's own failure. Latching
-        // here would kill every later dispatch over one transient error.
-        throw error;
+    const candidates = this.poolCandidates(route, ctx);
+    let lastError: unknown;
+    let lastResult: RunResult | undefined;
+
+    for (const candidate of candidates) {
+      try {
+        const result = await startRun(candidate.model);
+        if (result.aborted) {
+          this.noteAttempt(route, candidate.key, "pool", "aborted");
+          return result;
+        }
+        if (result.failure === undefined) {
+          this.noteAttempt(route, candidate.key, "pool", "success");
+          this.markServed(route, candidate.key);
+          return result;
+        }
+        if (!classifyProviderFailure({ isError: true, text: result.failure })) {
+          // A task failure is evidence about the work, not the provider: never
+          // spend another seat on it.
+          this.noteAttempt(route, candidate.key, "pool", "task-error");
+          return result;
+        }
+        this.noteAttempt(route, candidate.key, "pool", "provider-error");
+        lastResult = result;
+        lastError = undefined;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
+        this.noteAttempt(route, candidate.key, "pool", "provider-error");
+        lastError = error;
+        lastResult = undefined;
       }
-      return this.retryOnFallback(startRun, route, ctx, { error });
     }
 
-    if (first.aborted || first.failure === undefined) return first;
-    if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
-    if (route.fallbackKey === undefined) return first;
-    return this.retryOnFallback(startRun, route, ctx, { first });
+    // The pool is spent. The configured cross-provider leg is the only further
+    // move, and it is resolved AT FAILURE TIME: a leg withdrawn from this
+    // session's scope must not turn the last real failure into a routing error.
+    if (route.fallbackKey !== undefined) {
+      const key = route.fallbackKey;
+      const fallback = this.exactCatalogModel(ctx, (this.routing as SubagentRouting).catalogFor(ctx), key);
+      if (typeof fallback === "string") {
+        ctx.ui?.notify?.(
+          `[routing] retry leg ${key} is unavailable in this session; reporting ${modelKey(route.model)}'s failure`,
+          "warning",
+        );
+        this.noteAttempt(route, key, "fallback", "skipped");
+      } else {
+        try {
+          const result = await startRun(fallback);
+          if (result.aborted) {
+            this.noteAttempt(route, key, "fallback", "aborted");
+            return result;
+          }
+          if (result.failure === undefined) {
+            this.noteAttempt(route, key, "fallback", "success");
+            this.markServed(route, key);
+            return result;
+          }
+          const outcome: ProviderAttemptOutcome = classifyProviderFailure({ isError: true, text: result.failure })
+            ? "provider-error"
+            : "task-error";
+          this.noteAttempt(route, key, "fallback", outcome);
+          return result;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const outcome: ProviderAttemptOutcome = classifyProviderFailure({ isError: true, text: detail })
+            ? "provider-error"
+            : "task-error";
+          this.noteAttempt(route, key, "fallback", outcome);
+          throw error;
+        }
+      }
+    }
+
+    if (lastError !== undefined) throw lastError;
+    if (lastResult !== undefined) return lastResult;
+    throw new Error(`No provider could run ${modelKey(route.model)}: every pool member was missing from this session's catalog.`);
   }
 
   /**
-   * The single fallback leg, resolved at the moment a provider actually fails.
+   * The seats this dispatch may try, in order.
    *
-   * Two things it must NOT do: refuse a healthy dispatch because the leg is out
-   * of scope (a config that is not needed cannot block), and latch the route
-   * when the leg fails. A runtime failure is evidence about one task, not about
-   * routing, so the task reports what happened and the next dispatch is free.
+   * A non-pooled route is a single candidate, so the loop above is also the
+   * ordinary one-provider path. Pooled candidates resolve at dispatch time and
+   * a member whose `provider/<routed id>` is absent from this session's catalog
+   * is recorded as `skipped`, never allowed to refuse the dispatch.
    */
-  private async retryOnFallback(
-    startRun: (model?: Model<any>) => Promise<RunResult>,
+  private poolCandidates(
     route: RoutedModels,
     ctx: ExtensionContext,
-    primary: { first: RunResult } | { error: unknown },
-  ): Promise<RunResult> {
-    const key = route.fallbackKey as string;
-    const routing = this.routing as SubagentRouting;
-    const fallback = this.exactCatalogModel(ctx, routing.catalogFor(ctx), key);
-    const reportPrimary = (): Promise<RunResult> => ("error" in primary ? Promise.reject(primary.error) : Promise.resolve(primary.first));
-    if (typeof fallback === "string") {
-      // The leg was withdrawn between spawn and failure (scope change, logout).
-      // Surface the routed model's own failure instead of pretending the leg ran.
-      ctx.ui?.notify?.(
-        `[routing] retry leg ${key} is unavailable in this session; reporting ${modelKey(route.model)}'s failure`,
-        "warning",
-      );
-      return reportPrimary();
+  ): Array<{ key: string; model: Model<any> }> {
+    if (route.pool === undefined) return [{ key: modelKey(route.model), model: route.model }];
+    const catalog = (this.routing as SubagentRouting).catalogFor(ctx);
+    const members = route.pool.strategy === "round_robin"
+      ? this.rotatedMembers(route.pool.members)
+      : route.pool.members;
+    const candidates: Array<{ key: string; model: Model<any> }> = [];
+    for (const provider of members) {
+      const key = `${provider}/${route.model.id}`;
+      const model = this.exactCatalogModel(ctx, catalog, key);
+      if (typeof model === "string") {
+        this.noteAttempt(route, key, "pool", "skipped");
+        continue;
+      }
+      candidates.push({ key, model });
     }
-    // Outside the primary's catch on purpose: the leg's own outcome IS the task's
-    // outcome, and it is never converted into a routing decision.
-    return startRun(fallback);
+    // A catalog that lost every member must still report the routed model's own
+    // failure rather than inventing a routing error.
+    return candidates.length > 0 ? candidates : [{ key: modelKey(route.model), model: route.model }];
+  }
+
+  /** Declaration order, rotated by one synchronous session cursor that wraps. */
+  private rotatedMembers(members: string[]): string[] {
+    const start = this.poolCursor % members.length;
+    this.poolCursor = (this.poolCursor + 1) % members.length;
+    return [...members.slice(start), ...members.slice(0, start)];
+  }
+
+  /**
+   * Append one attempt to the pooled record. A no-op for unpooled dispatches:
+   * an ordinary route must produce exactly the record it produced before.
+   *
+   * `reason` is a fixed label, never the upstream failure text: an auth error
+   * can echo a token, and this ledger is persisted in the session store.
+   */
+  private noteAttempt(
+    route: RoutedModels,
+    key: string,
+    leg: "pool" | "fallback",
+    outcome: ProviderAttemptOutcome,
+  ): void {
+    if (route.ledger === undefined) return;
+    const reason =
+      outcome === "skipped" ? "not in session catalog"
+        : outcome === "provider-error" ? "provider error"
+          : outcome === "task-error" ? "task failure"
+            : undefined;
+    route.ledger.attempts.push({ key, leg, outcome, ...(reason === undefined ? {} : { reason }) });
+  }
+
+  private markServed(route: RoutedModels, key: string): void {
+    if (route.ledger !== undefined) route.ledger.servedModelKey = key;
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
@@ -1058,6 +1195,9 @@ export class AgentManager {
       ? this.resolveRoute(ctx, options, type)
       : undefined;
     if (typeof routed === "string") throw new Error(routed);
+    // The ledger is shared by reference: attempts are appended as they happen,
+    // and the settled record persists the same object.
+    if (routed?.ledger !== undefined) record.providerRoute = routed.ledger;
     const routedThinking = this.routing !== undefined && routed !== undefined
       ? thinkingForSubagent(this.routing.state, type)
       : undefined;

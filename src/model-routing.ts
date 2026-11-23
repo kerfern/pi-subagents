@@ -222,7 +222,9 @@ export function clearRoutingState(state: SubagentRoutingState): void {
  * substrings misread ordinary prose (`latest` contains "test", `authoring`
  * contains "auth"), and a misread here retries a task that actually completed.
  */
-const TASK_FAILURE_PATTERN = /\b(?:gate\w*|tests?|pytest|cancel\w*|scope[ds]?|implementation\w*|schema)\b/i;
+// `gate(?!way)`: a 502 "Bad Gateway" is the provider being down, not a task gate
+// that failed — without the guard the most common rotation trigger never rotates.
+const TASK_FAILURE_PATTERN = /\b(?:gate(?!way)\w*|tests?|pytest|cancel\w*|scope[ds]?|implementation\w*|schema)\b/i;
 const PROVIDER_STATUS_PATTERN = /\b(?:401|402|403|404|408|429|5\d\d)\b/;
 const PROVIDER_TEXT_PATTERN =
   /\b(?:auth|authenticat\w*|authoriz\w*|authoris\w*|unauthori[sz]ed|forbidden|quota|rate[ -]?limits?|connection|econn\w*|enotfound|dns|timed[ -]?out|timeouts?)\b/i;
@@ -257,6 +259,30 @@ export function fallbackKeyFor(configured: string | undefined, primary: string):
   const key = configured ?? FALLBACK_SUBAGENT_MODEL;
   if (key.toLowerCase() === NO_FALLBACK || key === primary) return undefined;
   return key;
+}
+
+export type PoolStrategy = "fill_first" | "round_robin";
+
+/** The declared provider pool: provider ids in the order they are tried. */
+export interface ProviderPoolSettings {
+  strategy: PoolStrategy;
+  /** At least two distinct provider ids; the first one is the anchored seat. */
+  members: string[];
+}
+
+/**
+ * The pool a routed model belongs to, or `[]` when the pool does not apply.
+ *
+ * A dispatch only enters the pool when its routed provider is the FIRST member:
+ * the route names a seat, and the pool is the rule for what happens when that
+ * seat cannot serve. A model id is never substituted — every candidate is
+ * `member/<same model id>`, so a pool cannot silently change the model.
+ */
+export function poolMembersFor(model: ModelRef, pool: ProviderPoolSettings | false | undefined): string[] {
+  if (pool === undefined || pool === false) return [];
+  if (pool.members.length < 2) return [];
+  if (pool.members[0] !== model.provider) return [];
+  return [...pool.members];
 }
 
 /** Why a fresh dispatch must be refused, or `undefined` when the route is healthy. */

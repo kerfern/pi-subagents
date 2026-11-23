@@ -1605,6 +1605,7 @@ export default function (pi: ExtensionAPI) {
     setMaxSubagentDepth: setMaxSubagentDepth,
     setFallbackSubagent: setFallbackSubagent,
     setFallbackModel: (model) => manager.setFallbackModel(model),
+    setProviderPool: (pool) => manager.setProviderPool(pool),
     setReportUsage,
     setShowCost,
     setShowModel,
@@ -3440,6 +3441,9 @@ Terse command-style prompts produce shallow, generic work.
       // Same rule: unset must round-trip as unset, so the shipped default keeps
       // applying without being frozen into the file.
       fallbackModel: manager.getFallbackModel(),
+      // `false` is the shipped default and must round-trip as `false`, not as
+      // an absent key, so a user who turned the pool off keeps it off.
+      providerPool: manager.getProviderPool(),
       reportUsage: isReportUsageEnabled(),
       // Defaults off: the guard is inert until an operator enables it, so an
       // unset value must round-trip as unset rather than being materialized as
@@ -3555,6 +3559,7 @@ Terse command-style prompts produce shallow, generic work.
     let scope: SettingsScope = defaultSettingsScope(process.cwd());
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
+      const pool = manager.getProviderPool();
       const mcf = manager.getMaxConcurrentForeground();
       const mcn = manager.getMaxConcurrentNested();
       const dmt = getDefaultMaxTurns() ?? 0;
@@ -3644,6 +3649,15 @@ Terse command-style prompts produce shallow, generic work.
           description: `Provider/model retried once when a subagent's own provider fails; "${NO_FALLBACK}" keeps the failure on the routed model. Cycles the reviewed legs — edit subagents.json for any other provider/model`,
           currentValue: configuredLeg,
           values: [...new Set([configuredLeg, NO_FALLBACK, FALLBACK_SUBAGENT_MODEL])],
+        },
+        {
+          id: "providerPool",
+          label: "Provider pool",
+          description:
+            "Seats tried in order when this provider fails (fill_first keeps the declared order; round_robin alternates). "
+            + "Members are hand-written as providerPool.members in subagents.json — the anchored seat is the first one",
+          currentValue: pool === false ? "off" : pool.strategy,
+          values: ["fill_first", "round_robin", "off"],
         },
         {
           id: "disableDefaultAgents",
@@ -3943,6 +3957,22 @@ Terse command-style prompts produce shallow, generic work.
               ? `Provider failures will retry once on ${FALLBACK_SUBAGENT_MODEL}`
               : `Provider failures will retry once on ${typed}`,
         );
+      } else if (id === "providerPool") {
+        const declared = manager.getProviderPool();
+        const members = declared === false ? [] : declared.members;
+        if (value === "off") {
+          manager.setProviderPool(false);
+          notifyApplied(ctx, target, "Provider pool off; failures stay on the routed model unless a retry leg is set");
+        } else if (members.length < 2) {
+          ctx.ui.notify(
+            "Provider pool needs at least two provider ids in subagents.json (providerPool.members) before it can be enabled",
+            "warning",
+          );
+        } else {
+          const strategy = value === "round_robin" ? "round_robin" : "fill_first";
+          manager.setProviderPool({ strategy, members });
+          notifyApplied(ctx, target, `Provider pool on (${strategy}): ${members.join(" → ")}`);
+        }
       } else if (id === "outputTranscript") {
         const enabled = value === "on";
         setOutputTranscriptDefault(enabled);

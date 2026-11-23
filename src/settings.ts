@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import type { ProviderPoolSettings } from "./model-routing.js";
 import type { CodexLimit } from "./quota-guard/adapters.js";
 import type { AgentMentionMode, CacheRetentionSetting, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
@@ -351,6 +352,18 @@ export interface SubagentsSettings {
    */
   fallbackModel?: string;
   /**
+   * Provider seats tried in order when the routed provider fails for a
+   * provider-shaped reason. `false` (the default) keeps the single-provider
+   * behaviour, where only the explicit `fallbackModel` leg can move the work.
+   *
+   * The first member is the anchored seat: only a dispatch routed to it enters
+   * the pool. Each candidate reuses the routed model id under another provider,
+   * so a pool can never change the model, only which credential serves it.
+   * Malformed declarations are turned off rather than half-honoured — a pool
+   * with one usable member would look enabled while doing nothing.
+   */
+  providerPool?: ProviderPoolSettings | false;
+  /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
    *
@@ -484,6 +497,7 @@ export interface SettingsAppliers {
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setFallbackModel: (v: string | undefined) => void;
+  setProviderPool: (v: ProviderPoolSettings | false) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -570,6 +584,7 @@ export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings
   maxSubagentDepth: 2,
   fallbackSubagent: undefined,
   fallbackModel: undefined,
+  providerPool: false,
   reportUsage: false,
   showCost: false,
   showModel: false,
@@ -748,7 +763,31 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackModel === "string" && r.fallbackModel.trim()) {
     out.fallbackModel = r.fallbackModel.trim();
   }
+  if (r.providerPool !== undefined) {
+    out.providerPool = r.providerPool === false ? false : sanitizeProviderPool(r.providerPool);
+  }
   return out;
+}
+
+/**
+ * Validate a declared `providerPool`. `false` disables the pool; a declaration
+ * that cannot be honoured also becomes `false` (never a half-pool), because a
+ * row or status line claiming a pool is active while one member is missing
+ * would misreport where work ran.
+ */
+function sanitizeProviderPool(raw: unknown): ProviderPoolSettings | false {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const { strategy, members } = raw as Record<string, unknown>;
+  if (!Array.isArray(members)) return false;
+  if (!members.every((m) => typeof m === "string" && m.trim().length > 0 && !m.includes("/"))) return false;
+  const resolved: ProviderPoolSettings = {
+    strategy: strategy === "round_robin" ? "round_robin" : "fill_first",
+    // Dedupe only after every member is known-good: silently dropping one bad
+    // entry would leave a pool that claims to be on with fewer seats than the
+    // operator wrote.
+    members: [...new Set(members.map((m) => (m as string).trim()))],
+  };
+  return resolved.members.length >= 2 ? resolved : false;
 }
 
 function globalPath(): string {
@@ -886,6 +925,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (typeof s.fallbackModel === "string") appliers.setFallbackModel(s.fallbackModel);
+  if (s.providerPool !== undefined) appliers.setProviderPool(s.providerPool);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

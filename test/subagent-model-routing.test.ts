@@ -423,3 +423,121 @@ describe("shared routing at startAgent", () => {
     }
   });
 });
+
+describe("provider pool at startAgent", () => {
+  const SEAT1 = { provider: "github-copilot", id: "gpt-6-luna" };
+  const SEAT2 = { provider: "github-copilot-2", id: "gpt-6-luna" };
+  const SEATS = [SEAT1, SEAT2, PRIMARY, { provider: "faux", id: "reviewer-1" }, FALLBACK];
+  const pooled = () => state({ effective: "github-copilot/gpt-6-luna", reviewerEffective: "faux/reviewer-1" });
+
+  it("rotates to the next seat on a provider failure and records both attempts", async () => {
+    vi.mocked(runAgent).mockResolvedValueOnce(providerFail() as RunResult).mockResolvedValueOnce(ok() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(SEAT1);
+    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(SEAT2);
+    expect(record?.providerRoute?.attempts.map((a) => [a.key, a.outcome, a.reason])).toEqual([
+      ["github-copilot/gpt-6-luna", "provider-error", "provider error"],
+      ["github-copilot-2/gpt-6-luna", "success", undefined],
+    ]);
+    expect(record?.providerRoute?.servedModelKey).toBe("github-copilot-2/gpt-6-luna");
+  });
+
+  it("never rotates for a task failure", async () => {
+    vi.mocked(runAgent).mockResolvedValue({ ...providerFail(), failure: "2 tests failed" } as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+    expect(record?.providerRoute?.attempts.map((a) => a.outcome)).toEqual(["task-error"]);
+  });
+
+  it("spends the pool and then the declared retry leg", async () => {
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce(providerFail() as RunResult)
+      .mockResolvedValueOnce(providerFail() as RunResult)
+      .mockResolvedValueOnce(ok() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+    manager.setFallbackModel("commandcode/minimax/minimax-m3.1-flash");
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(runAgent).mock.calls[2][3]!.model).toEqual(FALLBACK);
+    expect(record?.providerRoute?.attempts.map((a) => a.leg)).toEqual(["pool", "pool", "fallback"]);
+    expect(record?.providerRoute?.servedModelKey).toBe("commandcode/minimax/minimax-m3.1-flash");
+  });
+
+  it("does not spend a retry leg that names a pool member", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+    manager.setFallbackModel("github-copilot-2/gpt-6-luna");
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(2);
+    expect(record?.providerRoute?.attempts.map((a) => a.leg)).toEqual(["pool", "pool"]);
+  });
+
+  it("records a member missing from this session's catalog as skipped", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({
+      strategy: "fill_first",
+      members: ["github-copilot", "github-copilot-absent", "github-copilot-2"],
+    });
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    // The missing member is recorded BEFORE the seat that actually served it.
+    expect(record?.providerRoute?.attempts.map((a) => [a.key, a.outcome])).toEqual([
+      ["github-copilot-absent/gpt-6-luna", "skipped"],
+      ["github-copilot/gpt-6-luna", "success"],
+    ]);
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+  });
+
+  it("alternates the starting seat under round_robin, once per dispatch", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "round_robin", members: ["github-copilot", "github-copilot-2"] });
+
+    await spawnAndSettle(manager, {}, SEATS);
+    await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(SEAT1);
+    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(SEAT2);
+  });
+
+  it("does not pool a specialist route outside the anchored seat", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+
+    const record = await spawnAndSettle(manager, { type: "reviewer" }, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual({ provider: "faux", id: "reviewer-1" });
+    expect(record?.providerRoute).toBeUndefined();
+  });
+
+  it("leaves a dispatch exactly as before when the pool is off", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(state(), SEATS));
+    // Without a leg, a provider failure is reported on the routed model.
+    manager.setFallbackModel(NO_FALLBACK);
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+    expect(record?.providerRoute).toBeUndefined();
+  });
+});
