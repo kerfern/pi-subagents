@@ -36,6 +36,10 @@ export interface WriterRun {
 
 export type GitFn = (args: string[], cwd: string) => Promise<string>;
 
+export interface ExecOpts {
+  signal?: AbortSignal;
+}
+
 export interface TeamDeps {
   /** Repo root the team runs against (the operator's checkout; never written). */
   cwd: string;
@@ -44,7 +48,9 @@ export interface TeamDeps {
   /** Run git in cwd; resolve trimmed stdout, reject on non-zero exit. */
   git?: GitFn;
   /** Run the gate argv in cwd. */
-  exec?: (argv: string[], cwd: string) => Promise<{ code: number; output: string }>;
+  exec?: (argv: string[], cwd: string, opts?: ExecOpts) => Promise<{ code: number; output: string }>;
+  /** Cancels the run between phases; nothing is merged after it fires. */
+  signal?: AbortSignal;
 }
 
 export type TeamResult =
@@ -53,6 +59,18 @@ export type TeamResult =
 
 const MAX_WRITERS = 6;
 const MIN_WRITERS = 2;
+
+/**
+ * Harness-managed metadata, never a writer's product. Serena writes `.serena/`
+ * into a worktree when a child activates the project, and the child's
+ * harness-managed commit picks it up; without this exclusion every real team
+ * would refuse as "unclaimed change" and merge tool config into the repository.
+ */
+const TOOL_METADATA_PREFIXES = [".serena/"];
+
+function isToolMetadata(path: string): boolean {
+  return TOOL_METADATA_PREFIXES.some((prefix) => path === prefix.slice(0, -1) || path.startsWith(prefix));
+}
 
 /* ---------------------------- manifest + claims --------------------------- */
 
@@ -209,13 +227,20 @@ function segsCompatible(x: string, y: string): boolean {
 export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResult> {
   const git = deps.git ?? defaultGit;
   const exec = deps.exec ?? defaultExec;
+  const aborted = (phase: string): TeamResult | undefined =>
+    deps.signal?.aborted ? fail("aborted", `team run aborted before ${phase}`) : undefined;
 
+  const pre = aborted("dispatch");
+  if (pre) return pre;
   const runs = await Promise.all(plan.writers.map((w) => deps.dispatch(w).catch((err: unknown): WriterRun => ({
     status: "error",
     error: err instanceof Error ? err.message : String(err),
   }))));
 
   // Verify every settled writer before any merge.
+  const shas: string[] = [];
+  const pre2 = aborted("claim check");
+  if (pre2) return pre2;
   for (let i = 0; i < plan.writers.length; i++) {
     const writer = plan.writers[i]!;
     const run = runs[i]!;
@@ -225,20 +250,30 @@ export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResul
     if (!run.branch || !run.baseSha) {
       return fail("writer-no-changes", `writer "${writer.name}" changed nothing (no branch produced)`);
     }
+    if (!run.worktreePath) {
+      return fail("no-worktree", `writer "${writer.name}" has no isolated worktree; refusing to merge its branch`);
+    }
     let changed: string[];
     try {
-      changed = (await git(["diff", "--name-only", `${run.baseSha}..${run.branch}`], deps.cwd))
-        .split("\n").map((s) => s.trim()).filter(Boolean);
+      changed = (await git(["diff", "--name-only", "--no-renames", "-z", `${run.baseSha}..${run.branch}`], deps.cwd))
+        .split("\0").map((s) => s.trim()).filter(Boolean);
     } catch (err) {
       return fail("diff-failed", `writer "${writer.name}": ${(err as Error).message}`);
     }
-    if (changed.length === 0) {
+    const owned = changed.filter((path) => !isToolMetadata(path));
+    if (owned.length === 0) {
       return fail("writer-no-changes", `writer "${writer.name}" changed nothing`);
     }
-    const outside = changed.filter((p) => !writer.files.some((g) => globMatchesPath(g, p)));
+    const outside = owned.filter((p) => !writer.files.some((g) => globMatchesPath(g, p)));
     if (outside.length > 0) {
       return fail("unclaimed-change",
         `writer "${writer.name}" changed path(s) outside its claims: ${outside.join(", ")}`);
+    }
+    // Pin the verified commit: a branch moving after this point cannot change what is merged.
+    try {
+      shas.push(await git(["rev-parse", `${run.branch}^{commit}`], deps.cwd));
+    } catch (err) {
+      return fail("diff-failed", `writer "${writer.name}" branch "${run.branch}" did not resolve: ${(err as Error).message}`);
     }
   }
 
@@ -248,6 +283,8 @@ export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResul
     return fail("base-mismatch", "writers were created from different base SHAs");
   }
 
+  const pre3 = aborted("integration");
+  if (pre3) return pre3;
   // Serial integration into a fresh worktree at the shared base SHA.
   const integBranch = `pi-team-${Date.now().toString(36)}`;
   const integDir = mkdtempSync(join(tmpdir(), "pi-team-"));
@@ -260,9 +297,15 @@ export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResul
 
   const merged: string[] = [];
   try {
-    for (const { writer, run } of settled) {
+    for (let i = 0; i < settled.length; i++) {
+      const { writer, run } = settled[i]!;
+      const sha = shas[i]!;
+      if (deps.signal?.aborted) {
+        return await abandon(git, deps.cwd, integDir, integBranch,
+          fail("aborted", `team run aborted before merge of "${writer.name}"`));
+      }
       try {
-        await git(["merge", "--squash", run.branch!], integDir);
+        await git(["merge", "--squash", sha], integDir);
       } catch (err) {
         const conflicts = await listConflicts(git, integDir);
         await git(["merge", "--abort"], integDir).catch(() => undefined);
@@ -272,7 +315,11 @@ export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResul
           fail("merge-conflict",
             `writer "${writer.name}" conflicts in ${conflicts.length ? conflicts.join(", ") : "(unknown paths)"}: ${(err as Error).message}`));
       }
-      const author = await authorOf(git, deps.cwd, run.branch!);
+      // Squash-merge stages the branch's metadata too; unstage and remove it so
+      // the integration commit contains only claimed work.
+      await git(["reset", "--quiet", "HEAD", "--", ".serena"], integDir).catch(() => undefined);
+      await git(["clean", "-fdq", ".serena"], integDir).catch(() => undefined);
+      const author = await authorOf(git, deps.cwd, sha);
       try {
         await git(["commit", "--no-verify", "-m", `team(${writer.name}): merge ${run.branch}`, "--author", author], integDir);
         merged.push(writer.name);
@@ -286,7 +333,11 @@ export async function runTeam(deps: TeamDeps, plan: TeamPlan): Promise<TeamResul
       }
     }
 
-    const gateRes = await exec(plan.gate, integDir);
+    if (deps.signal?.aborted) {
+      return await abandon(git, deps.cwd, integDir, integBranch,
+        fail("aborted", "team run aborted before gate"));
+    }
+    const gateRes = await exec(plan.gate, integDir, { signal: deps.signal });
     if (gateRes.code !== 0) {
       const tail = gateRes.output.split("\n").slice(-30).join("\n");
       // Keep the integration branch for inspection; remove only a clean worktree.
@@ -343,10 +394,10 @@ function defaultGit(args: string[], cwd: string): Promise<string> {
   });
 }
 
-function defaultExec(argv: string[], cwd: string): Promise<{ code: number; output: string }> {
+function defaultExec(argv: string[], cwd: string, opts?: ExecOpts): Promise<{ code: number; output: string }> {
   const [cmd, ...rest] = argv;
   return new Promise((resolve) => {
-    execFile(cmd!, rest, { cwd, maxBuffer: 16 * 1024 * 1024, timeout: 600_000 }, (err, stdout, stderr) => {
+    execFile(cmd!, rest, { cwd, maxBuffer: 16 * 1024 * 1024, timeout: 600_000, signal: opts?.signal }, (err, stdout, stderr) => {
       const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
       resolve({ code, output: `${stdout}${stderr}` });
     });

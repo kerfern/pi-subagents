@@ -2,7 +2,7 @@
  * team-tool.test.ts — the model-callable `Team` adapter: it must refuse before
  * confirming anything unsafe, and dispatch nothing without an explicit approval.
  */
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,8 +17,8 @@ vi.mock("../src/team-writers.js", async () => {
 });
 
 import subagentsExtension from "../src/index.js";
-import { isWorktreeIsolationEnabled } from "../src/worktree.js";
 import { runTeam } from "../src/team-writers.js";
+import { isWorktreeIsolationEnabled } from "../src/worktree.js";
 
 function makePi() {
   const tools = new Map<string, any>();

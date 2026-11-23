@@ -50,7 +50,7 @@ function fakeWriter(repo: string, base: string, edits: Record<string, string>, s
     git(wt, "add", "-A");
     git(wt, "commit", "-qm", `${w.name} work`);
     git(repo, "worktree", "remove", "--force", wt);
-    return { status, branch, baseSha: base };
+    return { status, branch, baseSha: base, worktreePath: wt };
   };
 }
 
@@ -154,5 +154,176 @@ describe("runTeam (real git)", () => {
       (await fakeWriter(repo, base, { "src/api/n.txt": "x\n" }, w.name === "api" ? "error" : "completed")(w));
     const res = await runTeam({ cwd: repo, dispatch }, plan([["src/api/**"], ["src/web/**"]]));
     expect(res).toMatchObject({ ok: false, reason: "writer-not-done" });
+  });
+});
+
+describe("runTeam hardening (injected git)", () => {
+  const twoWriters = (): TeamPlan => ({
+    gate: ["gate"],
+    writers: [
+      { name: "api", agent: "implementer", prompt: "p", files: ["src/api/**"] },
+      { name: "web", agent: "implementer", prompt: "p", files: ["src/web/**"] },
+    ],
+  });
+  const okRun = (name: string, extra: Partial<WriterRun> = {}): WriterRun => ({
+    status: "completed",
+    branch: `pi-agent-${name}`,
+    baseSha: "BASE",
+    worktreePath: `/wt/${name}`,
+    ...extra,
+  });
+  /** Fake git: records argv; diff returns per-branch NUL-joined paths; rev-parse resolves a branch. */
+  function fakeGit(opts: { diff?: Record<string, string>; resolved?: Record<string, string> } = {}) {
+    const calls: { args: string[]; cwd: string }[] = [];
+    const git = async (args: string[], cwd: string): Promise<string> => {
+      calls.push({ args, cwd });
+      if (args[0] === "diff" && args.includes("--name-only") && !args.includes("--diff-filter=U")) {
+        const range = args[args.length - 1]!;
+        const branch = range.split("..")[1]!;
+        return opts.diff?.[branch] ?? (branch === "pi-agent-web" ? "src/web/ok.ts" : "src/api/ok.ts");
+      }
+      if (args[0] === "rev-parse" && args[1]?.endsWith("^{commit}")) {
+        const branch = args[1].replace("^{commit}", "");
+        return opts.resolved?.[branch] ?? `SHA-${branch}`;
+      }
+      if (args[0] === "merge" && args[1] === "--squash") return "";
+      if (args[0] === "rev-parse") return "HEAD-SHA";
+      if (args[0] === "status") return "";
+      if (args[0] === "log") return "Dev <d@x>";
+      return "";
+    };
+    return { git, calls };
+  }
+
+  it("diff uses --no-renames -z and treats NUL-separated paths individually", async () => {
+    const { git, calls } = fakeGit({ diff: { "pi-agent-api": "src/api/a.ts\0README.md" } });
+    const res = await runTeam({ cwd: "/repo", dispatch: async (w) => okRun(w.name), git, exec: async () => ({ code: 0, output: "" }) }, twoWriters());
+    const diffCall = calls.find((c) => c.args[0] === "diff" && c.args.includes("-z"))!;
+    expect(diffCall.args).toEqual(["diff", "--name-only", "--no-renames", "-z", "BASE..pi-agent-api"]);
+    expect(res).toMatchObject({ ok: false, reason: "unclaimed-change" });
+    if (res.ok) return;
+    expect(res.detail).toContain("README.md");
+    expect(res.detail).not.toContain("src/api/a.ts\0");
+  });
+
+  it("merges the resolved commit sha, not the movable branch name", async () => {
+    const { git, calls } = fakeGit({ resolved: { "pi-agent-api": "SHA-API", "pi-agent-web": "SHA-WEB" } });
+    const res = await runTeam({
+      cwd: "/repo",
+      dispatch: async (w) => okRun(w.name, { ...(w.name === "web" ? { branch: "pi-agent-web" } : {}) }),
+      git,
+      exec: async () => ({ code: 0, output: "" }),
+    }, { ...twoWriters(), writers: [
+      { name: "api", agent: "implementer", prompt: "p", files: ["src/api/**"] },
+      { name: "web", agent: "implementer", prompt: "p", files: ["src/web/**"] },
+    ] });
+    expect(res).toMatchObject({ ok: true, merged: ["api", "web"] });
+    const merges = calls.filter((c) => c.args[0] === "merge" && c.args[1] === "--squash").map((c) => c.args[2]);
+    expect(merges).toEqual(["SHA-API", "SHA-WEB"]);
+    expect(calls.some((c) => c.args[0] === "merge" && c.args.includes("pi-agent-api"))).toBe(false);
+    expect(calls.some((c) => c.args[0] === "rev-parse" && c.args[1] === "pi-agent-api^{commit}")).toBe(true);
+  });
+
+  it("ignores tool metadata in claims and keeps it out of the merge commit", async () => {
+    const { git, calls } = fakeGit({ diff: { "pi-agent-api": ".serena/project.yml\0src/api/ok.ts" } });
+    const res = await runTeam({
+      cwd: "/repo",
+      dispatch: async (w) => okRun(w.name),
+      git,
+      exec: async () => ({ code: 0, output: "" }),
+    }, twoWriters());
+    expect(res).toMatchObject({ ok: true });
+    const reset = calls.find((c) => c.args[0] === "reset" && c.args.includes(".serena"));
+    const clean = calls.find((c) => c.args[0] === "clean" && c.args.includes(".serena"));
+    expect(reset?.args).toEqual(["reset", "--quiet", "HEAD", "--", ".serena"]);
+    expect(clean?.args).toEqual(["clean", "-fdq", ".serena"]);
+  });
+
+  it("refuses a writer whose only change is tool metadata", async () => {
+    const { git } = fakeGit({ diff: { "pi-agent-api": ".serena/project.yml", "pi-agent-web": "src/web/ok.ts" } });
+    const res = await runTeam({
+      cwd: "/repo",
+      dispatch: async (w) => okRun(w.name),
+      git,
+      exec: async () => ({ code: 0, output: "" }),
+    }, twoWriters());
+    expect(res).toMatchObject({ ok: false, reason: "writer-no-changes" });
+  });
+
+  it("refuses a writer without a worktree before any merge", async () => {
+    const { git, calls } = fakeGit();
+    const res = await runTeam({
+      cwd: "/repo",
+      dispatch: async (w) => (w.name === "web" ? okRun(w.name, { worktreePath: undefined }) : okRun(w.name)),
+      git,
+      exec: async () => ({ code: 0, output: "" }),
+    }, twoWriters());
+    expect(res).toMatchObject({ ok: false, reason: "no-worktree" });
+    if (res.ok) return;
+    expect(res.detail).toContain('"web"');
+    expect(calls.some((c) => c.args[0] === "merge")).toBe(false);
+  });
+
+  it("aborted before dispatch: no dispatch, no git", async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    let dispatched = 0;
+    const { git, calls } = fakeGit();
+    const res = await runTeam({ cwd: "/repo", signal: ctrl.signal, dispatch: async (w) => { dispatched++; return okRun(w.name); }, git, exec: async () => ({ code: 0, output: "" }) }, twoWriters());
+    expect(res).toEqual({ ok: false, reason: "aborted", detail: "team run aborted before dispatch" });
+    expect(dispatched).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("aborted after writers settle: nothing merged and gate not run", async () => {
+    const ctrl = new AbortController();
+    const { git, calls } = fakeGit();
+    let gateCalled = false;
+    const res = await runTeam({
+      cwd: "/repo",
+      signal: ctrl.signal,
+      dispatch: async (w) => { ctrl.abort(); return okRun(w.name); },
+      git,
+      exec: async () => { gateCalled = true; return { code: 0, output: "" }; },
+    }, twoWriters());
+    expect(res).toMatchObject({ ok: false, reason: "aborted" });
+    expect(calls.some((c) => c.args[0] === "merge")).toBe(false);
+    expect(gateCalled).toBe(false);
+  });
+
+  it("aborted before the gate: gate not called, integration worktree removed", async () => {
+    const ctrl = new AbortController();
+    const { git, calls } = fakeGit();
+    let gateCalled = false;
+    const res = await runTeam({
+      cwd: "/repo",
+      signal: ctrl.signal,
+      dispatch: async (w) => okRun(w.name),
+      git: async (args, cwd) => {
+        const out = await git(args, cwd);
+        // Abort on the last writer's merge-commit so only the pre-gate check can fire.
+        if (args[0] === "commit" && args.some((a) => a.startsWith("team(web)"))) ctrl.abort();
+        return out;
+      },
+      exec: async () => { gateCalled = true; return { code: 0, output: "" }; },
+    }, twoWriters());
+    expect(res).toMatchObject({ ok: false, reason: "aborted", detail: "team run aborted before gate" });
+    expect(gateCalled).toBe(false);
+    expect(calls.some((c) => c.args[0] === "merge")).toBe(true);
+    expect(calls.some((c) => c.args[0] === "worktree" && c.args[1] === "remove")).toBe(true);
+  });
+
+  it("passes the signal to the gate executor", async () => {
+    const ctrl = new AbortController();
+    const { git } = fakeGit();
+    let seen: AbortSignal | undefined;
+    await runTeam({
+      cwd: "/repo",
+      signal: ctrl.signal,
+      dispatch: async (w) => okRun(w.name),
+      git,
+      exec: async (_argv, _cwd, opts) => { seen = opts?.signal; return { code: 0, output: "" }; },
+    }, twoWriters());
+    expect(seen).toBe(ctrl.signal);
   });
 });

@@ -4546,7 +4546,11 @@ Terse command-style prompts produce shallow, generic work.
    * One manifest, one dispatcher: the `/agents-team` command and the `Team` tool
    * differ only in how the plan is approved before a writer is spawned.
    */
-  const dispatchTeam = async (plan: TeamPlan, ctx: ExtensionCommandContext | ExtensionContext): Promise<TeamResult> => {
+  const dispatchTeam = async (
+    plan: TeamPlan,
+    ctx: ExtensionCommandContext | ExtensionContext,
+    signal?: AbortSignal,
+  ): Promise<TeamResult> => {
     const dispatch = async (writer: TeamWriter): Promise<WriterRun> => {
       const resolved = resolveSpawnType(writer.agent);
       if (!resolved.ok) return { status: "error", error: resolved.message };
@@ -4566,8 +4570,34 @@ Terse command-style prompts produce shallow, generic work.
         error: rec?.error,
       };
     };
-    return runTeam({ cwd: ctx.cwd, dispatch }, plan);
+    return runTeam({ cwd: ctx.cwd, dispatch, signal }, plan);
   };
+
+  /** Resolve a manifest path and refuse anything that is not a real file inside the project. */
+  const resolveTeamManifest = (manifestPath: string, cwd: string): { ok: true; path: string } | { ok: false; message: string } => {
+    try {
+      const root = realpathSync(cwd);
+      const resolved = realpathSync(resolvePath(root, manifestPath));
+      if (resolved !== root && !resolved.startsWith(root + sep)) {
+        return { ok: false, message: "the manifest path resolves outside the project directory" };
+      }
+      return { ok: true, path: resolved };
+    } catch (err) {
+      return { ok: false, message: (err as Error).message };
+    }
+  };
+
+  /**
+   * One approval text for both entry points: the gate runs host commands on
+   * writer-edited code, so the operator sees the exact argv and claims.
+   */
+  const approveTeam = async (plan: TeamPlan, ctx: ExtensionCommandContext | ExtensionContext): Promise<boolean> =>
+    ctx.ui.confirm(
+      "Run this team?",
+      `${plan.writers.length} writers, gate: ${plan.gate.join(" ")}\n` +
+        plan.writers.map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`).join("\n") +
+        "\n\nWriters run in isolated worktrees; the gate runs on the merged result in a throwaway tree.",
+    );
 
   /**
    * `Team` — the model-callable path. It never dispatches without an explicit
@@ -4601,32 +4631,22 @@ Terse command-style prompts produce shallow, generic work.
       const text = result.content[0]?.type === "text" ? result.content[0].text : "";
       return new Text(text, 0, 0);
     },
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (!isWorktreeIsolationEnabled()) {
         return textResult("team refused: worktree isolation is disabled in this session, so writers cannot be contained.");
       }
-      let resolvedPath: string;
+      const resolved = resolveTeamManifest(params.manifestPath, ctx.cwd);
+      if (!resolved.ok) return textResult(`team refused: ${resolved.message}`);
       let plan: TeamPlan;
       try {
-        const root = realpathSync(ctx.cwd);
-        resolvedPath = realpathSync(resolvePath(root, params.manifestPath));
-        if (resolvedPath !== root && !resolvedPath.startsWith(root + sep)) {
-          return textResult("team refused: the manifest path resolves outside the project directory.");
-        }
-        plan = parseTeamManifest(readFileSync(resolvedPath, "utf8"));
+        plan = parseTeamManifest(readFileSync(resolved.path, "utf8"));
       } catch (err) {
         return textResult(`team refused: ${(err as Error).message}`);
       }
-      const gateLine = plan.gate.join(" ");
-      const summary = plan.writers
-        .map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`)
-        .join("\n");
-      const approved = await ctx.ui.confirm(
-        "Run this team?",
-        `${plan.writers.length} writers, gate: ${gateLine}\n${summary}\n\nWriters run in isolated worktrees; the gate runs on the merged result in a throwaway tree.`,
-      );
-      if (!approved) return textResult("team refused: the operator did not approve this plan.");
-      const result = await dispatchTeam(plan, ctx);
+      if (!(await approveTeam(plan, ctx))) {
+        return textResult("team refused: the operator did not approve this plan.");
+      }
+      const result = await dispatchTeam(plan, ctx, signal);
       if (result.ok) {
         return {
           content: [{
@@ -4651,18 +4671,22 @@ Terse command-style prompts produce shallow, generic work.
         ctx.ui.notify("Usage: /agents-team <manifestPath>", "warning");
         return;
       }
+      const resolved = resolveTeamManifest(manifestArg, ctx.cwd);
+      if (!resolved.ok) {
+        ctx.ui.notify(`agents-team refused: ${resolved.message}`, "error");
+        return;
+      }
       let plan: TeamPlan;
       try {
-        plan = parseTeamManifest(readFileSync(resolvePath(ctx.cwd, manifestArg), "utf8"));
+        plan = parseTeamManifest(readFileSync(resolved.path, "utf8"));
       } catch (err) {
         ctx.ui.notify(`agents-team refused: ${(err as Error).message}`, "error");
         return;
       }
-      ctx.ui.notify(
-        `agents-team: ${plan.writers.length} writers, gate [${plan.gate.join(" ")}]\n` +
-          plan.writers.map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`).join("\n"),
-        "info",
-      );
+      if (!(await approveTeam(plan, ctx))) {
+        ctx.ui.notify("agents-team refused: the plan was not approved.", "warning");
+        return;
+      }
       const result = await dispatchTeam(plan, ctx);
       if (result.ok) {
         ctx.ui.notify(`agents-team ok: branch ${result.branch} commit ${result.commit} merged [${result.merged.join(", ")}]`, "info");

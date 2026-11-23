@@ -631,6 +631,10 @@ is partially merged. Your checkout is never written, merged into or reset, and n
 is pushed. The result carries the integration branch and commit; inspect them and the
 gate evidence before proposing integration.
 
+Harness-managed metadata under `.serena/` is ignored when checking claims and stripped
+from the integration commit, because Serena writes it into every worktree whose child
+activates the project; a writer whose only change is metadata counts as no change.
+
 **Not a sandbox:** a writer's `bash` can still touch anything the operator can. Claims
 bound what may be merged, not what a process may attempt.
 
