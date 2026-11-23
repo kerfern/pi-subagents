@@ -364,6 +364,13 @@ export interface SubagentsSettings {
    */
   providerPool?: ProviderPoolSettings | false;
   /**
+   * Bounds on what one team (a top-level owner plus its nested and workflow
+   * children) may spend. `false` (default) is unbounded. Malformed values make
+   * load refuse with a named {@link TeamPolicyError} rather than silently
+   * disabling the policy. Team totals live in memory and reset on restart.
+   */
+  teamPolicy?: TeamPolicy | false;
+  /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
    *
@@ -465,6 +472,24 @@ export interface SubagentsSettings {
 export type ToolDescriptionMode = "full" | "compact" | "custom";
 export type WorkflowToolExposureMode = "skill" | "inline" | "deferred";
 
+export interface TeamPolicy {
+  maxDispatchMs?: number;
+  maxTeamTokens?: number;
+  maxTeamMs?: number;
+  /** Cross-leg retries per team root, shared by pool rotation and the declared leg. 0–3. */
+  retries: number;
+  /** Base of the exponential backoff before an alternate leg, 0–5000 ms. */
+  retryBaseMs: number;
+}
+
+/** Thrown when a declared `teamPolicy` cannot be honoured. Names the offending key. */
+export class TeamPolicyError extends Error {
+  constructor(message: string) {
+    super(`[pi-subagents] Invalid teamPolicy: ${message}`);
+    this.name = "TeamPolicyError";
+  }
+}
+
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
@@ -498,6 +523,7 @@ export interface SettingsAppliers {
   setFallbackSubagent: (v: string | undefined) => void;
   setFallbackModel: (v: string | undefined) => void;
   setProviderPool: (v: ProviderPoolSettings | false) => void;
+  setTeamPolicy: (v: TeamPolicy | false) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -585,6 +611,7 @@ export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings
   fallbackSubagent: undefined,
   fallbackModel: undefined,
   providerPool: false,
+  teamPolicy: false,
   reportUsage: false,
   showCost: false,
   showModel: false,
@@ -766,7 +793,41 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (r.providerPool !== undefined) {
     out.providerPool = r.providerPool === false ? false : sanitizeProviderPool(r.providerPool);
   }
+  if (r.teamPolicy !== undefined) out.teamPolicy = sanitizeTeamPolicy(r.teamPolicy);
   return out;
+}
+
+/**
+ * Validate a declared `teamPolicy`. Unlike `providerPool`, a malformed value is
+ * NOT silently turned off: a budget the operator believes is active but is not
+ * is worse than a refused load, so this throws {@link TeamPolicyError}.
+ */
+function sanitizeTeamPolicy(raw: unknown): TeamPolicy | false {
+  if (raw === false) return false;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TeamPolicyError("expected false or an object");
+  }
+  const r = raw as Record<string, unknown>;
+  const out: Partial<TeamPolicy> = {};
+  for (const key of ["maxDispatchMs", "maxTeamTokens", "maxTeamMs"] as const) {
+    const v = r[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new TeamPolicyError(`${key} must be a non-negative finite number`);
+    }
+    out[key] = v;
+  }
+  const retries = r.retries;
+  if (!Number.isInteger(retries) || (retries as number) < 0 || (retries as number) > 3) {
+    throw new TeamPolicyError("retries must be an integer 0–3");
+  }
+  out.retries = retries as number;
+  const base = r.retryBaseMs;
+  if (typeof base !== "number" || !Number.isFinite(base) || base < 0 || base > 5000) {
+    throw new TeamPolicyError("retryBaseMs must be a number 0–5000");
+  }
+  out.retryBaseMs = base;
+  return out as TeamPolicy;
 }
 
 /**
@@ -809,6 +870,9 @@ function readSettingsFile(path: string, onReadFailure?: (reason: string) => void
   try {
     return sanitize(JSON.parse(readFileSync(path, "utf-8")));
   } catch (err) {
+    // A malformed teamPolicy is refused, not silently dropped: it is a budget
+    // the operator declared, and ignoring it would run the team unbounded.
+    if (err instanceof TeamPolicyError) throw err;
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
     onReadFailure?.(reason);
@@ -927,6 +991,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (typeof s.fallbackModel === "string") appliers.setFallbackModel(s.fallbackModel);
   if (s.providerPool !== undefined) appliers.setProviderPool(s.providerPool);
+  if (s.teamPolicy !== undefined) appliers.setTeamPolicy(s.teamPolicy);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

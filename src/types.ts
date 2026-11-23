@@ -329,6 +329,10 @@ export interface AgentRecord {
   requestedThinking?: EffectiveThinkingLevel;
   /** Number of primary/fallback provider attempts started for this run. */
   providerAttempts?: number;
+  /** Wall-clock cap timer armed by `teamPolicy.maxDispatchMs`; cleared at settle. */
+  dispatchTimer?: ReturnType<typeof setTimeout>;
+  /** Set when the run reported no usage, so its spend is unknown rather than zero. */
+  usageUnknown?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
   /** Nesting depth: top-level subagent = 1. */

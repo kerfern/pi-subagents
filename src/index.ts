@@ -8,11 +8,12 @@
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
+ *   /agents-team <file>     — Run a parallel writer team (see team-writers.ts)
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, isKeyRelease, matchesKey, type ScrollViewScrollbar, type SelectItem, SelectList, type SettingItem, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -71,11 +72,13 @@ import {
   settingSources,
   settingsFilePath,
   snapshotQuotaGuardSettings,
+  type TeamPolicy,
   type ToolDescriptionMode,
   type WorkflowToolExposureMode,
 } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { toSubagentInfo } from "./subagent-info.js";
+import { parseTeamManifest, runTeam, type TeamPlan, type TeamWriter, type WriterRun } from "./team-writers.js";
 import { type AgentInvocation, type AgentMentionMode, type AgentRecord, type CacheRetentionSetting, type JoinMode, type NotificationDetails, type SubagentType, THINKING_LEVELS, type ThinkingLevel, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -300,6 +303,18 @@ export const WORKFLOW_FILE_FLAG = "subagents-workflow-file";
  * {@link WORKFLOW_ENTRY_TYPE} imports it from here.
  */
 export { FOREIGN_WORKFLOW_TOOL_NAMES, WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData };
+
+
+/** Summary for the read-only `teamPolicy` row: `off`, or the declared caps. */
+function describeTeamPolicy(policy: TeamPolicy | false, used: { tokens: number; ms: number }): string {
+  const spent = `${Math.round(used.tokens / 100) / 10}k tok, ${Math.round(used.ms / 1000)}s this session`;
+  if (policy === false) return `off · ${spent}`;
+  const caps: string[] = [];
+  if (policy.maxTeamTokens !== undefined) caps.push(`tokens≤${policy.maxTeamTokens}`);
+  if (policy.maxTeamMs !== undefined) caps.push(`ms≤${policy.maxTeamMs}`);
+  caps.push(`retries=${policy.retries}`);
+  return `${caps.join(", ")} · ${spent}`;
+}
 
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
@@ -577,11 +592,12 @@ export default function (pi: ExtensionAPI) {
     // nested, or a workflow's — report to the model through their owner: the
     // parent's scoped tools, or the workflow's card, notification and dialog.
     // Keep them out of the transcript, notification, and UI channels.
-    if (!isTopLevelAgent(record)) return;
-
-    // Persist the final record: get_subagent_result answers from it once the
-    // live record is gone, and other extensions reconstruct history from it.
+    // Persist the final record for EVERY dispatch, owned children included: the
+    // providerRoute of a nested or workflow child is otherwise lost on restart.
+    // get_subagent_result answers from it once the live record is gone.
     pi.appendEntry<AgentRecordEntryData>(AGENT_RECORD_ENTRY_TYPE, agentRecordEntryData(record));
+
+    if (!isTopLevelAgent(record)) return;
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -1606,6 +1622,7 @@ export default function (pi: ExtensionAPI) {
     setFallbackSubagent: setFallbackSubagent,
     setFallbackModel: (model) => manager.setFallbackModel(model),
     setProviderPool: (pool) => manager.setProviderPool(pool),
+    setTeamPolicy: (policy) => manager.setTeamPolicy(policy),
     setReportUsage,
     setShowCost,
     setShowModel,
@@ -3444,6 +3461,8 @@ Terse command-style prompts produce shallow, generic work.
       // `false` is the shipped default and must round-trip as `false`, not as
       // an absent key, so a user who turned the pool off keeps it off.
       providerPool: manager.getProviderPool(),
+      // Off by default; the policy is file-only, so it round-trips as declared.
+      teamPolicy: manager.getTeamPolicy(),
       reportUsage: isReportUsageEnabled(),
       // Defaults off: the guard is inert until an operator enables it, so an
       // unset value must round-trip as unset rather than being materialized as
@@ -3820,6 +3839,14 @@ Terse command-style prompts produce shallow, generic work.
             "Add subagent tokens and cost to this session's own totals, so pi's footer and /cost stop reading a delegating session as nearly free. Reported on the next tool result (agents that finish in the background are counted on the one after). Context-window % is unaffected.",
           currentValue: isReportUsageEnabled() ? "on" : "off",
           values: ["on", "off"],
+        },
+        {
+          id: "teamPolicy",
+          label: "Team budget",
+          description:
+            "Read-only: the caps in force and what this session's teams have been charged. Edit teamPolicy in subagents.json (file-only)",
+          currentValue: describeTeamPolicy(manager.getTeamPolicy(), manager.getTeamUsage()),
+          values: [],
         },
       ];
     }
@@ -4514,5 +4541,52 @@ Terse command-style prompts produce shallow, generic work.
   pi.registerCommand("agents", {
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+  });
+  pi.registerCommand("agents-team", {
+    description: "Run a parallel writer team from a manifest: /agents-team <manifestPath>",
+    handler: async (args, ctx) => {
+      const manifestArg = args.trim();
+      if (!manifestArg) {
+        ctx.ui.notify("Usage: /agents-team <manifestPath>", "warning");
+        return;
+      }
+      let plan: TeamPlan;
+      try {
+        plan = parseTeamManifest(readFileSync(resolvePath(ctx.cwd, manifestArg), "utf8"));
+      } catch (err) {
+        ctx.ui.notify(`agents-team refused: ${(err as Error).message}`, "error");
+        return;
+      }
+      ctx.ui.notify(
+        `agents-team: ${plan.writers.length} writers, gate [${plan.gate.join(" ")}]\n` +
+          plan.writers.map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`).join("\n"),
+        "info",
+      );
+      const dispatch = async (writer: TeamWriter): Promise<WriterRun> => {
+        const resolved = resolveSpawnType(writer.agent);
+        if (!resolved.ok) return { status: "error", error: resolved.message };
+        const id = manager.spawn(pi, ctx, resolved.type, writer.prompt, {
+          description: `team: ${writer.name}`,
+          isolation: "worktree",
+          isBackground: true,
+          cwd: ctx.cwd,
+        });
+        await manager.waitForSettled(id, 60 * 60 * 1000);
+        const rec = manager.getRecord(id);
+        return {
+          status: rec?.status ?? "missing",
+          branch: rec?.worktreeResult?.branch,
+          baseSha: rec?.worktree?.baseSha,
+          worktreePath: rec?.worktree?.path,
+          error: rec?.error,
+        };
+      };
+      const result = await runTeam({ cwd: ctx.cwd, dispatch }, plan);
+      if (result.ok) {
+        ctx.ui.notify(`agents-team ok: branch ${result.branch} commit ${result.commit} merged [${result.merged.join(", ")}]`, "info");
+      } else {
+        ctx.ui.notify(`agents-team refused (${result.reason}): ${result.detail}`, "error");
+      }
+    },
   });
 }

@@ -990,6 +990,8 @@ Every project now starts with concurrency 16 and grace 10, without ever touching
 
 **Failure behavior:** missing file is silent; malformed JSON logs a `[pi-subagents] Ignoring malformed settings at …` warning to stderr; invalid/out-of-range field values are dropped per-field; a successful save's `/agents` toast ends with `(saved to global settings)` or `(saved to project settings)`; write failures — including a target file that is malformed or not a JSON object, which is left untouched — downgrade it to a warning with `(session only; failed to persist)`.
 
+`teamPolicy` (file-only, see `subagents.json`): caps a session's team spend. Totals reset on restart and whenever `teamPolicy` is re-declared in the file. If a launched run reports no usage, a declared token cap refuses further team dispatch until the operator reviews the spend and re-declares the policy.
+
 ## Events
 
 Agent lifecycle events are emitted via `pi.events.emit()` so other extensions can react:

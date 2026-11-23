@@ -42,6 +42,7 @@ import {
   type SubagentRoutingState,
   thinkingForSubagent,
 } from "./model-routing.js";
+import type { TeamPolicy } from "./settings.js";
 import type {
   AgentInvocation,
   AgentRecord,
@@ -484,6 +485,9 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
   try { session?.dispose?.(); } catch { /* ignore */ }
 }
 
+/** A team-budget refusal: the dispatch never starts; the record keeps the reason. */
+export class TeamRefusal extends Error {}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -497,6 +501,17 @@ export class AgentManager {
   private maxConcurrentNested = DEFAULT_MAX_CONCURRENT_NESTED;
   /** `fallbackModel` setting; undefined keeps the historical retry leg. */
   private fallbackModel: string | undefined;
+  /**
+   * `teamPolicy` setting; `false` is unbounded. Totals below are per team root
+   * and live in memory only — they reset on restart (documented).
+   */
+  private teamPolicy: TeamPolicy | false = false;
+  /** Settled tokens and wall ms per team root (top-level id, or `wf:<workflowId>`). */
+  private teamUsage = new Map<string, { tokens: number; ms: number }>();
+  /** Team roots that settled a run with no usage reported; blocks further dispatch under a token cap. */
+  private usageUnknown = new Set<string>();
+  /** Retry legs still allowed per team root (shared by pool rotation and the declared leg). */
+  private retryBudget = new Map<string, number>();
   /** `providerPool` setting; `false` keeps one provider per dispatch. */
   private providerPool: ProviderPoolSettings | false = false;
   /** Round-robin cursor: advances once per pooled dispatch, never per attempt. */
@@ -621,6 +636,31 @@ export class AgentManager {
   }
 
   /** Set the provider pool; `false` disables it and restores single-provider dispatch. */
+  setTeamPolicy(policy: TeamPolicy | false) {
+    // Re-declaring the policy starts fresh accounting: otherwise a cap lowered
+    // mid-session would be judged against spend the operator just reset, and an
+    // `usageUnknown` block could never be cleared from the file.
+    this.teamPolicy = policy;
+    this.teamUsage.clear();
+    this.retryBudget.clear();
+    this.usageUnknown.clear();
+  }
+
+  getTeamPolicy(): TeamPolicy | false {
+    return this.teamPolicy;
+  }
+
+  /** Charged tokens and wall time across every team this session has settled. */
+  getTeamUsage(): { tokens: number; ms: number } {
+    let tokens = 0;
+    let ms = 0;
+    for (const used of this.teamUsage.values()) {
+      tokens += used.tokens;
+      ms += used.ms;
+    }
+    return { tokens, ms };
+  }
+
   setProviderPool(pool: ProviderPoolSettings | false) {
     this.providerPool = pool;
   }
@@ -637,7 +677,12 @@ export class AgentManager {
   private runningNestedCount(): number {
     let n = 0;
     for (const record of this.agents.values()) {
-      if (record.status === "running" && record.parentAgentId !== undefined && record.workflowId === undefined) n++;
+      if (record.parentAgentId === undefined || record.workflowId !== undefined) continue;
+      // A stopped child still holds its slot until its run settles: abort()
+      // only fires the controller, and the child keeps tearing down until its
+      // promise leaves `unsettled`. Counting it as free would let a new nested
+      // child start beside the one that is still running.
+      if (record.status === "running" || (record.status === "stopped" && record.promise !== undefined && this.unsettled.has(record.promise))) n++;
     }
     return n;
   }
@@ -820,6 +865,74 @@ export class AgentManager {
    * replaces it with its own, and `sendToBackground` must be able to take it
    * off, or the caller that armed it could stop a run it no longer owns.
    */
+  /**
+   * The team a record bills to: its top-level ancestor id, or `wf:<workflowId>`
+   * for a workflow's children (which have no parent record). Nested and workflow
+   * children therefore charge the same totals as their root.
+   */
+  private teamRootKey(record: AgentRecord): string {
+    let cur: AgentRecord | undefined = record;
+    for (let hops = 0; cur && cur.parentAgentId !== undefined && hops < 64; hops++) {
+      const parent: AgentRecord | undefined = this.agents.get(cur.parentAgentId);
+      if (!parent) break;
+      cur = parent;
+    }
+    if (cur && cur.parentAgentId === undefined && cur.workflowId !== undefined && record.workflowId !== undefined) {
+      return `wf:${cur.workflowId}`;
+    }
+    if (record.workflowId !== undefined && record.parentAgentId === undefined) return `wf:${record.workflowId}`;
+    // Every top-level dispatch of this session is one team: the budget is per
+    // root session activation, not per agent id.
+    if (cur?.parentAgentId === undefined && cur?.workflowId === undefined) return "session";
+    return cur?.id ?? record.id;
+  }
+
+  /**
+   * The reason a dispatch must not start under the team policy, or undefined.
+   * Refuses on ACCUMULATED settled totals only (no estimate), on an aborted
+   * caller, and on an unknown-usage team under a declared token cap.
+   */
+  private admitDispatch(record: AgentRecord): string | undefined {
+    const policy = this.teamPolicy;
+    if (policy === false) return undefined;
+    const root = this.teamRootKey(record);
+    if (record.abortController?.signal.aborted) return "Dispatch refused: the caller aborted before it started.";
+    const used = this.teamUsage.get(root) ?? { tokens: 0, ms: 0 };
+    if (policy.maxTeamTokens !== undefined && used.tokens >= policy.maxTeamTokens) {
+      return `Dispatch refused: team token budget exhausted (${used.tokens} ≥ maxTeamTokens ${policy.maxTeamTokens}).`;
+    }
+    if (policy.maxTeamMs !== undefined && used.ms >= policy.maxTeamMs) {
+      return `Dispatch refused: team time budget exhausted (${used.ms}ms ≥ maxTeamMs ${policy.maxTeamMs}).`;
+    }
+    if (policy.maxTeamTokens !== undefined && this.usageUnknown.has(root)) {
+      return "Dispatch refused: a prior run in this team reported no usage, so the token cap cannot be enforced. " +
+        "Re-declare teamPolicy in subagents.json to reset the totals after reviewing the spend.";
+    }
+    return undefined;
+  }
+
+  /** Charge a settled run to its team: tokens and wall ms, and flag unknown usage. */
+  private chargeTeam(record: AgentRecord): void {
+    // A refused or never-launched dispatch (budget, worktree failure) has no
+    // spend to charge, and must not poison the team as "usage unknown".
+    if ((record.providerAttempts ?? 0) === 0) return;
+    const root = this.teamRootKey(record);
+    const u = record.lifetimeUsage;
+    const tokens = u ? u.input + u.output + u.cacheWrite : 0;
+    const ms = record.startedAt !== undefined && record.completedAt !== undefined
+      ? Math.max(0, record.completedAt - record.startedAt)
+      : 0;
+    const used = this.teamUsage.get(root) ?? { tokens: 0, ms: 0 };
+    used.tokens += tokens;
+    used.ms += ms;
+    this.teamUsage.set(root, used);
+    const reported = tokens > 0 || (u?.cost ?? 0) > 0;
+    if (!reported) {
+      record.usageUnknown = true;
+      this.usageUnknown.add(root);
+    }
+  }
+
   private armQueuedAbort(id: string, signal?: AbortSignal): boolean {
     if (signal === undefined) return true;
     if (signal.aborted) {
@@ -877,7 +990,9 @@ export class AgentManager {
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
+        // A team-budget refusal stays on the record so `/agents` shows why the
+        // dispatch never started; other immediate startup failures still vanish.
+        if (queuedPool !== undefined || (err instanceof TeamRefusal)) {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
@@ -1040,12 +1155,38 @@ export class AgentManager {
     const candidates = this.poolCandidates(route, ctx);
     let lastError: unknown;
     let lastResult: RunResult | undefined;
-
+    // The first attempt is free; every LATER leg (pool rotation or the declared
+    // fallback) spends one unit of the team's retry allowance.
+    const root = record ? this.teamRootKey(record) : undefined;
+    const retriesAllowed = this.teamPolicy === false ? Number.POSITIVE_INFINITY : this.teamPolicy.retries;
+    if (root !== undefined && !this.retryBudget.has(root)) this.retryBudget.set(root, retriesAllowed);
+    let launched = 0;
+    const spendRetry = async (): Promise<boolean> => {
+      if (root === undefined || launched === 0) return true;
+      const left = this.retryBudget.get(root) ?? retriesAllowed;
+      if (left <= 0) return false;
+      this.retryBudget.set(root, left - 1);
+      const base = this.teamPolicy === false ? 0 : this.teamPolicy.retryBaseMs;
+      const delay = Math.min(base * 2 ** (retriesAllowed - left), 5000);
+      if (delay > 0 && !(await this.sleepUnlessStopped(delay, record))) return false;
+      return true;
+    };
     for (const candidate of candidates) {
+      // Cancellation fences the next seat: a stop that landed during the
+      // previous attempt must not launch another child on a different provider.
+      if (this.stopped(record)) {
+        this.noteAttempt(route, candidate.key, "pool", "aborted");
+        break;
+      }
+      if (!(await spendRetry())) {
+        this.noteAttempt(route, candidate.key, "pool", "aborted", "team retry allowance exhausted or stopped");
+        break;
+      }
       const toolsAtStart = record?.toolUses ?? 0;
       // A provider error AFTER the attempt already ran tools cannot be retried:
       // the same prompt in the same worktree would replay those side effects.
       const replayRisk = (): boolean => (record?.toolUses ?? 0) > toolsAtStart;
+      launched++;
       try {
         const result = await startRun(candidate.model);
         if (result.aborted || this.stopped(record)) {
@@ -1089,7 +1230,7 @@ export class AgentManager {
     // The pool is spent. The configured cross-provider leg is the only further
     // move, and it is resolved AT FAILURE TIME: a leg withdrawn from this
     // session's scope must not turn the last real failure into a routing error.
-    if (route.fallbackKey !== undefined) {
+    if (route.fallbackKey !== undefined && !this.stopped(record) && await spendRetry()) {
       const key = route.fallbackKey;
       const fallback = this.exactCatalogModel(ctx, (this.routing as SubagentRouting).catalogFor(ctx), key);
       if (typeof fallback === "string") {
@@ -1129,6 +1270,25 @@ export class AgentManager {
     if (lastError !== undefined) throw lastError;
     if (lastResult !== undefined) return lastResult;
     throw new Error(`No provider could run ${modelKey(route.model)}: every pool member was missing from this session's catalog.`);
+  }
+
+  /**
+   * Resolve after `ms`, or `false` if the record was stopped meanwhile. Abortable
+   * by the record's own signal, so a stop cancels a pending backoff.
+   */
+  private sleepUnlessStopped(ms: number, record?: AgentRecord): Promise<boolean> {
+    const signal = record?.abortController?.signal;
+    if (signal?.aborted) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(ok);
+      };
+      const onAbort = () => done(false);
+      const timer = setTimeout(() => done(true), ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   /**
@@ -1205,6 +1365,9 @@ export class AgentManager {
       ? this.resolveRoute(ctx, options, type)
       : undefined;
     if (typeof routed === "string") throw new Error(routed);
+    // Team budget: refused before the pool slot, the worktree or any prompt.
+    const refusal = this.admitDispatch(record);
+    if (refusal !== undefined) throw new TeamRefusal(refusal);
     // The ledger is shared by reference: attempts are appended as they happen,
     // and the settled record persists the same object.
     if (routed?.ledger !== undefined) record.providerRoute = routed.ledger;
@@ -1255,6 +1418,13 @@ export class AgentManager {
         : getAgentConfig(type)?.isolation ?? options.isolation;
     let worktreeCwd: string | undefined;
     if (isolation === "worktree" && isWorktreeIsolationEnabled()) {
+      // A stop that landed during startup (before this await) must not create
+      // a worktree at all: nothing would ever clean it up.
+      if (this.stopped(record)) {
+        this.chargePool(record.chargedPool, -1);
+        this.drainQueue();
+        return;
+      }
       const wt = await createWorktree(pi, baseCwd, id);
       if (!wt) {
         this.chargePool(record.chargedPool, -1);
@@ -1299,6 +1469,15 @@ export class AgentManager {
     if (options.signal?.aborted) this.abort(id);
     else this.armParentAbort(record, options.signal);
     const detach = () => this.detachParentAbort(record);
+    // Per-dispatch wall clock. `abort` stops the run; in-flight tools finish
+    // (bash is not killed), as documented for the abort path.
+    const maxMs = this.teamPolicy === false ? undefined : this.teamPolicy.maxDispatchMs;
+    if (maxMs !== undefined && maxMs > 0) {
+      record.dispatchTimer = setTimeout(() => {
+        record.dispatchTimer = undefined;
+        this.abort(id);
+      }, maxMs);
+    }
 
     // `model ?? options.model`: the unrouted paths (no router, routing disabled,
     // or a resume) must reproduce the old call exactly, including the caller's
@@ -1512,6 +1691,11 @@ export class AgentManager {
    * the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean): void {
+    if (record.dispatchTimer !== undefined) {
+      clearTimeout(record.dispatchTimer);
+      record.dispatchTimer = undefined;
+    }
+    this.chargeTeam(record);
     if (!record.isBackground) record.resultConsumed = true;
     // Nobody waits on a settled run; a later foreground resume must not look
     // like a spawn `sendToBackground` could hand off.

@@ -202,7 +202,8 @@ describe("status note reaches the parent through the real handlers", () => {
       .map((c: any[]) => c[0]);
     expect(lifecycle).toEqual(["subagents:created", "subagents:started", "subagents:completed"]);
     for (const name of lifecycle) expect(pi.events.emit).toHaveBeenCalledWith(name, owned);
-    expect(pi.appendEntry).not.toHaveBeenCalledWith("subagents:record", expect.objectContaining({ id }));
+    // Durable attribution: owned children ARE persisted (providerRoute survives restart).
+    expect(pi.appendEntry).toHaveBeenCalledWith("subagents:record", expect.objectContaining({ id }));
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -232,7 +233,7 @@ describe("status note reaches the parent through the real handlers", () => {
     expect(pi.events.emit).toHaveBeenCalledWith("subagents:completed", expect.objectContaining({
       id, workflowId: "wf-1", result: "step done",
     }));
-    expect(pi.appendEntry).not.toHaveBeenCalledWith("subagents:record", expect.anything());
+    expect(pi.appendEntry).toHaveBeenCalledWith("subagents:record", expect.objectContaining({ id }));
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 

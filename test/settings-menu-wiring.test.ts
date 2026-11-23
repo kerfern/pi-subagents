@@ -307,19 +307,16 @@ describe("/agents → Settings writes only the changed setting", () => {
 
   it("Up from the filter wraps to the last row, and Enter acts on that row", async () => {
     const agents = boot();
-    // The last row is Report usage to session, which cycles off → on.
+    // The last row is the read-only Team budget summary (file-only, no editor),
+    // so Enter on it changes nothing and saves nothing.
     const { ctx, notify, page } = drivePage([UP, ENTER]);
 
     await agents(ctx);
 
     expect(page.screen).not.toContain("to save");
-    // The cursor the user sees is on the row Enter acted on.
-    expect(page.screen).toMatch(/^> Report usage to session +global +on\b/m);
-    expect(readJson(globalFile())).toEqual({ reportUsage: true });
-    expect(notify).toHaveBeenCalledWith(
-      "Subagent usage now counted in this session's totals (saved to global settings)",
-      "info",
-    );
+    expect(page.screen).toMatch(/^> Team budget +off\b/m);
+    expect(existsSync(globalFile())).toBe(false);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("tags each row set in a file with that file, and retags a row after a save moves it", async () => {
@@ -694,7 +691,7 @@ describe("/agents → Settings filter and height", () => {
 
     expect(page.lines.length).toBeLessThanOrEqual(24);
     expect(page.lines[0]).toContain("Subagent Settings");
-    expect(page.screen).toMatch(/^> Report usage to session +off\b/m);
-    expect(page.screen).toContain("(31/31)");
+    expect(page.screen).toMatch(/^> Team budget +off\b/m);
+    expect(page.screen).toContain("(32/32)");
   });
 });
