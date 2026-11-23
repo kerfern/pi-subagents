@@ -458,6 +458,44 @@ describe("provider pool at startAgent", () => {
     expect(record?.providerRoute?.attempts.map((a) => a.outcome)).toEqual(["task-error"]);
   });
 
+  it("does not replay a seat that already ran a tool", async () => {
+    vi.mocked(runAgent).mockImplementation(((_pi: any, _ctx: any, _type: any, opts: any) => {
+      opts.onToolActivity?.({ type: "end" });
+      return Promise.resolve(providerFail() as RunResult);
+    }) as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+
+    const record = await spawnAndSettle(manager, {}, SEATS);
+
+    // Rotating here would replay the same prompt in the same worktree after
+    // side effects already happened.
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+    expect(record?.providerRoute?.attempts.map((a) => [a.outcome, a.reason])).toEqual([
+      ["provider-error", "tools already ran; not replayed"],
+    ]);
+  });
+
+  it("does not record success when the dispatch was stopped", async () => {
+    let release: (result: RunResult) => void = () => {};
+    vi.mocked(runAgent).mockImplementation((() => new Promise<RunResult>((resolve) => {
+      release = resolve;
+    })) as any);
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
+    manager.setProviderPool({ strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] });
+
+    const id = manager.spawn({} as any, mockCtx(SEATS), "general-purpose", "p", fresh() as any);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(manager.abort(id)).toBe(true);
+    release(ok() as RunResult);
+
+    const record = manager.getRecord(id);
+    await record?.promise;
+    expect(record?.status).toBe("stopped");
+    expect(record?.providerRoute?.servedModelKey).toBeUndefined();
+    expect(record?.providerRoute?.attempts.map((a) => a.outcome)).not.toContain("success");
+  });
+
   it("spends the pool and then the declared retry leg", async () => {
     vi.mocked(runAgent)
       .mockResolvedValueOnce(providerFail() as RunResult)

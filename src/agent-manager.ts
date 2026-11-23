@@ -1013,6 +1013,7 @@ export class AgentManager {
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route?: RoutedModels,
     ctx?: ExtensionContext,
+    record?: AgentRecord,
   ): Promise<RunResult> {
     // NOT an `async` method: every unrouted path must call the runner directly,
     // so a SYNCHRONOUS throw out of `runAgent` stays a startup failure the
@@ -1020,22 +1021,36 @@ export class AgentManager {
     // promise that the completion tail swallows, and the spawn would look like
     // it started.
     if (this.routing === undefined || route === undefined) return startRun(route?.model);
-    return this.runAttempts(startRun, route, ctx as ExtensionContext);
+    return this.runAttempts(startRun, route, ctx as ExtensionContext, record);
+  }
+
+  /**
+   * True when an external stop already claimed the record. A provider failure
+   * must not be recorded as a success, and a late result must not advance the
+   * pool, after the caller asked for the dispatch to stop.
+   */
+  private stopped(record: AgentRecord | undefined): boolean {
+    return record?.status === "stopped" || record?.abortController?.signal.aborted === true;
   }
 
   private async runAttempts(
     startRun: (model?: Model<any>) => Promise<RunResult>,
     route: RoutedModels,
     ctx: ExtensionContext,
+    record?: AgentRecord,
   ): Promise<RunResult> {
     const candidates = this.poolCandidates(route, ctx);
     let lastError: unknown;
     let lastResult: RunResult | undefined;
 
     for (const candidate of candidates) {
+      const toolsAtStart = record?.toolUses ?? 0;
+      // A provider error AFTER the attempt already ran tools cannot be retried:
+      // the same prompt in the same worktree would replay those side effects.
+      const replayRisk = (): boolean => (record?.toolUses ?? 0) > toolsAtStart;
       try {
         const result = await startRun(candidate.model);
-        if (result.aborted) {
+        if (result.aborted || this.stopped(record)) {
           this.noteAttempt(route, candidate.key, "pool", "aborted");
           return result;
         }
@@ -1050,12 +1065,23 @@ export class AgentManager {
           this.noteAttempt(route, candidate.key, "pool", "task-error");
           return result;
         }
+        if (replayRisk()) {
+          this.noteAttempt(route, candidate.key, "pool", "provider-error", "tools already ran; not replayed");
+          return result;
+        }
         this.noteAttempt(route, candidate.key, "pool", "provider-error");
         lastResult = result;
         lastError = undefined;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
+        if (!classifyProviderFailure({ isError: true, text: detail })) {
+          this.noteAttempt(route, candidate.key, "pool", "task-error");
+          throw error;
+        }
+        if (replayRisk()) {
+          this.noteAttempt(route, candidate.key, "pool", "provider-error", "tools already ran; not replayed");
+          throw error;
+        }
         this.noteAttempt(route, candidate.key, "pool", "provider-error");
         lastError = error;
         lastResult = undefined;
@@ -1077,7 +1103,7 @@ export class AgentManager {
       } else {
         try {
           const result = await startRun(fallback);
-          if (result.aborted) {
+          if (result.aborted || this.stopped(record)) {
             this.noteAttempt(route, key, "fallback", "aborted");
             return result;
           }
@@ -1134,9 +1160,10 @@ export class AgentManager {
       }
       candidates.push({ key, model });
     }
-    // A catalog that lost every member must still report the routed model's own
-    // failure rather than inventing a routing error.
-    return candidates.length > 0 ? candidates : [{ key: modelKey(route.model), model: route.model }];
+    // No cached-anchor exception: the catalog is re-read here but the worktree
+    // await can move it again, and a seat that is no longer selectable must not
+    // be launched just because it was the routed model when the dispatch began.
+    return candidates;
   }
 
   /** Declaration order, rotated by one synchronous session cursor that wraps. */
@@ -1158,13 +1185,14 @@ export class AgentManager {
     key: string,
     leg: "pool" | "fallback",
     outcome: ProviderAttemptOutcome,
+    detail?: string,
   ): void {
     if (route.ledger === undefined) return;
-    const reason =
-      outcome === "skipped" ? "not in session catalog"
+    const reason = detail ??
+      (outcome === "skipped" ? "not in session catalog"
         : outcome === "provider-error" ? "provider error"
           : outcome === "task-error" ? "task failure"
-            : undefined;
+            : undefined);
     route.ledger.attempts.push({ key, leg, outcome, ...(reason === undefined ? {} : { reason }) });
   }
 
@@ -1394,7 +1422,7 @@ export class AgentManager {
       });
     };
 
-    const promise = this.runRouted(startRun, routed as RoutedModels | undefined, ctx)
+    const promise = this.runRouted(startRun, routed as RoutedModels | undefined, ctx, record)
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
         this.settleOutcome(record, { text: responseText, failure, aborted, steered });
         // Kept beside `result`, never inside it: `result` is prose meant for a
