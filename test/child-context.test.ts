@@ -13,6 +13,17 @@ describe("child session async context", () => {
     expect(inChildSessionContext()).toBe(false);
   });
 
+  it("shares the marker with a separately loaded copy of the module", async () => {
+    // Two live copies (parent's package, another extension's copy) must agree on
+    // the same storage, or a guard using one copy would miss a child from the other.
+    const slot = (globalThis as any)[Symbol.for("pi-subagents.child-context.v1")];
+    expect(slot?.storage).toBeDefined();
+    await runInChildSessionContext(async () => {
+      expect(slot.storage.getStore()).toBe(true);
+    });
+    expect(slot.storage.getStore()).toBeUndefined();
+  });
+
   it("prevents a child resource load from creating another extension manager", async () => {
     const pi = new Proxy({}, {
       get: vi.fn(() => {
