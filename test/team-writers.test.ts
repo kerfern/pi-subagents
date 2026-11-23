@@ -91,6 +91,51 @@ describe("parseTeamManifest overlap", () => {
   });
 });
 
+describe("runTeam cancellation", () => {
+  it("passes the signal into the gate and reports an abort that lands mid-gate", async () => {
+    const repo = initRepo();
+    const base = git(repo, "rev-parse", "HEAD");
+    const plan = parseTeamManifest(JSON.stringify({
+      gate: ["node", "--test"],
+      writers: [
+        { name: "a", agent: "implementer", prompt: "p", files: ["src/api/a.txt"] },
+        { name: "b", agent: "implementer", prompt: "p", files: ["src/web/b.txt"] },
+      ],
+    }));
+    const dispatch = (w: TeamWriter) => fakeWriter(repo, base, { [w.files[0]!]: `${w.name}-change\n` })(w);
+
+    const controller = new AbortController();
+    let gateSignal: AbortSignal | undefined;
+    let sawAbort = false;
+    let gateStarted!: () => void;
+    const started = new Promise<void>((resolve) => { gateStarted = resolve; });
+    const exec = async (_argv: string[], _cwd: string, opts?: { signal?: AbortSignal }) => {
+      gateSignal = opts?.signal;
+      gateStarted();
+      await new Promise<void>((resolve) => {
+        if (opts?.signal?.aborted) { sawAbort = true; resolve(); return; }
+        const timer = setTimeout(resolve, 500);
+        opts?.signal?.addEventListener("abort", () => { sawAbort = true; clearTimeout(timer); resolve(); }, { once: true });
+      });
+      return sawAbort ? { code: 143, output: "gate killed by abort" } : { code: 0, output: "gate passed without an abort" };
+    };
+
+    const running = runTeam({ cwd: repo, dispatch, exec, signal: controller.signal }, plan);
+    await started;
+    controller.abort();
+    const result = await running;
+
+    expect(gateSignal).toBe(controller.signal);
+    expect(sawAbort, "the gate must receive the abort while it is running").toBe(true);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("gate-failed");
+    expect(result.detail).toContain("143");
+    expect(git(repo, "branch", "--list", "pi-team-*").length).toBeGreaterThan(0);
+    expect(git(repo, "rev-parse", "HEAD")).toBe(base);
+  });
+});
+
 describe("runTeam (real git)", () => {
   const plan = (files: [string[], string[]]): TeamPlan => ({
     gate: gateOk.gate,

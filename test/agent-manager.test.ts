@@ -3196,6 +3196,35 @@ describe("AgentManager — waitForSettled (#443)", () => {
     openGate();
   });
 
+  it("counts a foreground resume as settling until it returns", async () => {
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", { description: "first", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockImplementation(async () => {
+      await gate;
+      return { text: "second", aborted: false, steered: false };
+    });
+
+    const resumed = manager.resume(id, "more");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(manager.isSettling(id)).toBe(true);
+    let settled: boolean | undefined;
+    const waiting = manager.waitForSettled(id, 5_000).then((ok) => { settled = ok; });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled, "waitForSettled must wait for the resumed turn").toBeUndefined();
+
+    openGate();
+    await resumed;
+    await waiting;
+    expect(manager.isSettling(id)).toBe(false);
+    expect(settled).toBe(true);
+  });
+
   it("resolves true at once for an agent that has already settled with no descendants", async () => {
     resolvedRun();
     manager = new AgentManager();

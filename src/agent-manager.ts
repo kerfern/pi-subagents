@@ -1997,7 +1997,10 @@ export class AgentManager {
       this.abortOwnedChildren(id);
       return record.result ?? "";
     })();
-    record.promise = run;
+    // Tracked like a spawn's run: `isSettling`/`waitForSettled` and the nested
+    // slot count read this set, so an untracked resume would report the agent
+    // settled while its turn was still running.
+    this.trackRun(record, run);
     await run;
 
     return record;

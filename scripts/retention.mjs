@@ -100,7 +100,8 @@ export function applyRetention({ candidates, archiveDir }) {
     const manifest = manifestFor(candidate.dir);
     renameSync(candidate.dir, target);
     writeFileSync(join(target, "manifest.json"), `${JSON.stringify({
-      archivedAt: new Date(candidate.mtime).toISOString(),
+      archivedAt: new Date().toISOString(),
+      lastActivityAt: new Date(candidate.mtime).toISOString(),
       family: candidate.family,
       ...manifest,
     }, null, 2)}\n`);
