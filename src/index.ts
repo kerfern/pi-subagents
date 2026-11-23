@@ -11,9 +11,9 @@
  *   /agents-team <file>     — Run a parallel writer team (see team-writers.ts)
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { isAbsolute, join, resolve as resolvePath, sep } from "node:path";
 import { type AgentSession, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, isKeyRelease, matchesKey, type ScrollViewScrollbar, type SelectItem, SelectList, type SettingItem, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -78,7 +78,7 @@ import {
 } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { toSubagentInfo } from "./subagent-info.js";
-import { parseTeamManifest, runTeam, type TeamPlan, type TeamWriter, type WriterRun } from "./team-writers.js";
+import { parseTeamManifest, runTeam, type TeamPlan, type TeamResult, type TeamWriter, type WriterRun } from "./team-writers.js";
 import { type AgentInvocation, type AgentMentionMode, type AgentRecord, type CacheRetentionSetting, type JoinMode, type NotificationDetails, type SubagentType, THINKING_LEVELS, type ThinkingLevel, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -4542,6 +4542,107 @@ Terse command-style prompts produce shallow, generic work.
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
   });
+  /**
+   * One manifest, one dispatcher: the `/agents-team` command and the `Team` tool
+   * differ only in how the plan is approved before a writer is spawned.
+   */
+  const dispatchTeam = async (plan: TeamPlan, ctx: ExtensionCommandContext | ExtensionContext): Promise<TeamResult> => {
+    const dispatch = async (writer: TeamWriter): Promise<WriterRun> => {
+      const resolved = resolveSpawnType(writer.agent);
+      if (!resolved.ok) return { status: "error", error: resolved.message };
+      const id = manager.spawn(pi, ctx, resolved.type, writer.prompt, {
+        description: `team: ${writer.name}`,
+        isolation: "worktree",
+        isBackground: true,
+        cwd: ctx.cwd,
+      });
+      await manager.waitForSettled(id, 60 * 60 * 1000);
+      const rec = manager.getRecord(id);
+      return {
+        status: rec?.status ?? "missing",
+        branch: rec?.worktreeResult?.branch,
+        baseSha: rec?.worktree?.baseSha,
+        worktreePath: rec?.worktree?.path,
+        error: rec?.error,
+      };
+    };
+    return runTeam({ cwd: ctx.cwd, dispatch }, plan);
+  };
+
+  /**
+   * `Team` — the model-callable path. It never dispatches without an explicit
+   * operator confirmation showing the gate argv and the claimed files: the gate
+   * runs with host permissions on writer-edited code, so a silent call would be
+   * a sandbox escape by delegation.
+   */
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.TEAM,
+    label: "Team",
+    description: [
+      "Run a writer team from a manifest file: 2–6 writers with exclusive file claims, each in its own worktree, merged into a throwaway integration tree and gated once.",
+      "The operator must approve the plan (writers, claims, gate argv) before any writer starts; a declined or unavailable confirmation refuses the call.",
+      "Your checkout is never written, merged into, or reset, and nothing is pushed. Returns the integration branch and commit on success, or the refusal reason with retained refs to inspect.",
+    ].join(" "),
+    promptSnippet: "Run a gated parallel writer team from a manifest",
+    promptGuidelines: [
+      "Split work so each writer owns disjoint files before calling `Team`; overlapping claims are refused.",
+      "After success, inspect `git diff`/`git log` on the returned branch and verify the gate evidence before proposing integration.",
+    ],
+    parameters: Type.Object({
+      manifestPath: Type.String({
+        maxLength: 4096,
+        description: "Path to the team manifest JSON, relative to the session cwd. Must stay inside the project.",
+      }),
+    }),
+    renderCall(args, theme) {
+      return new Text(`${theme.fg("toolTitle", "▸ ")}${theme.bold(theme.fg("toolTitle", "Team"))}  ${theme.fg("muted", String(args.manifestPath ?? ""))}`, 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      return new Text(text, 0, 0);
+    },
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      if (!isWorktreeIsolationEnabled()) {
+        return textResult("team refused: worktree isolation is disabled in this session, so writers cannot be contained.");
+      }
+      let resolvedPath: string;
+      let plan: TeamPlan;
+      try {
+        const root = realpathSync(ctx.cwd);
+        resolvedPath = realpathSync(resolvePath(root, params.manifestPath));
+        if (resolvedPath !== root && !resolvedPath.startsWith(root + sep)) {
+          return textResult("team refused: the manifest path resolves outside the project directory.");
+        }
+        plan = parseTeamManifest(readFileSync(resolvedPath, "utf8"));
+      } catch (err) {
+        return textResult(`team refused: ${(err as Error).message}`);
+      }
+      const gateLine = plan.gate.join(" ");
+      const summary = plan.writers
+        .map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`)
+        .join("\n");
+      const approved = await ctx.ui.confirm(
+        "Run this team?",
+        `${plan.writers.length} writers, gate: ${gateLine}\n${summary}\n\nWriters run in isolated worktrees; the gate runs on the merged result in a throwaway tree.`,
+      );
+      if (!approved) return textResult("team refused: the operator did not approve this plan.");
+      const result = await dispatchTeam(plan, ctx);
+      if (result.ok) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `team ok: ${result.merged.length} writers merged into ${result.branch} at ${result.commit}.\nInspect: git log --oneline ${result.branch} and git diff ${result.merged.join(" ")} (branches of the same base).\nYour checkout was not modified.`,
+          }],
+          details: result as any,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `team refused (${result.reason}): ${result.detail}` }],
+        details: result as any,
+      };
+    },
+  }));
+
   pi.registerCommand("agents-team", {
     description: "Run a parallel writer team from a manifest: /agents-team <manifestPath>",
     handler: async (args, ctx) => {
@@ -4562,26 +4663,7 @@ Terse command-style prompts produce shallow, generic work.
           plan.writers.map((w) => `  - ${w.name} (${w.agent}): ${w.files.join(", ")}`).join("\n"),
         "info",
       );
-      const dispatch = async (writer: TeamWriter): Promise<WriterRun> => {
-        const resolved = resolveSpawnType(writer.agent);
-        if (!resolved.ok) return { status: "error", error: resolved.message };
-        const id = manager.spawn(pi, ctx, resolved.type, writer.prompt, {
-          description: `team: ${writer.name}`,
-          isolation: "worktree",
-          isBackground: true,
-          cwd: ctx.cwd,
-        });
-        await manager.waitForSettled(id, 60 * 60 * 1000);
-        const rec = manager.getRecord(id);
-        return {
-          status: rec?.status ?? "missing",
-          branch: rec?.worktreeResult?.branch,
-          baseSha: rec?.worktree?.baseSha,
-          worktreePath: rec?.worktree?.path,
-          error: rec?.error,
-        };
-      };
-      const result = await runTeam({ cwd: ctx.cwd, dispatch }, plan);
+      const result = await dispatchTeam(plan, ctx);
       if (result.ok) {
         ctx.ui.notify(`agents-team ok: branch ${result.branch} commit ${result.commit} merged [${result.merged.join(", ")}]`, "info");
       } else {

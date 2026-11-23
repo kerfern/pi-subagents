@@ -87,6 +87,8 @@ export const SUBAGENT_TOOL_NAMES = {
   STEER: "steer_subagent",
   STOP: "stop_subagent",
   STOP_WORKFLOW: "stop_workflow",
+  /** Runs a writer team; main-session only, never inherited by children. */
+  TEAM: "Team",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */

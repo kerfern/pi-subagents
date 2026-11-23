@@ -601,6 +601,39 @@ A failed `agent()` call returns `null`. The completion notification lists every 
 
 **Opt-in staged pilot:** [`cache-aware-orchestration.js`](examples/workflows/cache-aware-orchestration.js) — Plan approval → gated worker → advisor/review stages with task-scoped artifacts and usage telemetry. Use redacted task summaries; see workflow guide for stage arguments and limits.
 
+### `Team`
+
+Run a writer team from a manifest: 2–6 writers with **exclusive file claims**, each in
+its own worktree at one base SHA, squash-merged serially into a throwaway integration
+tree where the gate runs once. The model calls this; the operator approves the plan
+first.
+
+| Parameter | Type | Required | Description |
+| ----------- | ------ | ---------- | ------------- |
+| `manifestPath` | string | yes | Manifest JSON path relative to the session cwd. Must resolve inside the project |
+
+```json
+{
+  "gate": ["npm", "test"],
+  "writers": [
+    { "name": "add", "agent": "worker", "prompt": "Make lib/add.mjs pass its test.", "files": ["lib/add.mjs"] },
+    { "name": "slug", "agent": "worker", "prompt": "Make lib/slugify.mjs pass its test.", "files": ["lib/slugify.mjs"] }
+  ]
+}
+```
+
+Refused before anything starts when: the manifest is invalid, claims overlap, the path
+escapes the project, worktree isolation is off, or the operator declines the
+confirmation (which shows the gate argv and every claimed file — the gate runs with
+host permissions on writer-edited code). Writer errors, a drifting base SHA, a diff
+outside the claims, a merge conflict or a failing gate refuse the whole team; nothing
+is partially merged. Your checkout is never written, merged into or reset, and nothing
+is pushed. The result carries the integration branch and commit; inspect them and the
+gate evidence before proposing integration.
+
+**Not a sandbox:** a writer's `bash` can still touch anything the operator can. Claims
+bound what may be merged, not what a process may attempt.
+
 ### `get_subagent_result`
 
 Check status and retrieve results from a background agent.
@@ -628,6 +661,7 @@ Send a steering message to a running agent. The message interrupts after the cur
 
 | Command | Description |
 | --------- | ------------- |
+| `/agents-team <manifest>` | Run the same writer team interactively (shared dispatcher with the `Team` tool) |
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
 | `/subagent-model [provider/model]` | Set specialist (Plan/advisor/reviewer) model → specialist thinking → other-subagent model → other-subagent thinking. No argument opens four pickers in series; model pickers support filtering and `↑↓`, thinking pickers offer `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. An exact `provider/model` argument applies models only, preserving current thinking routes. See [Subagent Model Routing](#subagent-model-routing) |
 | `/implementer-model` | Alias for `/subagent-model` |
