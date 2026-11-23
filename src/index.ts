@@ -36,6 +36,7 @@ import { describeModel, type ModelRegistry, resolveModel } from "./model-resolve
 import {
   DEFAULT_REVIEWER_MODEL,
   DEFAULT_SUBAGENT_MODEL,
+  FALLBACK_SUBAGENT_MODEL,
   type ModelRef,
   modelKey,
   ROUTING_STATE_TYPE,
@@ -1603,6 +1604,7 @@ export default function (pi: ExtensionAPI) {
     setWorkflowsEnabled: setWorkflowsEnabled,
     setMaxSubagentDepth: setMaxSubagentDepth,
     setFallbackSubagent: setFallbackSubagent,
+    setFallbackModel: (model) => manager.setFallbackModel(model),
     setReportUsage,
     setShowCost,
     setShowModel,
@@ -3435,6 +3437,9 @@ Terse command-style prompts produce shallow, generic work.
       // explicit configuration — which then fails loudly if general-purpose later
       // goes away. undefined is dropped by JSON.stringify.
       fallbackSubagent: getFallbackSubagent(),
+      // Same rule: unset must round-trip as unset, so the shipped default keeps
+      // applying without being frozen into the file.
+      fallbackModel: manager.getFallbackModel(),
       reportUsage: isReportUsageEnabled(),
       // Defaults off: the guard is inert until an operator enables it, so an
       // unset value must round-trip as unset rather than being materialized as
@@ -3529,6 +3534,7 @@ Terse command-style prompts produce shallow, generic work.
   function resetSetting(key: keyof SubagentsSettings, value: unknown) {
     if (value !== undefined) applySettings({ [key]: value } as SubagentsSettings, settingsAppliers);
     else if (key === "fallbackSubagent") setFallbackSubagent(undefined);
+    else if (key === "fallbackModel") manager.setFallbackModel(undefined);
     else if (key === "packageAgents") setPackageAgentsGate(undefined);
     else if (key === "packageWorkflows") setPackageWorkflowsGate(undefined);
     else if (key === "workflowsEnabled") {
@@ -3561,6 +3567,9 @@ Terse command-style prompts produce shallow, generic work.
       // persist a fallback that would hard-error on every dispatch.
       const fallbackValue = getFallbackSubagent() ?? "general-purpose";
       const fallbackValues = [...new Set([...getAvailableTypes(), NO_FALLBACK])];
+      // One leg is configured in a file; the row cycles the reviewed choices so
+      // it stays usable without a free-text editor (`isNumericSettingKey` gates those).
+      const configuredLeg = manager.getFallbackModel() ?? FALLBACK_SUBAGENT_MODEL;
 
       // Ordered by category, with no header rows (every row stays a setting the
       // filter can match): limits, dispatch, features, agent files, display.
@@ -3628,6 +3637,13 @@ Terse command-style prompts produce shallow, generic work.
           description: `Agent used when subagent_type is unknown, disabled, or ambiguous; "${NO_FALLBACK}" rejects the call instead (strict dispatch)`,
           currentValue: fallbackValue,
           values: fallbackValues,
+        },
+        {
+          id: "fallbackModel",
+          label: "Fallback model",
+          description: `Provider/model retried once when a subagent's own provider fails; "${NO_FALLBACK}" keeps the failure on the routed model. Cycles the reviewed legs — edit subagents.json for any other provider/model`,
+          currentValue: configuredLeg,
+          values: [...new Set([configuredLeg, NO_FALLBACK, FALLBACK_SUBAGENT_MODEL])],
         },
         {
           id: "disableDefaultAgents",
@@ -3913,6 +3929,19 @@ Terse command-style prompts produce shallow, generic work.
           value === NO_FALLBACK
             ? "Unknown or disabled agent types will now be rejected"
             : `Unknown agent types will fall back to ${value}`,
+        );
+      } else if (id === "fallbackModel") {
+        const typed = value.trim();
+        // Empty = back to the shipped default; the sentinel stays the sentinel.
+        manager.setFallbackModel(typed === "" ? undefined : typed);
+        notifyApplied(
+          ctx,
+          target,
+          typed === NO_FALLBACK
+            ? "Provider failures will be reported on the routed model, not retried elsewhere"
+            : typed === ""
+              ? `Provider failures will retry once on ${FALLBACK_SUBAGENT_MODEL}`
+              : `Provider failures will retry once on ${typed}`,
         );
       } else if (id === "outputTranscript") {
         const enabled = value === "on";

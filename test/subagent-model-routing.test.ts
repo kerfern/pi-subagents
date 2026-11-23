@@ -11,6 +11,7 @@ vi.mock("../src/worktree.js", () => ({
 import { AgentManager, type SubagentRouting } from "../src/agent-manager.js";
 import type { RunResult } from "../src/agent-runner.js";
 import { runAgent } from "../src/agent-runner.js";
+import { NO_FALLBACK } from "../src/agent-types.js";
 import type { SubagentRoutingState } from "../src/model-routing.js";
 
 const PRIMARY = { provider: "faux", id: "primary-1" };
@@ -47,9 +48,13 @@ const providerFail = () => ({ ...ok(), responseText: "", failure: "429 rate limi
 const fresh = (over: Record<string, unknown> = {}) => ({ description: "d", isBackground: false, ...over });
 
 /** Runs a fresh dispatch to completion (or startup failure). */
-async function spawnAndSettle(manager: AgentManager, over: Record<string, unknown> = {}) {
+async function spawnAndSettle(
+  manager: AgentManager,
+  over: Record<string, unknown> = {},
+  models?: Array<{ provider: string; id: string }>,
+) {
   const { type = "general-purpose", ...options } = over;
-  const id = manager.spawn({} as any, mockCtx(), type as string, "p", fresh(options) as any);
+  const id = manager.spawn({} as any, mockCtx(models), type as string, "p", fresh(options) as any);
   const record = manager.getRecord(id);
   await (record?.promise ?? manager.awaitStartup(id)).catch(() => {});
   return record;
@@ -259,6 +264,89 @@ describe("shared routing at startAgent", () => {
     await expect(spawnRefused(manager)).rejects.toThrow(/unavailable/i);
     expect(routing.routingFailed).toBe(true);
     expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("with the retry leg off, a provider failure is reported and not retried or latched", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
+    manager.setFallbackModel(NO_FALLBACK);
+
+    const record = await spawnAndSettle(manager);
+
+    // One dispatch, on the routed model: no silent provider switch.
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(PRIMARY);
+    expect(record?.status).toBe("error");
+    // A transient provider error must not stop every later dispatch.
+    expect(routing.routingFailed).toBe(false);
+  });
+
+  it("with the retry leg off, a thrown provider error is not retried", async () => {
+    vi.mocked(runAgent).mockRejectedValue(new Error("429 rate limit exceeded"));
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
+    manager.setFallbackModel(NO_FALLBACK);
+
+    await spawnAndSettle(manager);
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(routing.routingFailed).toBe(false);
+  });
+
+  it("with the retry leg off, an unavailable default leg no longer blocks dispatch", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
+    const routing = state();
+    // Only the routed model is in the catalog; the default leg is absent.
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [PRIMARY]));
+    manager.setFallbackModel(NO_FALLBACK);
+
+    const record = await spawnAndSettle(manager);
+
+    expect(record?.status).toBe("completed");
+    expect(routing.routingFailed).toBe(false);
+    expect(runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a configured retry leg and names it when that leg fails", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
+    manager.setFallbackModel("commandcode/minimax/minimax-m3.1-flash");
+
+    await spawnAndSettle(manager);
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(FALLBACK);
+    expect(routing.terminalReason).toContain("commandcode/minimax/minimax-m3.1-flash");
+  });
+
+  it("honors a configured leg that differs from the shipped default", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    // A distinct key, so the assertion cannot pass by falling back to the constant.
+    const leg = { provider: "faux", id: "retry-2" };
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing, [PRIMARY, leg]));
+    manager.setFallbackModel("faux/retry-2");
+
+    // The leg must be in the dispatch catalog too, not only in the routed one.
+    await spawnAndSettle(manager, {}, [PRIMARY, leg]);
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(leg);
+    expect(routing.terminalReason).toContain("faux/retry-2");
+  });
+
+  it("treats a retry leg naming the routed model as off", async () => {
+    vi.mocked(runAgent).mockResolvedValue(providerFail() as RunResult);
+    const routing = state();
+    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(routing));
+    manager.setFallbackModel("faux/primary-1");
+
+    await spawnAndSettle(manager);
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(routing.routingFailed).toBe(false);
   });
 
   it("fails before running when the fallback is not in the catalog", async () => {

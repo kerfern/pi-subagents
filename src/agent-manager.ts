@@ -30,7 +30,7 @@ import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import {
   classifyProviderFailure,
-  FALLBACK_SUBAGENT_MODEL,
+  fallbackKeyFor,
   isRoutingEnabled,
   type ModelRef,
   modelForSubagent,
@@ -87,10 +87,11 @@ export interface SubagentRouting {
   onLatch?(reason: string): void;
 }
 
-/** The two models one logical task may run on: the route, and its one retry. */
+/** The models one logical task may run on: the route, and its one approved retry. */
 interface RoutedModels {
   model: Model<any>;
-  fallback: Model<any>;
+  /** Absent when `fallbackModel` is off (or names the routed model itself). */
+  fallback?: Model<any>;
 }
 
 /**
@@ -469,6 +470,8 @@ export class AgentManager {
   private maxConcurrent: number;
   private maxConcurrentForeground = DEFAULT_MAX_CONCURRENT_FOREGROUND;
   private maxConcurrentNested = DEFAULT_MAX_CONCURRENT_NESTED;
+  /** `fallbackModel` setting; undefined keeps the historical retry leg. */
+  private fallbackModel: string | undefined;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -578,6 +581,15 @@ export class AgentManager {
 
   getMaxConcurrentNested(): number {
     return this.maxConcurrentNested;
+  }
+
+  /** Set the retry leg's model key (`"none"` disables it); undefined restores the default. */
+  setFallbackModel(model: string | undefined) {
+    this.fallbackModel = model;
+  }
+
+  getFallbackModel(): string | undefined {
+    return this.fallbackModel;
   }
 
   /**
@@ -908,9 +920,13 @@ export class AgentManager {
         `${routedThinking}. Change it with /subagent-model.`;
     }
 
-    const fallback = this.exactCatalogModel(ctx, catalog, FALLBACK_SUBAGENT_MODEL);
+    // No configured leg means a provider failure surfaces on the routed model
+    // rather than moving the work to another provider and subscription.
+    const fallbackKey = fallbackKeyFor(this.fallbackModel, wanted);
+    if (fallbackKey === undefined) return { model };
+    const fallback = this.exactCatalogModel(ctx, catalog, fallbackKey);
     if (typeof fallback === "string") {
-      recordUnavailableModel(routing.state, FALLBACK_SUBAGENT_MODEL);
+      recordUnavailableModel(routing.state, fallbackKey);
       return this.latched(routing);
     }
     return { model, fallback };
@@ -971,11 +987,17 @@ export class AgentManager {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (!classifyProviderFailure({ isError: true, text: detail })) throw error;
+      if (route.fallback === undefined) {
+        // No approved retry leg: surface the routed model's own failure. Latching
+        // here would kill every later dispatch over one transient error.
+        throw error;
+      }
       return this.retryOnFallback(startRun, route);
     }
 
     if (first.aborted || first.failure === undefined) return first;
     if (!classifyProviderFailure({ isError: true, text: first.failure })) return first;
+    if (route.fallback === undefined) return first;
     return this.retryOnFallback(startRun, route);
   }
 
@@ -989,18 +1011,19 @@ export class AgentManager {
     route: RoutedModels,
   ): Promise<RunResult> {
     const routing = this.routing as SubagentRouting;
+    const fallback = route.fallback as Model<any>;
     try {
-      const second = await startRun(route.fallback);
+      const second = await startRun(fallback);
       if (!second.aborted && second.failure !== undefined
         && classifyProviderFailure({ isError: true, text: second.failure })) {
-        recordFallbackFailure(routing.state, second.failure, modelKey(route.model));
+        recordFallbackFailure(routing.state, second.failure, modelKey(route.model), modelKey(fallback));
         this.latched(routing);
       }
       return second;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       if (classifyProviderFailure({ isError: true, text: detail })) {
-        recordFallbackFailure(routing.state, detail, modelKey(route.model));
+        recordFallbackFailure(routing.state, detail, modelKey(route.model), modelKey(fallback));
         this.latched(routing);
       }
       throw error;

@@ -338,6 +338,19 @@ export interface SubagentsSettings {
    */
   fallbackSubagent?: string;
   /**
+   * Model the one retry leg uses when a subagent's own provider fails for
+   * provider-shaped reasons (auth, quota, rate limit, connection, 5xx).
+   *
+   * Unset keeps the historical constant (`FALLBACK_SUBAGENT_MODEL`); `"none"`
+   * (or the boolean `false` — a boolean would otherwise be dropped as the wrong
+   * type and silently leave switching on, the wrong direction to fail for this
+   * setting) turns the leg off, so a provider failure is reported on the routed
+   * model instead of quietly running the work on a different provider and
+   * subscription. A value equal to the routed model is treated as off, too:
+   * re-dialling the provider that just failed is not a fallback.
+   */
+  fallbackModel?: string;
+  /**
    * Whether this extension's tool results carry a `usage` field, so subagent
    * spend reaches the parent session's own accounting. Defaults to `false`.
    *
@@ -470,6 +483,7 @@ export interface SettingsAppliers {
   setQuotaGuardReserveUnits: (units: Record<string, number>) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
+  setFallbackModel: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -555,6 +569,7 @@ export const SETTING_DEFAULTS: { readonly [K in keyof Required<SubagentsSettings
   workflowsEnabled: undefined,
   maxSubagentDepth: 2,
   fallbackSubagent: undefined,
+  fallbackModel: undefined,
   reportUsage: false,
   showCost: false,
   showModel: false,
@@ -726,6 +741,13 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
+  if (r.fallbackModel === false) {
+    // Same reasoning as `fallbackSubagent` above: a boolean that would be
+    // dropped must not leave provider switching silently enabled.
+    out.fallbackModel = NO_FALLBACK;
+  } else if (typeof r.fallbackModel === "string" && r.fallbackModel.trim()) {
+    out.fallbackModel = r.fallbackModel.trim();
+  }
   return out;
 }
 
@@ -863,6 +885,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  if (typeof s.fallbackModel === "string") appliers.setFallbackModel(s.fallbackModel);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

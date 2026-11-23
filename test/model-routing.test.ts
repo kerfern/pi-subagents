@@ -97,18 +97,18 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
-  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use OpenCode Go DeepSeek v4.1 Flash/low", () => {
+  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use Luna/off", () => {
     const state = restoreRoutingState([], [
-      { provider: "openai-codex", id: "gpt-6.1-sol" },
-      { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+      { provider: "openai-codex", id: "gpt-6.2-sol" },
+      { provider: "github-copilot", id: "gpt-6-luna" },
     ]);
     for (const role of ["reviewer", "Plan", "advisor"]) {
-      expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.1-sol");
+      expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.2-sol");
       expect(thinkingForSubagent(state, role)).toBe("xhigh");
     }
     for (const role of ["worker", "Explore", "implementer", "custom-role"]) {
-      expect(modelForSubagent(state, role)).toBe("opencode-go/deepseek-v4.1-flash");
-      expect(thinkingForSubagent(state, role)).toBe("low");
+      expect(modelForSubagent(state, role)).toBe("github-copilot/gpt-6-luna");
+      expect(thinkingForSubagent(state, role)).toBe("off");
     }
   });
 
@@ -120,7 +120,7 @@ describe("restore + migration", () => {
     expect(state.selected).toBe("gone/x");
     expect(state.effective).toBe(DEFAULT_SUBAGENT_MODEL);
     expect(state.reviewerEffective).toBe(DEFAULT_REVIEWER_MODEL);
-    expect(thinkingForSubagent(state, "worker")).toBe("low");
+    expect(thinkingForSubagent(state, "worker")).toBe("off");
     expect(thinkingForSubagent(state, "reviewer")).toBe("xhigh");
     expect(state.stale).toBe(true);
   });

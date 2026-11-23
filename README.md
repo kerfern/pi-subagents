@@ -792,9 +792,9 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 
 | | |
 | --------- | ------------- |
-| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.1-sol` (xhigh); other agents `opencode-go/deepseek-v4.1-flash` (low) |
+| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.2-sol` (xhigh); other agents `github-copilot/gpt-6-luna` (off) |
 | Roles | Reviewer, built-in `Plan`, and custom `advisor` use specialist route; all other types use shared route |
-| Fallback | CommandCode MiniMax M3.1 Flash (`commandcode/minimax/minimax-m3.1-flash`); exact catalog validation before primary execution |
+| Fallback | Configurable with `fallbackModel`; unset means CommandCode MiniMax M3.1 Flash (`commandcode/minimax/minimax-m3.1-flash`), `none` keeps a provider failure on the routed model; exact catalog validation before primary execution |
 | Select | `/subagent-model` (canonical) or `/implementer-model` (alias) |
 | Picker order | Reviewer/Plan/advisor model → thinking → other-agent model → thinking |
 | Stored | Session entry `subagent-model-state` — shared `provider/model` + `thinking`, reviewer `reviewerProvider/reviewerModel` + `reviewerThinking`, per session, never per project |
@@ -804,6 +804,8 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 
 **One retry, same task.** A recognized provider failure (auth, quota, rate limit, 404/408/429/5xx, connection/transport errors) retries *the identical task* — same prompt, type, tools, options and worktree — once on the fallback provider. A failure on that leg sets the terminal latch. Task, gate, test, cancellation, schema and scope failures never retry: the classifier is deliberately narrow, because a retry that re-runs finished work costs real tokens.
 
+**The retry leg is a configured choice, not an assumption.** `fallbackModel` names the one model a provider failure may retry on; unset keeps the shipped default, and `none` (or `false`) turns the leg off so the routed model's own failure is reported instead of the work quietly running on a different provider and subscription. A configured key equal to the routed model is treated as off too — re-dialling the provider that just failed is not a fallback. With the leg off, a provider failure is surfaced for that task and does **not** latch the route: one transient error must not stop every later dispatch.
+
 **Fail closed.** A latched route refuses every later fresh or queued dispatch with the recorded reason, and never offers a replacement model — already-running agents are left to settle. Re-selecting with `/subagent-model` is the deliberate, only way out. An unavailable target (the selected or default model missing from this session's catalog) is terminal *before* execution: it does not fall back, so a provider outage or a revoked login surfaces as an error naming the model instead of a silent substitution.
 
 **Resumes are exempt** in both directions: a resumed conversation keeps the model its stored session already has, consumes no fallback attempt, and still opens while the route is latched.
@@ -812,7 +814,7 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max background concurrency, max foreground concurrency, max nested concurrency, nested depth, default max turns, grace turns, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, package agents on/off, package workflows on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, workflow tool exposure skill/inline/deferred, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max background concurrency, max foreground concurrency, max nested concurrency, nested depth, default max turns, grace turns, fallback agent, fallback model, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, package agents on/off, package workflows on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, workflow tool exposure skill/inline/deferred, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides.
@@ -828,6 +830,8 @@ A row whose value comes from a settings file is tagged with that file (`project`
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max background concurrency `10`, max foreground concurrency `0` = unlimited, max nested concurrency `10`, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nested subagents entirely, even for agents that set `allowed_subagents` — see the [depth table](#nested-subagents). Read when a subagent session is built, so a change applies to agents started after it.
+
+**Fallback model** (`fallbackModel`, unset = `commandcode/minimax/minimax-m3.1-flash`): the one model a recognized provider failure may retry the task on. Set it to any exact `provider/modelId` from this session's catalog, or to `none` to keep the failure on the routed model. Under `none` a provider failure is reported for that task and the route is left healthy, so a rate-limited minute does not turn into a session that refuses every dispatch until `/subagent-model` is re-run. The boolean `false` is accepted as a spelling of `none` for the same reason as above. Also settable from `/agents → Settings → Fallback model` (Enter to type a key; clear it to restore the shipped default).
 
 **Fallback agent** (`fallbackSubagent`, default `general-purpose`): the agent used when a caller-supplied `subagent_type` doesn't resolve to exactly one enabled agent — unknown, disabled, or ambiguous because two agents differ only by case. Name any enabled agent to route those calls there instead, or set `none` for **strict**, fail-closed dispatch: the call is refused with an error listing the available types, and nothing spawns. Strict mode matters most for background and scheduled calls, which would otherwise start executing a substituted agent before the caller learns anything. Also settable from `/agents → Settings → Fallback agent`. The boolean `false` is accepted as a spelling of `none`, because it would otherwise be dropped as the wrong type and silently leave the permissive default in place. Every other value is read as an agent name, so a mistaken `off` fails loudly at dispatch rather than meaning one thing in the settings file and another in the resolver. A fallback agent that is itself unknown or disabled is a misconfiguration and is reported rather than quietly replaced. Note the default is unchanged and stays permissive by design: with `disableDefaultAgents` and no `general-purpose` of your own, an unresolvable type still resolves to a built-in config carrying *all* tools — set `none` (or name one of your own agents) to close that.
 

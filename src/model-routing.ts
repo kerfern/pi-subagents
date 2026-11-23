@@ -11,9 +11,17 @@
 
 import type { ThinkingLevel } from "./types.js";
 
-export const DEFAULT_SUBAGENT_MODEL = "opencode-go/deepseek-v4.1-flash";
-export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.1-sol";
-const DEFAULT_SUBAGENT_THINKING: ThinkingLevel = "low";
+/**
+ * Sentinel shared with `agent-types.ts` (`fallbackSubagent`). Defined here because
+ * this module must stay import-free for the harness policy check, which loads it
+ * through Node's type stripping; `agent-types.ts` re-exports it.
+ */
+export const NO_FALLBACK = "none";
+
+export const DEFAULT_SUBAGENT_MODEL = "github-copilot/gpt-6-luna";
+export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.2-sol";
+/** `off` is pi's extended level beyond pi-ai's `ThinkingLevel`; the session accepts it. */
+const DEFAULT_SUBAGENT_THINKING = "off" as ThinkingLevel;
 const DEFAULT_REVIEWER_THINKING: ThinkingLevel = "xhigh";
 /**
  * Where one provider failure retries to. Deliberately a DIFFERENT provider from
@@ -241,11 +249,27 @@ export function recordFallbackFailure(
   state: SubagentRoutingState,
   detail: string,
   primaryModel = state.effective,
+  fallbackModel = FALLBACK_SUBAGENT_MODEL,
 ): void {
   state.routingFailed = true;
   state.terminalReason =
     `Subagent routing stopped: ${primaryModel} failed, then the fallback ` +
-    `${FALLBACK_SUBAGENT_MODEL} failed (${detail}).`;
+    `${fallbackModel} failed (${detail}).`;
+}
+
+/**
+ * The fallback leg a fresh dispatch may use, or `undefined` for none.
+ *
+ * `configured` is the `fallbackModel` setting: unset keeps the historical
+ * constant, `NO_FALLBACK` ("none", or the boolean `false` in the file) turns
+ * the leg off so a provider failure reports itself instead of silently
+ * switching provider, and a key equal to the primary would only re-dial the
+ * provider that just failed, so it is dropped as well.
+ */
+export function fallbackKeyFor(configured: string | undefined, primary: string): string | undefined {
+  const key = configured ?? FALLBACK_SUBAGENT_MODEL;
+  if (key.toLowerCase() === NO_FALLBACK || key === primary) return undefined;
+  return key;
 }
 
 /** Why a fresh dispatch must be refused, or `undefined` when the route is healthy. */

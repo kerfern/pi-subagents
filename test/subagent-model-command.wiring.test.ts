@@ -312,8 +312,8 @@ describe("the Agent tool under a live route", () => {
       undefined,
       agentCtx([
         FAUX,
-        { provider: "openai-codex", id: "gpt-6.1-sol" },
-        { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+        { provider: "openai-codex", id: "gpt-6.2-sol" },
+        { provider: "github-copilot", id: "gpt-6-luna" },
       ]),
     )).rejects.toThrow(/override/i);
   });
@@ -401,7 +401,7 @@ describe("routing restore on session start", () => {
 
     expect(statuses.at(-1)).toEqual({
       key: ROUTING_KEY,
-      text: "🧿: openai-codex/gpt-6.1-sol (xhigh) | 👷🏻‍♂️: opencode-go/deepseek-v4.1-flash (low)",
+      text: "🧿: openai-codex/gpt-6.2-sol (xhigh) | 👷🏻‍♂️: github-copilot/gpt-6-luna (off)",
     });
     expect(notes.some(note => note.level === "warning" && note.text.includes("gone/x"))).toBe(true);
   });

@@ -411,7 +411,7 @@ describe("/agents → Settings writes only the changed setting", () => {
     // Package agents is on by default because no gate is set at all.
     writeJson(globalFile(), { packageAgents: false });
     const agents = boot();
-    const { ctx, page } = drivePage([...toRow(19), DEL]);
+    const { ctx, page } = drivePage([...toRow(20), DEL]);
 
     await agents(ctx);
 
@@ -694,6 +694,6 @@ describe("/agents → Settings filter and height", () => {
     expect(page.lines.length).toBeLessThanOrEqual(24);
     expect(page.lines[0]).toContain("Subagent Settings");
     expect(page.screen).toMatch(/^> Report usage to session +off\b/m);
-    expect(page.screen).toContain("(29/29)");
+    expect(page.screen).toContain("(30/30)");
   });
 });

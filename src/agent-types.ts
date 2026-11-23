@@ -7,6 +7,7 @@
 
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENTS } from "./default-agents.js";
+import { NO_FALLBACK } from "./model-routing.js";
 import type { ToolDescriptionMode } from "./settings.js";
 import type { AgentConfig } from "./types.js";
 
@@ -34,8 +35,12 @@ export function isDefaultsDisabled(): boolean { return disableDefaults; }
 /** Set whether default agents are disabled. */
 export function setDefaultsDisabled(b: boolean): void { disableDefaults = b; }
 
-/** `fallbackSubagent` value that disables the fallback entirely (strict dispatch). */
-export const NO_FALLBACK = "none";
+/**
+ * `fallbackSubagent`/`fallbackModel` value that disables the fallback entirely
+ * (strict dispatch). Defined in `model-routing.ts`, which stays import-free so
+ * the harness policy check can load it through Node's type stripping.
+ */
+export { NO_FALLBACK };
 
 /**
  * Agent type substituted when a caller-supplied `subagent_type` doesn't resolve
