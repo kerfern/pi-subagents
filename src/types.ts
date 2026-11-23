@@ -202,7 +202,7 @@ export interface ProviderAttempt {
  * without reading a toast from another extension.
  */
 export interface ProviderRouteRecord {
-  strategy: "fill_first" | "round_robin";
+  strategy: "fill_first";
   members: string[];
   attempts: ProviderAttempt[];
   servedModelKey?: string;

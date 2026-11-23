@@ -500,7 +500,6 @@ export class AgentManager {
   /** `providerPool` setting; `false` keeps one provider per dispatch. */
   private providerPool: ProviderPoolSettings | false = false;
   /** Round-robin cursor: advances once per pooled dispatch, never per attempt. */
-  private poolCursor = 0;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -624,7 +623,6 @@ export class AgentManager {
   /** Set the provider pool; `false` disables it and restores single-provider dispatch. */
   setProviderPool(pool: ProviderPoolSettings | false) {
     this.providerPool = pool;
-    this.poolCursor = 0;
   }
 
   getProviderPool(): ProviderPoolSettings | false {
@@ -1147,9 +1145,7 @@ export class AgentManager {
   ): Array<{ key: string; model: Model<any> }> {
     if (route.pool === undefined) return [{ key: modelKey(route.model), model: route.model }];
     const catalog = (this.routing as SubagentRouting).catalogFor(ctx);
-    const members = route.pool.strategy === "round_robin"
-      ? this.rotatedMembers(route.pool.members)
-      : route.pool.members;
+    const members = route.pool.members;
     const candidates: Array<{ key: string; model: Model<any> }> = [];
     for (const provider of members) {
       const key = `${provider}/${route.model.id}`;
@@ -1166,20 +1162,6 @@ export class AgentManager {
     return candidates;
   }
 
-  /** Declaration order, rotated by one synchronous session cursor that wraps. */
-  private rotatedMembers(members: string[]): string[] {
-    const start = this.poolCursor % members.length;
-    this.poolCursor = (this.poolCursor + 1) % members.length;
-    return [...members.slice(start), ...members.slice(0, start)];
-  }
-
-  /**
-   * Append one attempt to the pooled record. A no-op for unpooled dispatches:
-   * an ordinary route must produce exactly the record it produced before.
-   *
-   * `reason` is a fixed label, never the upstream failure text: an auth error
-   * can echo a token, and this ledger is persisted in the session store.
-   */
   private noteAttempt(
     route: RoutedModels,
     key: string,

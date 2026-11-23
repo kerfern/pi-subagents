@@ -543,18 +543,6 @@ describe("provider pool at startAgent", () => {
     expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
   });
 
-  it("alternates the starting seat under round_robin, once per dispatch", async () => {
-    vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
-    manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));
-    manager.setProviderPool({ strategy: "round_robin", members: ["github-copilot", "github-copilot-2"] });
-
-    await spawnAndSettle(manager, {}, SEATS);
-    await spawnAndSettle(manager, {}, SEATS);
-
-    expect(vi.mocked(runAgent).mock.calls[0][3]!.model).toEqual(SEAT1);
-    expect(vi.mocked(runAgent).mock.calls[1][3]!.model).toEqual(SEAT2);
-  });
-
   it("does not pool a specialist route outside the anchored seat", async () => {
     vi.mocked(runAgent).mockResolvedValue(ok() as RunResult);
     manager = new AgentManager(undefined, 10, undefined, undefined, undefined, undefined, router(pooled(), SEATS));

@@ -66,9 +66,17 @@ describe("providerPool setting", () => {
   });
 
   it("keeps a declared pool in declaration order", () => {
+    writeProject({ providerPool: { strategy: "fill_first", members: ["github-copilot", "github-copilot-2"] } });
+    expect(loadSettings(projectDir).providerPool).toEqual({
+      strategy: "fill_first",
+      members: ["github-copilot", "github-copilot-2"],
+    });
+  });
+
+  it("normalizes an unsupported strategy instead of rotating by it", () => {
     writeProject({ providerPool: { strategy: "round_robin", members: ["github-copilot", "github-copilot-2"] } });
     expect(loadSettings(projectDir).providerPool).toEqual({
-      strategy: "round_robin",
+      strategy: "fill_first",
       members: ["github-copilot", "github-copilot-2"],
     });
   });

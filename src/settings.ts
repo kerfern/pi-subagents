@@ -777,11 +777,12 @@ function sanitize(raw: unknown): SubagentsSettings {
  */
 function sanitizeProviderPool(raw: unknown): ProviderPoolSettings | false {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-  const { strategy, members } = raw as Record<string, unknown>;
+  // `strategy` is accepted for forward compatibility; only `fill_first` is supported.
+  const { members } = raw as Record<string, unknown>;
   if (!Array.isArray(members)) return false;
   if (!members.every((m) => typeof m === "string" && m.trim().length > 0 && !m.includes("/"))) return false;
   const resolved: ProviderPoolSettings = {
-    strategy: strategy === "round_robin" ? "round_robin" : "fill_first",
+    strategy: "fill_first",
     // Dedupe only after every member is known-good: silently dropping one bad
     // entry would leave a pool that claims to be on with fewer seats than the
     // operator wrote.

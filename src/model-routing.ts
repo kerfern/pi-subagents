@@ -261,7 +261,7 @@ export function fallbackKeyFor(configured: string | undefined, primary: string):
   return key;
 }
 
-export type PoolStrategy = "fill_first" | "round_robin";
+export type PoolStrategy = "fill_first";
 
 /** The declared provider pool: provider ids in the order they are tried. */
 export interface ProviderPoolSettings {

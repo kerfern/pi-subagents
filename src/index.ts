@@ -3654,10 +3654,10 @@ Terse command-style prompts produce shallow, generic work.
           id: "providerPool",
           label: "Provider pool",
           description:
-            "Seats tried in order when this provider fails (fill_first keeps the declared order; round_robin alternates). "
+            "Seats tried in declaration order when this provider fails. "
             + "Members are hand-written as providerPool.members in subagents.json — the anchored seat is the first one",
           currentValue: pool === false ? "off" : pool.strategy,
-          values: ["fill_first", "round_robin", "off"],
+          values: ["fill_first", "off"],
         },
         {
           id: "disableDefaultAgents",
@@ -3969,7 +3969,7 @@ Terse command-style prompts produce shallow, generic work.
             "warning",
           );
         } else {
-          const strategy = value === "round_robin" ? "round_robin" : "fill_first";
+          const strategy = "fill_first" as const;
           manager.setProviderPool({ strategy, members });
           notifyApplied(ctx, target, `Provider pool on (${strategy}): ${members.join(" → ")}`);
         }
