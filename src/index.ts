@@ -310,8 +310,9 @@ function describeTeamPolicy(policy: TeamPolicy | false, used: { tokens: number; 
   const spent = `${Math.round(used.tokens / 100) / 10}k tok, ${Math.round(used.ms / 1000)}s this session`;
   if (policy === false) return `off · ${spent}`;
   const caps: string[] = [];
-  if (policy.maxTeamTokens !== undefined) caps.push(`tokens≤${policy.maxTeamTokens}`);
-  if (policy.maxTeamMs !== undefined) caps.push(`ms≤${policy.maxTeamMs}`);
+  if (policy.warnTeamTokens !== undefined) caps.push(`warn ${policy.warnTeamTokens} tok`);
+  if (policy.warnTeamMs !== undefined) caps.push(`warn ${Math.round(policy.warnTeamMs / 1000)}s`);
+  if (policy.maxDispatchMs !== undefined) caps.push(`dispatch≤${policy.maxDispatchMs}ms`);
   caps.push(`retries=${policy.retries}`);
   return `${caps.join(", ")} · ${spent}`;
 }
@@ -3844,7 +3845,7 @@ Terse command-style prompts produce shallow, generic work.
           id: "teamPolicy",
           label: "Team budget",
           description:
-            "Read-only: the caps in force and what this session's teams have been charged. Edit teamPolicy in subagents.json (file-only)",
+            "Read-only: spend warnings in force and what this session's teams have been charged. Warnings never refuse a dispatch; only maxDispatchMs aborts one. Edit teamPolicy in subagents.json (file-only)",
           currentValue: describeTeamPolicy(manager.getTeamPolicy(), manager.getTeamUsage()),
           values: [],
         },

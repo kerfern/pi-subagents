@@ -479,17 +479,15 @@ export interface TeamPolicy {
    * the human checkpoint is removed. Defaults to `false`.
    */
   autoApprove?: boolean;
+  /** Hard abort for one dispatch that stops making progress, 0 = no timer. */
   maxDispatchMs?: number;
-  maxTeamTokens?: number;
-  maxTeamMs?: number;
   /**
-   * Slice of `maxTeamTokens` held for the final independent review. Ordinary
-   * roles may spend only `maxTeamTokens - reviewReserveTokens`; a `reviewer`
-   * may draw the whole cap. Requires `maxTeamTokens`.
+   * Soft display threshold, not a cap: crossing it warns once per team root.
+   * Accounting keeps running and no dispatch is refused.
    */
-  reviewReserveTokens?: number;
-  /** Time slice of `maxTeamMs` reserved on the same terms. Requires `maxTeamMs`. */
-  reviewReserveMs?: number;
+  warnTeamTokens?: number;
+  /** Soft wall-time threshold on the same terms. */
+  warnTeamMs?: number;
   /** Cross-leg retries per team root, shared by pool rotation and the declared leg. 0–3. */
   retries: number;
   /** Base of the exponential backoff before an alternate leg, 0–5000 ms. */
@@ -822,40 +820,30 @@ function sanitizeTeamPolicy(raw: unknown): TeamPolicy | false {
     throw new TeamPolicyError("expected false or an object");
   }
   const r = raw as Record<string, unknown>;
-  const out: Partial<TeamPolicy> = {};
-  if (r.autoApprove !== undefined) {
-    if (typeof r.autoApprove !== "boolean") throw new TeamPolicyError("autoApprove must be a boolean");
-    out.autoApprove = r.autoApprove;
-  }
-  for (const key of [
-    "maxDispatchMs",
+  for (const legacy of [
     "maxTeamTokens",
     "maxTeamMs",
     "reviewReserveTokens",
     "reviewReserveMs",
   ] as const) {
+    if (r[legacy] !== undefined) {
+      throw new TeamPolicyError(
+        `${legacy} is no longer a cap; spend is recorded and warned, never refused. Use ${legacy.includes("Tokens") ? "warnTeamTokens" : "warnTeamMs"} for the soft threshold.`,
+      );
+    }
+  }
+  const out: Partial<TeamPolicy> = {};
+  if (r.autoApprove !== undefined) {
+    if (typeof r.autoApprove !== "boolean") throw new TeamPolicyError("autoApprove must be a boolean");
+    out.autoApprove = r.autoApprove;
+  }
+  for (const key of ["maxDispatchMs", "warnTeamTokens", "warnTeamMs"] as const) {
     const v = r[key];
     if (v === undefined) continue;
     if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
       throw new TeamPolicyError(`${key} must be a non-negative finite number`);
     }
     out[key] = v;
-  }
-  if (out.reviewReserveTokens !== undefined) {
-    if (out.maxTeamTokens === undefined) {
-      throw new TeamPolicyError("reviewReserveTokens requires maxTeamTokens");
-    }
-    if (out.reviewReserveTokens > out.maxTeamTokens) {
-      throw new TeamPolicyError("reviewReserveTokens must not exceed maxTeamTokens");
-    }
-  }
-  if (out.reviewReserveMs !== undefined) {
-    if (out.maxTeamMs === undefined) {
-      throw new TeamPolicyError("reviewReserveMs requires maxTeamMs");
-    }
-    if (out.reviewReserveMs > out.maxTeamMs) {
-      throw new TeamPolicyError("reviewReserveMs must not exceed maxTeamMs");
-    }
   }
   const retries = r.retries;
   if (!Number.isInteger(retries) || (retries as number) < 0 || (retries as number) > 3) {

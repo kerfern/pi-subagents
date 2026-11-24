@@ -508,6 +508,8 @@ export class AgentManager {
   private teamPolicy: TeamPolicy | false = false;
   /** Settled tokens and wall ms per team root (top-level id, or `wf:<workflowId>`). */
   private teamUsage = new Map<string, { tokens: number; ms: number }>();
+  /** Soft-threshold crossings already reported, per team root and step. */
+  private teamWarned = new Map<string, Set<string>>();
   /** Team roots that settled a run with no usage reported; blocks further dispatch under a token cap. */
   private usageUnknown = new Set<string>();
   /** Retry legs still allowed per team root (shared by pool rotation and the declared leg). */
@@ -642,6 +644,7 @@ export class AgentManager {
     // `usageUnknown` block could never be cleared from the file.
     this.teamPolicy = policy;
     this.teamUsage.clear();
+    this.teamWarned.clear();
     this.retryBudget.clear();
     this.usageUnknown.clear();
   }
@@ -889,44 +892,12 @@ export class AgentManager {
 
   /**
    * The reason a dispatch must not start under the team policy, or undefined.
-   * Refuses on ACCUMULATED settled totals only (no estimate), on an aborted
-   * caller, and on an unknown-usage team under a declared token cap.
+   * Spend limits are advisory: only an aborted caller refuses. Accounting keeps
+   * running so the operator can see the spend, and `warnTeamSpend` reports it.
    */
   private admitDispatch(record: AgentRecord): string | undefined {
-    const policy = this.teamPolicy;
-    if (policy === false) return undefined;
-    const root = this.teamRootKey(record);
+    if (this.teamPolicy === false) return undefined;
     if (record.abortController?.signal.aborted) return "Dispatch refused: the caller aborted before it started.";
-    const used = this.teamUsage.get(root) ?? { tokens: 0, ms: 0 };
-    // The final review gets a reserved slice: ordinary roles stop at
-    // `cap - reserve`, a reviewer may draw the whole cap. With no reserve this
-    // collapses to the single cap and the old refusal text.
-    const reviewReserveTokens = policy.reviewReserveTokens ?? 0;
-    const tokenLimit = policy.maxTeamTokens === undefined
-      ? undefined
-      : record.type === "reviewer"
-        ? policy.maxTeamTokens
-        : Math.max(0, policy.maxTeamTokens - reviewReserveTokens);
-    if (tokenLimit !== undefined && used.tokens >= tokenLimit) {
-      return reviewReserveTokens > 0 && record.type !== "reviewer"
-        ? `Dispatch refused: writer token budget exhausted (${used.tokens} ≥ ${tokenLimit}; the cap holds ${reviewReserveTokens} beyond it for review dispatches).`
-        : `Dispatch refused: team token budget exhausted (${used.tokens} ≥ maxTeamTokens ${policy.maxTeamTokens}).`;
-    }
-    const reviewReserveMs = policy.reviewReserveMs ?? 0;
-    const timeLimit = policy.maxTeamMs === undefined
-      ? undefined
-      : record.type === "reviewer"
-        ? policy.maxTeamMs
-        : Math.max(0, policy.maxTeamMs - reviewReserveMs);
-    if (timeLimit !== undefined && used.ms >= timeLimit) {
-      return reviewReserveMs > 0 && record.type !== "reviewer"
-        ? `Dispatch refused: writer time budget exhausted (${used.ms}ms ≥ ${timeLimit}ms; the cap holds ${reviewReserveMs}ms beyond it for review dispatches).`
-        : `Dispatch refused: team time budget exhausted (${used.ms}ms ≥ maxTeamMs ${policy.maxTeamMs}).`;
-    }
-    if (policy.maxTeamTokens !== undefined && this.usageUnknown.has(root)) {
-      return "Dispatch refused: a prior run in this team reported no usage, so the token cap cannot be enforced. " +
-        "Re-declare teamPolicy in subagents.json to reset the totals after reviewing the spend.";
-    }
     return undefined;
   }
 
@@ -950,6 +921,41 @@ export class AgentManager {
       record.usageUnknown = true;
       this.usageUnknown.add(root);
     }
+    this.warnTeamSpend(root, used, record);
+  }
+
+  /**
+   * Report crossing a soft threshold once per root and step. Warnings are the
+   * whole contract here: nothing is refused, so an unattended run keeps going
+   * and the operator sees the spend afterwards.
+   */
+  private warnTeamSpend(
+    root: string,
+    used: { tokens: number; ms: number },
+    record: AgentRecord,
+  ): void {
+    const policy = this.teamPolicy;
+    if (policy === false) return;
+    const notify = (record as { teamNotify?: (message: string) => void }).teamNotify;
+    if (notify === undefined) return;
+    const steps = [0.5, 0.8, 1];
+    const warn = (kind: "tokens" | "ms", value: number, limit: number): void => {
+      const warned = this.teamWarned.get(root) ?? new Set<string>();
+      this.teamWarned.set(root, warned);
+      const crossed = steps.filter((step) => value >= limit * step).pop();
+      if (crossed === undefined) return;
+      const key = `${kind}@${crossed}`;
+      if (warned.has(key)) return;
+      warned.add(key);
+      const pct = Math.round((value / limit) * 100);
+      const shown = kind === "tokens" ? `${value} tokens` : `${Math.round(value / 1000)}s`;
+      const cap = kind === "tokens" ? `${limit} warnTeamTokens` : `${Math.round(limit / 1000)}s warnTeamMs`;
+      notify(
+        `[team] spend ${shown} (${pct}% of ${cap}); warning only, no dispatch is refused.`,
+      );
+    };
+    if (policy.warnTeamTokens !== undefined) warn("tokens", used.tokens, policy.warnTeamTokens);
+    if (policy.warnTeamMs !== undefined) warn("ms", used.ms, policy.warnTeamMs);
   }
 
   private armQueuedAbort(id: string, signal?: AbortSignal): boolean {
@@ -1384,7 +1390,10 @@ export class AgentManager {
       ? this.resolveRoute(ctx, options, type)
       : undefined;
     if (typeof routed === "string") throw new Error(routed);
-    // Team budget: refused before the pool slot, the worktree or any prompt.
+    // Spend thresholds are advisory; the notifier lives on the record because
+    // the charge happens at settle, long after this ctx is gone.
+    (record as { teamNotify?: (message: string) => void }).teamNotify = ctx.ui?.notify;
+    // Refused before the pool slot, the worktree or any prompt.
     const refusal = this.admitDispatch(record);
     if (refusal !== undefined) throw new TeamRefusal(refusal);
     // The ledger is shared by reference: attempts are appended as they happen,

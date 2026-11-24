@@ -137,7 +137,7 @@ describe("Team tool", () => {
   it("skips the prompt when teamPolicy.autoApprove is declared", async () => {
     const ctx = boot(
       false,
-      { autoApprove: true, retries: 1, retryBaseMs: 3000, maxTeamTokens: 1_200_000, maxTeamMs: 1_800_000, maxDispatchMs: 900_000 },
+      { autoApprove: true, retries: 1, retryBaseMs: 3000, warnTeamTokens: 2_000_000, warnTeamMs: 1_800_000, maxDispatchMs: 900_000 },
     );
     vi.mocked(runTeam).mockResolvedValue({ ok: true, branch: "team/y", commit: "def456", merged: ["a", "b"] });
     const result = await callTeam(ctx, "team.json");

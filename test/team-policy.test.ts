@@ -58,8 +58,13 @@ const ok = (tokens = 0) => ({
 const providerFail = () => ({ ...ok(), responseText: "", failure: "429 rate limit exceeded" });
 const fresh = (over: Record<string, unknown> = {}) => ({ description: "d", isBackground: false, ...over });
 
-async function spawnAndSettle(m: AgentManager, over: Record<string, unknown> = {}, type: any = "general-purpose") {
-  const id = m.spawn({} as any, mockCtx(), type, "p", fresh(over) as any);
+async function spawnAndSettle(
+  m: AgentManager,
+  over: Record<string, unknown> = {},
+  type: any = "general-purpose",
+  ctx = mockCtx(),
+) {
+  const id = m.spawn({} as any, ctx, type, "p", fresh(over) as any);
   await new Promise((resolve) => setTimeout(resolve, 0));
   const record = m.getRecord(id);
   await (record?.promise ?? m.awaitStartup(id)).catch(() => {});
@@ -93,12 +98,13 @@ describe("teamPolicy settings", () => {
   it("refuses load with a named error for a malformed policy (not a silent off)", () => {
     expect(() => loadWith({ retries: 9, retryBaseMs: 0 })()).toThrow(TeamPolicyError);
     expect(() => loadWith({ retries: 9, retryBaseMs: 0 })()).toThrow(/Invalid teamPolicy: retries/);
-    expect(() => loadWith({ maxTeamTokens: -1, retries: 0, retryBaseMs: 0 })()).toThrow(/maxTeamTokens/);
+    expect(() => loadWith({ warnTeamTokens: -1, retries: 0, retryBaseMs: 0 })()).toThrow(/warnTeamTokens/);
+    expect(() => loadWith({ maxTeamTokens: 1000, retries: 0, retryBaseMs: 0 })()).toThrow(/no longer a cap/);
     expect(() => loadWith({ retries: 1, retryBaseMs: 6000 })()).toThrow(/retryBaseMs/);
   });
 
   it("accepts a well-formed policy", () => {
-    const policy: TeamPolicy = { maxTeamTokens: 1000, retries: 2, retryBaseMs: 100 };
+    const policy: TeamPolicy = { warnTeamTokens: 1000, retries: 2, retryBaseMs: 100 };
     expect(loadWith(policy)().teamPolicy).toEqual(policy);
   });
 
@@ -113,103 +119,66 @@ describe("teamPolicy settings", () => {
     expect(loadSettings(join(dir, "nowhere")).teamPolicy ?? false).toBe(false);
   });
 
-  it("accepts a review reserve inside the cap and refuses a nonsensical one", () => {
+  it("refuses the retired hard caps by name instead of ignoring them", () => {
     const base = { retries: 1, retryBaseMs: 3000 };
-    expect(loadWith({ ...base, maxTeamTokens: 1000, reviewReserveTokens: 400 })().teamPolicy)
-      .toMatchObject({ reviewReserveTokens: 400 });
-    expect(loadWith({ ...base, maxTeamMs: 1000, reviewReserveMs: 250 })().teamPolicy)
-      .toMatchObject({ reviewReserveMs: 250 });
-    expect(() => loadWith({ ...base, reviewReserveTokens: 10 })()).toThrow(/requires maxTeamTokens/);
-    expect(() => loadWith({ ...base, maxTeamTokens: 100, reviewReserveTokens: 200 })())
-      .toThrow(/must not exceed maxTeamTokens/);
-    expect(() => loadWith({ ...base, maxTeamMs: 100, reviewReserveMs: 200 })())
-      .toThrow(/must not exceed maxTeamMs/);
+    for (const key of ["maxTeamTokens", "maxTeamMs", "reviewReserveTokens", "reviewReserveMs"]) {
+      expect(() => loadWith({ ...base, [key]: 10 })()).toThrow(/no longer a cap/);
+    }
   });
 });
 
-describe("admitDispatch / team token budget", () => {
-  it("refuses a queued run once accumulated team tokens exceed the cap, visibly on the record", async () => {
+describe("spend warnings (never refusals)", () => {
+  it("admits a run past the warning threshold and reports the spend", async () => {
     vi.mocked(runAgent)
       .mockImplementationOnce(((_pi: any, _ctx: any, _t: any, opts: any) => {
         opts.onAssistantUsage?.({ input: 600, output: 0, cacheWrite: 0 }, {});
         return Promise.resolve(ok(0) as RunResult);
       }) as any)
       .mockResolvedValue(ok(0) as RunResult);
+    const ctx = mockCtx();
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
-    manager.setTeamPolicy({ maxTeamTokens: 500, retries: 0, retryBaseMs: 0 });
+    manager.setTeamPolicy({ warnTeamTokens: 500, retries: 0, retryBaseMs: 0 });
 
-    const first = await spawnAndSettle(manager);
-    expect(first?.status).toBe("completed");
-
-    const callsBefore = vi.mocked(runAgent).mock.calls.length;
-    const second = await spawnAndSettle(manager);
-    expect(vi.mocked(runAgent).mock.calls.length).toBe(callsBefore);
-    expect(second?.status).toBe("error");
-    expect(second?.error).toMatch(/team token budget exhausted/);
+    expect((await spawnAndSettle(manager, {}, "general-purpose", ctx))?.status).toBe("completed");
+    const second = await spawnAndSettle(manager, {}, "general-purpose", ctx);
+    expect(second?.status).toBe("completed");
+    const messages = ctx.ui.notify.mock.calls.map((c: any[]) => String(c[0]));
+    expect(messages.some((m: string) => /warning only, no dispatch is refused/.test(m))).toBe(true);
+    expect(messages.some((m: string) => /600 tokens/.test(m))).toBe(true);
   });
-});
 
-describe("reserved review slice", () => {
-  it("stops writers at cap minus reserve and still admits the final reviewer", async () => {
+  it("warns once per step and re-arms when the policy is re-declared", async () => {
     vi.mocked(runAgent).mockImplementation(((_pi: any, _ctx: any, _t: any, opts: any) => {
-      opts.onAssistantUsage?.({ input: 700, output: 0, cacheWrite: 0 }, {});
+      opts.onAssistantUsage?.({ input: 300, output: 0, cacheWrite: 0 }, {});
       return Promise.resolve(ok(0) as RunResult);
     }) as any);
+    const ctx = mockCtx();
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
-    manager.setTeamPolicy({ maxTeamTokens: 1000, reviewReserveTokens: 400, retries: 0, retryBaseMs: 0 });
-
-    expect((await spawnAndSettle(manager))?.status).toBe("completed");
-    const refusedWriter = await spawnAndSettle(manager);
-    expect(refusedWriter?.status).toBe("error");
-    expect(refusedWriter?.error).toMatch(/writer token budget exhausted \(700 ≥ 600; the cap holds 400 beyond it for review dispatches\)/);
-
-    const review = await spawnAndSettle(manager, {}, "reviewer");
-    expect(review?.status).toBe("completed");
-    expect(review?.providerAttempts ?? 1).toBeGreaterThan(0);
-    expect(manager.getTeamUsage().tokens).toBe(1400);
-
-    const secondReview = await spawnAndSettle(manager, {}, "reviewer");
-    expect(secondReview?.status).toBe("error");
-    expect(secondReview?.error).toMatch(/team token budget exhausted \(1400 ≥ maxTeamTokens 1000\)/);
-    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(2);
-  });
-
-  it("reserves time on the same terms", async () => {
-    vi.mocked(runAgent).mockResolvedValue(ok(0) as RunResult);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
-    manager.setTeamPolicy({ maxTeamMs: 200, reviewReserveMs: 120, retries: 0, retryBaseMs: 0 });
-    // Seed the settled totals directly: this test targets admission arithmetic,
-    // not how a run measures its own wall time.
-    (manager as any).teamUsage.set("session", { tokens: 0, ms: 150 });
-
-    const refusedWriter = await spawnAndSettle(manager);
-    expect(refusedWriter?.status).toBe("error");
-    expect(refusedWriter?.error).toMatch(/writer time budget exhausted \(150ms ≥ 80ms; the cap holds 120ms beyond it for review dispatches\)/);
-
-    const review = await spawnAndSettle(manager, {}, "reviewer");
-    expect(review?.status).toBe("completed");
-  });
-});
-
-describe("teamPolicy re-declaration", () => {
-  it("resets the team's totals so a raised or re-declared budget admits again", async () => {
-    vi.mocked(runAgent).mockImplementationOnce(((_pi: any, _ctx: any, _t: any, opts: any) => {
-      opts.onAssistantUsage?.({ input: 600, output: 0, cacheWrite: 0 }, {});
-      return Promise.resolve(ok(0) as RunResult);
-    }) as any).mockResolvedValue(ok(0) as RunResult);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
-    const policy: TeamPolicy = { maxTeamTokens: 500, retries: 0, retryBaseMs: 0 };
+    const policy: TeamPolicy = { warnTeamTokens: 1000, retries: 0, retryBaseMs: 0 };
     manager.setTeamPolicy(policy);
+    const count = () => ctx.ui.notify.mock.calls.filter((c: any[]) => /\[team\] spend/.test(String(c[0]))).length;
 
-    expect((await spawnAndSettle(manager))?.status).toBe("completed");
-    const refused = await spawnAndSettle(manager);
-    expect(refused?.status).toBe("error");
-    expect(refused?.error).toMatch(/team token budget exhausted/);
-
-    // Re-declaring the same policy is an operator reset, not a no-op.
+    await spawnAndSettle(manager, {}, "general-purpose", ctx); // 300
+    await spawnAndSettle(manager, {}, "general-purpose", ctx); // 600 → 50%
+    await spawnAndSettle(manager, {}, "general-purpose", ctx); // 900 → 80%
+    expect(count()).toBe(2);
+    // Re-declaring resets both the totals and the warned steps, so the ladder
+    // can report again from a clean slate.
     manager.setTeamPolicy({ ...policy });
-    const admitted = await spawnAndSettle(manager);
-    expect(admitted?.status).toBe("completed");
+    await spawnAndSettle(manager, {}, "general-purpose", ctx); // 300
+    await spawnAndSettle(manager, {}, "general-purpose", ctx); // 600 → 50% again
+    expect(count()).toBe(3);
+  });
+
+  it("warns on wall time without refusing the dispatch", async () => {
+    vi.mocked(runAgent).mockResolvedValue(ok(0) as RunResult);
+    const ctx = mockCtx();
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
+    manager.setTeamPolicy({ warnTeamMs: 200, retries: 0, retryBaseMs: 0 });
+    (manager as any).teamUsage.set("session", { tokens: 0, ms: 150 });
+    const run = await spawnAndSettle(manager, {}, "general-purpose", ctx);
+    expect(run?.status).toBe("completed");
+    expect(ctx.ui.notify.mock.calls.some((c: any[]) => /warnTeamMs/.test(String(c[0])))).toBe(true);
   });
 });
 
