@@ -119,6 +119,11 @@ function parseWriter(w: unknown, i: number): TeamWriter {
   if (!isRecord(w)) throw new Error(`writer #${i} must be an object`);
   const name = nonEmptyString(w.name, `writer #${i} 'name'`);
   const agent = nonEmptyString(w.agent, `writer "${name}" 'agent'`);
+  if (agent.trim().toLowerCase() === "reviewer") {
+    throw new Error(
+      `writer "${name}" may not use the reviewer role: the review reserve is not writer budget`,
+    );
+  }
   const prompt = nonEmptyString(w.prompt, `writer "${name}" 'prompt'`);
   if (!Array.isArray(w.files) || w.files.length === 0) {
     throw new Error(`writer "${name}" 'files' must be a non-empty array`);

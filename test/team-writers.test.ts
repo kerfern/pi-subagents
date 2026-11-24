@@ -85,6 +85,16 @@ describe("parseTeamManifest overlap", () => {
     expect(globMatchesPath("src/*.ts", "src/deep/a.ts")).toBe(false);
     expect(globMatchesPath("src/**", "src/a/b/c.ts")).toBe(true);
   });
+  it("refuses a writer that names the reviewer role", () => {
+    const body = JSON.stringify({
+      gate: ["node", "--test"],
+      writers: [
+        { name: "a", agent: "reviewer", prompt: "p", files: ["src/api/**"] },
+        { name: "b", agent: "implementer", prompt: "p", files: ["src/web/**"] },
+      ],
+    });
+    expect(() => parseTeamManifest(body)).toThrow(/may not use the reviewer role/);
+  });
   it("rejects non-repo-relative and bad team sizes", () => {
     expect(() => parseTeamManifest(mk(["/abs/x"], ["src/web/**"]))).toThrow(/repo-relative/);
     expect(() => parseTeamManifest(JSON.stringify({ gate: ["x"], writers: [{ name: "a", agent: "i", prompt: "p", files: ["a"] }] }))).toThrow(/2–6 writers/);

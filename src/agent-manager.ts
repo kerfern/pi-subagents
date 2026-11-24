@@ -909,7 +909,7 @@ export class AgentManager {
         : Math.max(0, policy.maxTeamTokens - reviewReserveTokens);
     if (tokenLimit !== undefined && used.tokens >= tokenLimit) {
       return reviewReserveTokens > 0 && record.type !== "reviewer"
-        ? `Dispatch refused: writer token budget exhausted (${used.tokens} ≥ ${tokenLimit}; ${reviewReserveTokens} reserved for the final review).`
+        ? `Dispatch refused: writer token budget exhausted (${used.tokens} ≥ ${tokenLimit}; the cap holds ${reviewReserveTokens} beyond it for review dispatches).`
         : `Dispatch refused: team token budget exhausted (${used.tokens} ≥ maxTeamTokens ${policy.maxTeamTokens}).`;
     }
     const reviewReserveMs = policy.reviewReserveMs ?? 0;
@@ -920,7 +920,7 @@ export class AgentManager {
         : Math.max(0, policy.maxTeamMs - reviewReserveMs);
     if (timeLimit !== undefined && used.ms >= timeLimit) {
       return reviewReserveMs > 0 && record.type !== "reviewer"
-        ? `Dispatch refused: writer time budget exhausted (${used.ms}ms ≥ ${timeLimit}ms; ${reviewReserveMs}ms reserved for the final review).`
+        ? `Dispatch refused: writer time budget exhausted (${used.ms}ms ≥ ${timeLimit}ms; the cap holds ${reviewReserveMs}ms beyond it for review dispatches).`
         : `Dispatch refused: team time budget exhausted (${used.ms}ms ≥ maxTeamMs ${policy.maxTeamMs}).`;
     }
     if (policy.maxTeamTokens !== undefined && this.usageUnknown.has(root)) {

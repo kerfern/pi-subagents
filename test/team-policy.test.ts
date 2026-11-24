@@ -161,13 +161,35 @@ describe("reserved review slice", () => {
     expect((await spawnAndSettle(manager))?.status).toBe("completed");
     const refusedWriter = await spawnAndSettle(manager);
     expect(refusedWriter?.status).toBe("error");
-    expect(refusedWriter?.error).toMatch(/writer token budget exhausted \(700 ≥ 600; 400 reserved for the final review\)/);
+    expect(refusedWriter?.error).toMatch(/writer token budget exhausted \(700 ≥ 600; the cap holds 400 beyond it for review dispatches\)/);
 
     const review = await spawnAndSettle(manager, {}, "reviewer");
     expect(review?.status).toBe("completed");
     expect(review?.providerAttempts ?? 1).toBeGreaterThan(0);
+    expect(manager.getTeamUsage().tokens).toBe(1400);
+
+    const secondReview = await spawnAndSettle(manager, {}, "reviewer");
+    expect(secondReview?.status).toBe("error");
+    expect(secondReview?.error).toMatch(/team token budget exhausted \(1400 ≥ maxTeamTokens 1000\)/);
     expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(2);
   });
+
+  it("reserves time on the same terms", async () => {
+    vi.mocked(runAgent).mockImplementation(((_pi: any, _ctx: any, _t: any, opts: any) => {
+      opts.onAssistantUsage?.({ input: 10, output: 0, cacheWrite: 0 }, {});
+      return new Promise((resolve) => setTimeout(() => resolve(ok(0) as RunResult), 150));
+    }) as any);
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
+    manager.setTeamPolicy({ maxTeamMs: 200, reviewReserveMs: 120, retries: 0, retryBaseMs: 0 });
+
+    expect((await spawnAndSettle(manager))?.status).toBe("completed");
+    const refusedWriter = await spawnAndSettle(manager);
+    expect(refusedWriter?.status).toBe("error");
+    expect(refusedWriter?.error).toMatch(/writer time budget exhausted \(\d+ms ≥ 80ms; the cap holds 120ms beyond it for review dispatches\)/);
+
+    const review = await spawnAndSettle(manager, {}, "reviewer");
+    expect(review?.status).toBe("completed");
+  }, 15_000);
 });
 
 describe("teamPolicy re-declaration", () => {
