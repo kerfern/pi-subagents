@@ -175,21 +175,20 @@ describe("reserved review slice", () => {
   });
 
   it("reserves time on the same terms", async () => {
-    vi.mocked(runAgent).mockImplementation(((_pi: any, _ctx: any, _t: any, opts: any) => {
-      opts.onAssistantUsage?.({ input: 10, output: 0, cacheWrite: 0 }, {});
-      return new Promise((resolve) => setTimeout(() => resolve(ok(0) as RunResult), 150));
-    }) as any);
+    vi.mocked(runAgent).mockResolvedValue(ok(0) as RunResult);
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
     manager.setTeamPolicy({ maxTeamMs: 200, reviewReserveMs: 120, retries: 0, retryBaseMs: 0 });
+    // Seed the settled totals directly: this test targets admission arithmetic,
+    // not how a run measures its own wall time.
+    (manager as any).teamUsage.set("session", { tokens: 0, ms: 150 });
 
-    expect((await spawnAndSettle(manager))?.status).toBe("completed");
     const refusedWriter = await spawnAndSettle(manager);
     expect(refusedWriter?.status).toBe("error");
-    expect(refusedWriter?.error).toMatch(/writer time budget exhausted \(\d+ms ≥ 80ms; the cap holds 120ms beyond it for review dispatches\)/);
+    expect(refusedWriter?.error).toMatch(/writer time budget exhausted \(150ms ≥ 80ms; the cap holds 120ms beyond it for review dispatches\)/);
 
     const review = await spawnAndSettle(manager, {}, "reviewer");
     expect(review?.status).toBe("completed");
-  }, 15_000);
+  });
 });
 
 describe("teamPolicy re-declaration", () => {

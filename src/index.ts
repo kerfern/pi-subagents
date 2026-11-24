@@ -4554,6 +4554,15 @@ Terse command-style prompts produce shallow, generic work.
     const dispatch = async (writer: TeamWriter): Promise<WriterRun> => {
       const resolved = resolveSpawnType(writer.agent);
       if (!resolved.ok) return { status: "error", error: resolved.message };
+      // A project `fallbackSubagent` can resolve an unknown writer name to the
+      // reviewer role. Reviewer admission draws the review reserve, so refuse it
+      // here rather than trusting the manifest's literal text.
+      if (resolved.type === "reviewer") {
+        return {
+          status: "error",
+          error: `writer "${writer.name}" resolved to the reviewer role; the review reserve is not writer budget`,
+        };
+      }
       const id = manager.spawn(pi, ctx, resolved.type, writer.prompt, {
         description: `team: ${writer.name}`,
         isolation: "worktree",
