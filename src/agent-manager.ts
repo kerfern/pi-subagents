@@ -898,11 +898,30 @@ export class AgentManager {
     const root = this.teamRootKey(record);
     if (record.abortController?.signal.aborted) return "Dispatch refused: the caller aborted before it started.";
     const used = this.teamUsage.get(root) ?? { tokens: 0, ms: 0 };
-    if (policy.maxTeamTokens !== undefined && used.tokens >= policy.maxTeamTokens) {
-      return `Dispatch refused: team token budget exhausted (${used.tokens} ≥ maxTeamTokens ${policy.maxTeamTokens}).`;
+    // The final review gets a reserved slice: ordinary roles stop at
+    // `cap - reserve`, a reviewer may draw the whole cap. With no reserve this
+    // collapses to the single cap and the old refusal text.
+    const reviewReserveTokens = policy.reviewReserveTokens ?? 0;
+    const tokenLimit = policy.maxTeamTokens === undefined
+      ? undefined
+      : record.type === "reviewer"
+        ? policy.maxTeamTokens
+        : Math.max(0, policy.maxTeamTokens - reviewReserveTokens);
+    if (tokenLimit !== undefined && used.tokens >= tokenLimit) {
+      return reviewReserveTokens > 0 && record.type !== "reviewer"
+        ? `Dispatch refused: writer token budget exhausted (${used.tokens} ≥ ${tokenLimit}; ${reviewReserveTokens} reserved for the final review).`
+        : `Dispatch refused: team token budget exhausted (${used.tokens} ≥ maxTeamTokens ${policy.maxTeamTokens}).`;
     }
-    if (policy.maxTeamMs !== undefined && used.ms >= policy.maxTeamMs) {
-      return `Dispatch refused: team time budget exhausted (${used.ms}ms ≥ maxTeamMs ${policy.maxTeamMs}).`;
+    const reviewReserveMs = policy.reviewReserveMs ?? 0;
+    const timeLimit = policy.maxTeamMs === undefined
+      ? undefined
+      : record.type === "reviewer"
+        ? policy.maxTeamMs
+        : Math.max(0, policy.maxTeamMs - reviewReserveMs);
+    if (timeLimit !== undefined && used.ms >= timeLimit) {
+      return reviewReserveMs > 0 && record.type !== "reviewer"
+        ? `Dispatch refused: writer time budget exhausted (${used.ms}ms ≥ ${timeLimit}ms; ${reviewReserveMs}ms reserved for the final review).`
+        : `Dispatch refused: team time budget exhausted (${used.ms}ms ≥ maxTeamMs ${policy.maxTeamMs}).`;
     }
     if (policy.maxTeamTokens !== undefined && this.usageUnknown.has(root)) {
       return "Dispatch refused: a prior run in this team reported no usage, so the token cap cannot be enforced. " +

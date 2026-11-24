@@ -58,8 +58,8 @@ const ok = (tokens = 0) => ({
 const providerFail = () => ({ ...ok(), responseText: "", failure: "429 rate limit exceeded" });
 const fresh = (over: Record<string, unknown> = {}) => ({ description: "d", isBackground: false, ...over });
 
-async function spawnAndSettle(m: AgentManager, over: Record<string, unknown> = {}) {
-  const id = m.spawn({} as any, mockCtx(), "general-purpose", "p", fresh(over) as any);
+async function spawnAndSettle(m: AgentManager, over: Record<string, unknown> = {}, type: any = "general-purpose") {
+  const id = m.spawn({} as any, mockCtx(), type, "p", fresh(over) as any);
   await new Promise((resolve) => setTimeout(resolve, 0));
   const record = m.getRecord(id);
   await (record?.promise ?? m.awaitStartup(id)).catch(() => {});
@@ -112,6 +112,19 @@ describe("teamPolicy settings", () => {
   it("defaults to off", () => {
     expect(loadSettings(join(dir, "nowhere")).teamPolicy ?? false).toBe(false);
   });
+
+  it("accepts a review reserve inside the cap and refuses a nonsensical one", () => {
+    const base = { retries: 1, retryBaseMs: 3000 };
+    expect(loadWith({ ...base, maxTeamTokens: 1000, reviewReserveTokens: 400 })().teamPolicy)
+      .toMatchObject({ reviewReserveTokens: 400 });
+    expect(loadWith({ ...base, maxTeamMs: 1000, reviewReserveMs: 250 })().teamPolicy)
+      .toMatchObject({ reviewReserveMs: 250 });
+    expect(() => loadWith({ ...base, reviewReserveTokens: 10 })()).toThrow(/requires maxTeamTokens/);
+    expect(() => loadWith({ ...base, maxTeamTokens: 100, reviewReserveTokens: 200 })())
+      .toThrow(/must not exceed maxTeamTokens/);
+    expect(() => loadWith({ ...base, maxTeamMs: 100, reviewReserveMs: 200 })())
+      .toThrow(/must not exceed maxTeamMs/);
+  });
 });
 
 describe("admitDispatch / team token budget", () => {
@@ -133,6 +146,27 @@ describe("admitDispatch / team token budget", () => {
     expect(vi.mocked(runAgent).mock.calls.length).toBe(callsBefore);
     expect(second?.status).toBe("error");
     expect(second?.error).toMatch(/team token budget exhausted/);
+  });
+});
+
+describe("reserved review slice", () => {
+  it("stops writers at cap minus reserve and still admits the final reviewer", async () => {
+    vi.mocked(runAgent).mockImplementation(((_pi: any, _ctx: any, _t: any, opts: any) => {
+      opts.onAssistantUsage?.({ input: 700, output: 0, cacheWrite: 0 }, {});
+      return Promise.resolve(ok(0) as RunResult);
+    }) as any);
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, undefined, router(state()));
+    manager.setTeamPolicy({ maxTeamTokens: 1000, reviewReserveTokens: 400, retries: 0, retryBaseMs: 0 });
+
+    expect((await spawnAndSettle(manager))?.status).toBe("completed");
+    const refusedWriter = await spawnAndSettle(manager);
+    expect(refusedWriter?.status).toBe("error");
+    expect(refusedWriter?.error).toMatch(/writer token budget exhausted \(700 ≥ 600; 400 reserved for the final review\)/);
+
+    const review = await spawnAndSettle(manager, {}, "reviewer");
+    expect(review?.status).toBe("completed");
+    expect(review?.providerAttempts ?? 1).toBeGreaterThan(0);
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(2);
   });
 });
 

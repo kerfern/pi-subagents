@@ -482,6 +482,14 @@ export interface TeamPolicy {
   maxDispatchMs?: number;
   maxTeamTokens?: number;
   maxTeamMs?: number;
+  /**
+   * Slice of `maxTeamTokens` held for the final independent review. Ordinary
+   * roles may spend only `maxTeamTokens - reviewReserveTokens`; a `reviewer`
+   * may draw the whole cap. Requires `maxTeamTokens`.
+   */
+  reviewReserveTokens?: number;
+  /** Time slice of `maxTeamMs` reserved on the same terms. Requires `maxTeamMs`. */
+  reviewReserveMs?: number;
   /** Cross-leg retries per team root, shared by pool rotation and the declared leg. 0–3. */
   retries: number;
   /** Base of the exponential backoff before an alternate leg, 0–5000 ms. */
@@ -819,13 +827,35 @@ function sanitizeTeamPolicy(raw: unknown): TeamPolicy | false {
     if (typeof r.autoApprove !== "boolean") throw new TeamPolicyError("autoApprove must be a boolean");
     out.autoApprove = r.autoApprove;
   }
-  for (const key of ["maxDispatchMs", "maxTeamTokens", "maxTeamMs"] as const) {
+  for (const key of [
+    "maxDispatchMs",
+    "maxTeamTokens",
+    "maxTeamMs",
+    "reviewReserveTokens",
+    "reviewReserveMs",
+  ] as const) {
     const v = r[key];
     if (v === undefined) continue;
     if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
       throw new TeamPolicyError(`${key} must be a non-negative finite number`);
     }
     out[key] = v;
+  }
+  if (out.reviewReserveTokens !== undefined) {
+    if (out.maxTeamTokens === undefined) {
+      throw new TeamPolicyError("reviewReserveTokens requires maxTeamTokens");
+    }
+    if (out.reviewReserveTokens > out.maxTeamTokens) {
+      throw new TeamPolicyError("reviewReserveTokens must not exceed maxTeamTokens");
+    }
+  }
+  if (out.reviewReserveMs !== undefined) {
+    if (out.maxTeamMs === undefined) {
+      throw new TeamPolicyError("reviewReserveMs requires maxTeamMs");
+    }
+    if (out.reviewReserveMs > out.maxTeamMs) {
+      throw new TeamPolicyError("reviewReserveMs must not exceed maxTeamMs");
+    }
   }
   const retries = r.retries;
   if (!Number.isInteger(retries) || (retries as number) < 0 || (retries as number) > 3) {
