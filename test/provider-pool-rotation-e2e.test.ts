@@ -74,7 +74,7 @@ describe("provider pool rotation on a real child 401", () => {
       cwd,
       prompt: "Delegate.",
       primaryProvider: "github-copilot",
-      primaryModelId: "gpt-6-luna",
+      primaryModelId: "claude-haiku-5.5",
       extraProviderSeats: ["github-copilot-2"],
       beforeRun: () => {
         // vitest.config disables routing process-wide; this suite needs it live.
@@ -105,9 +105,9 @@ describe("provider pool rotation on a real child 401", () => {
     } | undefined);
     const attempts = record?.providerRoute?.attempts;
     expect(attempts?.map((a) => [a.key, a.leg, a.outcome])).toEqual([
-      ["github-copilot/gpt-6-luna", "pool", "provider-error"],
-      ["github-copilot-2/gpt-6-luna", "pool", "success"],
+      ["github-copilot/claude-haiku-5.5", "pool", "provider-error"],
+      ["github-copilot-2/claude-haiku-5.5", "pool", "success"],
     ]);
-    expect(record?.providerRoute?.servedModelKey).toBe("github-copilot-2/gpt-6-luna");
+    expect(record?.providerRoute?.servedModelKey).toBe("github-copilot-2/claude-haiku-5.5");
   });
 });

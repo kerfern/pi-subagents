@@ -18,7 +18,7 @@ import type { ThinkingLevel } from "./types.js";
  */
 export const NO_FALLBACK = "none";
 
-export const DEFAULT_SUBAGENT_MODEL = "github-copilot/gpt-6-luna";
+export const DEFAULT_SUBAGENT_MODEL = "github-copilot/claude-haiku-5.5";
 export const DEFAULT_REVIEWER_MODEL = "openai-codex/gpt-6.2-sol";
 /** `off` is pi's extended level beyond pi-ai's `ThinkingLevel`; the session accepts it. */
 const DEFAULT_SUBAGENT_THINKING = "off" as ThinkingLevel;

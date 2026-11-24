@@ -96,17 +96,17 @@ describe("restore + migration", () => {
     expect(state.migratedFrom).toBe(LEGACY_ROUTING_STATE_TYPE);
   });
 
-  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use Luna/off", () => {
+  it("routes reviewer, Plan, and advisor to Sol/xhigh; ordinary agents use Haiku/off", () => {
     const state = restoreRoutingState([], [
       { provider: "openai-codex", id: "gpt-6.2-sol" },
-      { provider: "github-copilot", id: "gpt-6-luna" },
+      { provider: "github-copilot", id: "claude-haiku-5.5" },
     ]);
     for (const role of ["reviewer", "Plan", "advisor"]) {
       expect(modelForSubagent(state, role)).toBe("openai-codex/gpt-6.2-sol");
       expect(thinkingForSubagent(state, role)).toBe("xhigh");
     }
     for (const role of ["worker", "Explore", "implementer", "custom-role"]) {
-      expect(modelForSubagent(state, role)).toBe("github-copilot/gpt-6-luna");
+      expect(modelForSubagent(state, role)).toBe("github-copilot/claude-haiku-5.5");
       expect(thinkingForSubagent(state, role)).toBe("off");
     }
   });

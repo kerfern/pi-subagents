@@ -313,7 +313,7 @@ describe("the Agent tool under a live route", () => {
       agentCtx([
         FAUX,
         { provider: "openai-codex", id: "gpt-6.2-sol" },
-        { provider: "github-copilot", id: "gpt-6-luna" },
+        { provider: "github-copilot", id: "claude-haiku-5.5" },
       ]),
     )).rejects.toThrow(/override/i);
   });
@@ -401,7 +401,7 @@ describe("routing restore on session start", () => {
 
     expect(statuses.at(-1)).toEqual({
       key: ROUTING_KEY,
-      text: "🧿: openai-codex/gpt-6.2-sol (xhigh) | 👷🏻‍♂️: github-copilot/gpt-6-luna (off)",
+      text: "🧿: openai-codex/gpt-6.2-sol (xhigh) | 👷🏻‍♂️: github-copilot/claude-haiku-5.5 (off)",
     });
     expect(notes.some(note => note.level === "warning" && note.text.includes("gone/x"))).toBe(true);
   });

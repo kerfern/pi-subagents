@@ -830,7 +830,7 @@ Two session-scoped routes decide fresh subagent models — `reviewer`, `Plan`, a
 
 | | |
 | --------- | ------------- |
-| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.2-sol` (xhigh); other agents `github-copilot/gpt-6-luna` (off) |
+| Defaults | Reviewer/Plan/advisor `openai-codex/gpt-6.2-sol` (xhigh); other agents `github-copilot/claude-haiku-5.5` (off) |
 | Roles | Reviewer, built-in `Plan`, and custom `advisor` use specialist route; all other types use shared route |
 | Fallback | Configurable with `fallbackModel`; unset means CommandCode MiniMax M3.1 Flash (`commandcode/minimax/minimax-m3.1-flash`), `none` keeps a provider failure on the routed model; resolved only when a provider fails |
 | Pool | Optional `providerPool` (`fill_first`): other provider seats for the same model id, tried before the fallback leg. Off by default |
